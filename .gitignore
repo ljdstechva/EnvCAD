@@ -4,3 +4,4 @@ reference/
 .DS_Store
 *.log
 *.tsbuildinfo
+.playwright-cli/

@@ -8,6 +8,8 @@ export default defineConfig({
     environment: 'jsdom',
     include: [
       'test/**/*.test.ts',
+      'sidecar/src/**/*.test.ts',
+      'src/agent/**/*.test.ts',
       'src/sheet/__tests__/**/*.test.ts',
       'src/sheet/**/__tests__/**/*.test.ts'
     ],
