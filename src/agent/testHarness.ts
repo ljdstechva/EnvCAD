@@ -104,8 +104,13 @@ let testRunning = false
  * gated on import.meta.env.DEV) whenever a message crosses the WebSocket.
  */
 export function installAgentTestHarness() {
-  if (!import.meta.env.DEV) return
+  const e2eMode = import.meta.env.VITE_E2E === 'true'
+  if (!import.meta.env.DEV && !e2eMode) return
   installCadTestApi()
+  if (!import.meta.env.DEV) {
+    console.log('[cadTest] window.__cadTest is ready for the E2E preview build')
+    return
+  }
   window.__agentTest = async (text: string) => {
     if (testRunning) throw new Error('An agent acceptance test is already running')
     if (agentBridge.state.connectionState !== 'online') {

@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "type": "module",
   "dependencyNotes": {
-    "@mlightcad/*": "Pinned to exact versions on purpose — no ^ ranges. src/agent/polyline.ts reads AcDbPolyline's private _geo field to recover vertex bulges (the public API exposes positions only), so a silent minor-version bump could change that internal representation. The reader is written to fall back to straight vertices if it does, but the pin keeps the upgrade a deliberate, testable step. See docs/agent-test-plan.md."
+    "@mlightcad/*": "Pinned to exact versions on purpose — no ^ ranges. src/agent/polyline.ts reads vertex positions and bulges through public APIs, validates that both views align, and falls back to straight chord vertices when bulges cannot be verified. The pin keeps upgrades deliberate and testable. See docs/agent-test-plan.md."
   },
   "scripts": {
     "dev": "concurrently --kill-others-on-fail -n vite,sidecar -c blue,green \"vite\" \"npm run sidecar\"",
@@ -12,7 +12,8 @@
     "typecheck": "vue-tsc -b --pretty false && tsc -p sidecar/tsconfig.json --pretty false",
     "build": "vue-tsc -b && vite build",
     "preview": "vite preview",
-    "test": "vitest",
+    "test": "vitest run",
+    "test:e2e": "playwright test",
     "gen:fixture": "tsx test/fixtures/generate-sample-site.ts"
   },
   "dependencies": {
@@ -30,6 +31,7 @@
     "zod": "^4.0.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.62.0",
     "@types/lodash-es": "^4.17.12",
     "@types/node": "^26.1.1",
     "@types/ws": "^8.5.12",

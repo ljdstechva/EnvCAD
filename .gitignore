@@ -6,3 +6,5 @@ reference/
 *.tsbuildinfo
 .playwright-cli/
 output/
+playwright-report/
+test-results/

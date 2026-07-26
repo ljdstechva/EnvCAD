@@ -17,6 +17,21 @@ const BASE_SHEET: SheetDefinition = {
   viewportCenter: 'extents'
 }
 
+const MATRIX_SCALES = [50, 100, 200, 500, 1000] as const
+const SHEET_MATRIX = Object.entries(PAPER_SIZES).flatMap(([paper, portrait]) =>
+  (['portrait', 'landscape'] as const).flatMap((orientation) =>
+    (['m', 'mm'] as const).flatMap((drawingUnit) =>
+      MATRIX_SCALES.map((scaleDenominator) => ({
+        paper: paper as SheetDefinition['paper'],
+        portrait,
+        orientation,
+        drawingUnit,
+        scaleDenominator
+      }))
+    )
+  )
+)
+
 describe('paper sizes', () => {
   it('contains the required portrait dimensions in millimeters', () => {
     expect(PAPER_SIZES).toEqual({
@@ -42,6 +57,42 @@ describe('paper sizes', () => {
       heightMm: 297
     })
   })
+
+  it.each(SHEET_MATRIX)(
+    'computes $paper $orientation in $drawingUnit at 1:$scaleDenominator',
+    ({ paper, portrait, orientation, drawingUnit, scaleDenominator }) => {
+      const sheet: SheetDefinition = {
+        ...BASE_SHEET,
+        paper,
+        orientation,
+        drawingUnit,
+        scaleDenominator,
+        viewportCenter: { x: 25, y: -10 }
+      }
+      const layout = computeSheetLayout(sheet)
+      const expectedPage =
+        orientation === 'portrait'
+          ? portrait
+          : { widthMm: portrait.heightMm, heightMm: portrait.widthMm }
+      const expectedMmPerUnit = (drawingUnit === 'm' ? 1000 : 1) / scaleDenominator
+
+      expect(layout.page).toEqual(expectedPage)
+      expect(layout.mmPerUnit).toBeCloseTo(expectedMmPerUnit, 12)
+      expect(layout.printableArea.width).toBeCloseTo(expectedPage.widthMm - 20)
+      expect(layout.printableArea.height).toBeCloseTo(expectedPage.heightMm - 20)
+      expect(layout.viewport.width).toBeCloseTo(
+        layout.printableArea.width / expectedMmPerUnit,
+        10
+      )
+      expect(layout.viewport.height).toBeCloseTo(
+        layout.printableArea.height / expectedMmPerUnit,
+        10
+      )
+      expect(layout.viewport.centerX).toBe(25)
+      expect(layout.viewport.centerY).toBe(-10)
+      expect(layout.warnings).toEqual([])
+    }
+  )
 })
 
 describe('scale conversion', () => {

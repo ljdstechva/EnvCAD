@@ -27,6 +27,7 @@ import {
   AcGePoint2d,
   AcGePoint3d,
   HATCH_PATTERN_SOLID,
+  acdbHostApplicationServices,
   type AcDbDatabase
 } from '@mlightcad/data-model'
 import { sheetStore } from '../sheet/sheetStore'
@@ -69,6 +70,8 @@ import {
 } from '../symbols/library'
 
 type InputRecord = Record<string, unknown>
+
+let testDatabaseOverride: AcDbDatabase | undefined
 
 const DIMENSION_LAYER = 'DIMENSIONS'
 const BOUNDARY_LAYER = 'BOUNDARY'
@@ -135,7 +138,17 @@ function entityIds(value: unknown): string[] {
 }
 
 function currentDatabase(): AcDbDatabase {
-  return AcApDocManager.instance.curDocument.database
+  return testDatabaseOverride ?? AcApDocManager.instance.curDocument.database
+}
+
+/**
+ * Headless integration-test seam. Runtime callers never set this value; tests
+ * can exercise database-backed executors without constructing a viewer/WebGL
+ * document manager.
+ */
+export function setCadToolTestDatabase(database: AcDbDatabase | undefined): void {
+  testDatabaseOverride = database
+  if (database) acdbHostApplicationServices().workingDatabase = database
 }
 
 function drawingUnits(db = currentDatabase()): string {

@@ -1,6 +1,18 @@
 import { describe, expect, it } from 'vitest'
 
+import { PAPER_SIZES, type SheetDefinition } from '../../types'
+import { BUILTIN_TEMPLATES } from '../builtin'
+import { renderTitleBlockOverlay } from '../renderTitleBlock'
 import { computeScaleBarLayout, niceRoundNumber } from '../scaleBar'
+
+const TEST_SHEET: SheetDefinition = {
+  paper: 'A3',
+  orientation: 'landscape',
+  marginsMm: { top: 10, right: 10, bottom: 10, left: 10 },
+  scaleDenominator: 500,
+  drawingUnit: 'm',
+  viewportCenter: 'extents'
+}
 
 describe('niceRoundNumber', () => {
   it.each([
@@ -73,4 +85,37 @@ describe('computeScaleBarLayout', () => {
     expect(layout.segmentCount).toBe(5)
     expect(layout.labels).toHaveLength(6)
   })
+
+  it.each(BUILTIN_TEMPLATES.flatMap((template) =>
+    (['m', 'mm'] as const).map((drawingUnit) => ({ template, drawingUnit }))
+  ))(
+    'renders the declared scale-bar labels for $template.id in $drawingUnit',
+    ({ template, drawingUnit }) => {
+      const sheet = { ...TEST_SHEET, drawingUnit }
+      const page = PAPER_SIZES[sheet.paper]
+      const printableArea = {
+        x: 10,
+        y: 10,
+        width: page.heightMm - 20,
+        height: page.widthMm - 20
+      }
+      const overlay = renderTitleBlockOverlay(sheet, template, printableArea)
+
+      if (!template.scaleBar) {
+        expect(overlay).not.toContain('envcad-title-block-scale-bar')
+        return
+      }
+
+      const layout = computeScaleBarLayout(
+        template.scaleBar.widthMm,
+        sheet.scaleDenominator,
+        drawingUnit
+      )
+      expect(overlay).toContain('envcad-title-block-scale-bar')
+      layout.labels.forEach((label, index) => {
+        const suffix = index === layout.labels.length - 1 ? ` ${drawingUnit}` : ''
+        expect(overlay).toContain(`>${label}${suffix}</text>`)
+      })
+    }
+  )
 })
