@@ -23,8 +23,8 @@ defineProps<{
   gap: 10px;
   padding: 0 10px;
   height: 24px;
-  background: #007acc;
-  color: #ffffff;
+  background: var(--statusbar-bg);
+  color: var(--statusbar-text);
   font-size: 11px;
   flex-shrink: 0;
 }

@@ -350,11 +350,11 @@ function previewSvg(template: TitleBlockTemplate): string {
   width: 360px;
   max-height: 85vh;
   overflow: auto;
-  background: #2b2b2b;
-  border: 1px solid #4a4a4a;
+  background: var(--bg-dialog);
+  border: 1px solid var(--border-color);
   border-radius: 4px;
-  color: #e0e0e0;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  color: var(--text-primary);
+  box-shadow: 0 8px 24px var(--shadow-color);
 }
 
 .dialog-header {
@@ -362,7 +362,7 @@ function previewSvg(template: TitleBlockTemplate): string {
   align-items: center;
   justify-content: space-between;
   padding: 10px 12px;
-  border-bottom: 1px solid #1a1a1a;
+  border-bottom: 1px solid var(--border-strong);
   font-weight: 600;
   font-size: 13px;
 }
@@ -370,7 +370,7 @@ function previewSvg(template: TitleBlockTemplate): string {
 .icon-btn {
   background: transparent;
   border: none;
-  color: #ccc;
+  color: var(--text-secondary);
   font-size: 16px;
   cursor: pointer;
   line-height: 1;
@@ -393,14 +393,14 @@ function previewSvg(template: TitleBlockTemplate): string {
 .field-row label {
   width: 90px;
   flex-shrink: 0;
-  color: #b0b0b0;
+  color: var(--text-secondary);
 }
 
 select,
 input[type='number'] {
-  background: #1e1e1e;
-  border: 1px solid #4a4a4a;
-  color: #e0e0e0;
+  background: var(--bg-input);
+  border: 1px solid var(--border-color);
+  color: var(--text-primary);
   padding: 4px 6px;
   border-radius: 3px;
   font-size: 12px;
@@ -411,7 +411,7 @@ input[type='number'] {
 }
 
 .hint {
-  color: #888;
+  color: var(--text-muted);
   font-size: 11px;
 }
 
@@ -423,7 +423,7 @@ input[type='number'] {
 
 .group-label {
   font-size: 12px;
-  color: #b0b0b0;
+  color: var(--text-secondary);
 }
 
 .margins-grid {
@@ -437,7 +437,7 @@ input[type='number'] {
   flex-direction: column;
   gap: 3px;
   font-size: 11px;
-  color: #999;
+  color: var(--text-secondary);
 }
 
 .margins-grid input {
@@ -458,9 +458,9 @@ input[type='number'] {
   align-items: center;
   justify-content: center;
   gap: 6px;
-  background: #3c3c3c;
-  color: #ccc;
-  border: 1px solid #4a4a4a;
+  background: var(--bg-button);
+  color: var(--text-secondary);
+  border: 1px solid var(--border-color);
   border-radius: 3px;
   padding: 6px 8px;
   font-size: 12px;
@@ -469,8 +469,8 @@ input[type='number'] {
 
 .orientation-toggle button.active,
 .viewport-toggle button.active {
-  background: #0e639c;
-  border-color: #1177bb;
+  background: var(--accent);
+  border-color: var(--accent-border);
   color: #fff;
 }
 
@@ -494,17 +494,17 @@ input[type='number'] {
   flex-direction: column;
   align-items: center;
   gap: 4px;
-  background: #3c3c3c;
-  border: 1px solid #4a4a4a;
+  background: var(--bg-button);
+  border: 1px solid var(--border-color);
   border-radius: 3px;
   padding: 6px;
   cursor: pointer;
-  color: #ccc;
+  color: var(--text-secondary);
 }
 
 .template-card.active {
-  background: #0e639c;
-  border-color: #1177bb;
+  background: var(--accent);
+  border-color: var(--accent-border);
   color: #fff;
 }
 
@@ -536,9 +536,9 @@ input[type='number'] {
 
 .template-io button {
   flex: 1;
-  background: #3c3c3c;
-  color: #ccc;
-  border: 1px solid #4a4a4a;
+  background: var(--bg-button);
+  color: var(--text-secondary);
+  border: 1px solid var(--border-color);
   border-radius: 3px;
   padding: 6px 8px;
   font-size: 12px;
@@ -555,7 +555,7 @@ input[type='number'] {
 }
 
 .error-hint {
-  color: #f0a0a0;
+  color: var(--error-text);
 }
 
 .fields-grid {
@@ -569,7 +569,7 @@ input[type='number'] {
   flex-direction: column;
   gap: 3px;
   font-size: 11px;
-  color: #999;
+  color: var(--text-secondary);
 }
 
 .field-input input {
@@ -578,14 +578,14 @@ input[type='number'] {
 
 .dialog-footer {
   padding: 10px 12px;
-  border-top: 1px solid #1a1a1a;
+  border-top: 1px solid var(--border-strong);
   display: flex;
   justify-content: flex-end;
 }
 
 .primary {
-  background: #0e639c;
-  border: 1px solid #1177bb;
+  background: var(--accent);
+  border: 1px solid var(--accent-border);
   color: #fff;
   padding: 6px 16px;
   border-radius: 3px;

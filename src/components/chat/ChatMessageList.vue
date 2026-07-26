@@ -100,7 +100,7 @@ defineExpose({ scrollToBottom })
 }
 
 .empty-state {
-  color: #888;
+  color: var(--text-muted);
   font-style: italic;
   padding: 16px 4px;
   font-size: 12px;
@@ -133,21 +133,21 @@ defineExpose({ scrollToBottom })
 }
 
 .bubble.user {
-  background: #0e639c;
+  background: var(--accent);
   color: #ffffff;
   border-bottom-right-radius: 2px;
 }
 
 .bubble.assistant {
-  background: #333333;
-  color: #e0e0e0;
+  background: var(--bg-button);
+  color: var(--text-primary);
   border-bottom-left-radius: 2px;
 }
 
 .bubble.error {
-  background: #4a1414;
-  color: #f0a0a0;
-  border: 1px solid #6a1c1c;
+  background: var(--error-bg);
+  color: var(--error-text);
+  border: 1px solid var(--error-border);
 }
 
 .attach-note {
@@ -176,17 +176,17 @@ defineExpose({ scrollToBottom })
   bottom: 10px;
   left: 50%;
   transform: translateX(-50%);
-  background: #0e639c;
+  background: var(--accent);
   color: #fff;
   border: none;
   border-radius: 12px;
   padding: 5px 12px;
   font-size: 11px;
   cursor: pointer;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+  box-shadow: 0 2px 8px var(--shadow-color);
 }
 
 .jump-to-bottom:hover {
-  background: #1177bb;
+  background: var(--accent-border);
 }
 </style>

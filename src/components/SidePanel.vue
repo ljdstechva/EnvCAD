@@ -36,19 +36,19 @@ const activeTab = ref<TabId>('ai')
   flex-direction: column;
   height: 100%;
   width: 100%;
-  background: #252525;
+  background: var(--bg-panel);
 }
 
 .tab-bar {
   display: flex;
-  border-bottom: 1px solid #1a1a1a;
+  border-bottom: 1px solid var(--border-strong);
   flex-shrink: 0;
 }
 
 .tab-bar button {
   flex: 1;
   background: transparent;
-  color: #b0b0b0;
+  color: var(--text-secondary);
   border: none;
   padding: 8px 6px;
   font-size: 12px;
@@ -57,8 +57,8 @@ const activeTab = ref<TabId>('ai')
 }
 
 .tab-bar button.active {
-  color: #ffffff;
-  border-bottom-color: #0e639c;
+  color: var(--text-primary);
+  border-bottom-color: var(--accent);
 }
 
 .tab-content {

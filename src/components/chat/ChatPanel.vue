@@ -66,9 +66,9 @@ function onNewChat() {
 
 .offline-banner {
   flex-shrink: 0;
-  background: #4a3b12;
-  color: #f0d080;
-  border-bottom: 1px solid #6a551c;
+  background: var(--warn-bg);
+  color: var(--warn-text);
+  border-bottom: 1px solid var(--warn-border);
   padding: 6px 10px;
   font-size: 11px;
   line-height: 1.4;
@@ -80,12 +80,12 @@ function onNewChat() {
   align-items: center;
   gap: 8px;
   padding: 6px 8px;
-  border-bottom: 1px solid #1a1a1a;
+  border-bottom: 1px solid var(--border-strong);
 }
 
 .status-text {
   font-size: 11px;
-  color: #999;
+  color: var(--text-muted);
 }
 
 .grow {
@@ -94,9 +94,9 @@ function onNewChat() {
 
 .stop-btn,
 .new-chat-btn {
-  background: #3c3c3c;
-  color: #e0e0e0;
-  border: 1px solid #4a4a4a;
+  background: var(--bg-button);
+  color: var(--text-primary);
+  border: 1px solid var(--border-color);
   border-radius: 3px;
   padding: 4px 9px;
   font-size: 11px;
@@ -105,16 +105,16 @@ function onNewChat() {
 
 .stop-btn:hover,
 .new-chat-btn:hover:not(:disabled) {
-  background: #4a4a4a;
+  background: var(--bg-button-hover);
 }
 
 .stop-btn {
-  background: #6a2626;
-  border-color: #8a3232;
+  background: var(--danger-bg);
+  border-color: var(--danger-border);
 }
 
 .stop-btn:hover {
-  background: #8a3232;
+  background: var(--danger-bg-hover);
 }
 
 .new-chat-btn:disabled {

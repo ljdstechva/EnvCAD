@@ -29,7 +29,7 @@ const props = defineProps<{
 }
 
 .empty {
-  color: #888;
+  color: var(--text-muted);
   font-style: italic;
   padding: 8px;
 }
@@ -42,13 +42,13 @@ const props = defineProps<{
 }
 
 .layer-row:hover {
-  background: #333;
+  background: var(--bg-button-hover);
 }
 
 .swatch {
   width: 12px;
   height: 12px;
-  border: 1px solid #555;
+  border: 1px solid var(--border-color);
   flex-shrink: 0;
 }
 

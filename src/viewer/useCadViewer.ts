@@ -10,6 +10,8 @@ import { AcDbLayout, AcDbUnitsValue } from '@mlightcad/data-model'
 import dxfParserWorkerUrl from '../../node_modules/@mlightcad/cad-simple-viewer/dist/dxf-parser-worker.js?url'
 import dwgParserWorkerUrl from '../../node_modules/@mlightcad/cad-simple-viewer/dist/libredwg-parser-worker.js?url'
 import mtextRendererWorkerUrl from '../../node_modules/@mlightcad/cad-simple-viewer/dist/mtext-renderer-worker.js?url'
+import { pushToast } from '../toast/toastStore'
+import { pushRecentFile } from '../autosave/autosave'
 
 export interface LayerInfo {
   name: string
@@ -24,8 +26,14 @@ export function useCadViewer() {
   const canUndo = ref(false)
   const canRedo = ref(false)
   const documentOpen = ref(false)
+  const isDirty = ref(false)
+  const fileName = ref('drawing.dxf')
   const layers: Ref<LayerInfo[]> = ref([])
   const docManager = shallowRef<AcApDocManager | null>(null)
+
+  function markDirty() {
+    isDirty.value = true
+  }
 
   function refreshLayers() {
     const db = docManager.value?.curDocument?.database
@@ -107,6 +115,7 @@ export function useCadViewer() {
       // zoom immediately after this event.
       ensureLayoutViews(manager)
       documentOpen.value = true
+      isDirty.value = false
       refreshLayers()
       refreshUndoRedo()
       selectionCount.value = manager.curView.selectionSet.count
@@ -115,7 +124,10 @@ export function useCadViewer() {
     // Undo/redo state must also refresh after edits made outside the
     // toolbar's own undo/redo/open calls (e.g. agent tool handlers editing
     // the database via acapRunDatabaseEdit, which emits this event).
-    eventBus.on('undo-stack-changed', refreshAfterDatabaseEdit)
+    eventBus.on('undo-stack-changed', () => {
+      refreshAfterDatabaseEdit()
+      markDirty()
+    })
 
     return manager
   }
@@ -123,16 +135,50 @@ export function useCadViewer() {
   async function openFile(file: File) {
     const manager = docManager.value
     if (!manager) return
-    const buffer = await file.arrayBuffer()
-    await manager.openDocument(file.name, buffer, {
-      mode: AcEdOpenMode.Write,
-      openViewMode: AcApOpenViewMode.Extents
-    })
-    refreshLayers()
-    refreshUndoRedo()
+    try {
+      const buffer = await file.arrayBuffer()
+      await manager.openDocument(file.name, buffer, {
+        mode: AcEdOpenMode.Write,
+        openViewMode: AcApOpenViewMode.Extents
+      })
+      fileName.value = file.name
+      pushRecentFile(file.name)
+      refreshLayers()
+      refreshUndoRedo()
+    } catch (error) {
+      pushToast(
+        `Couldn't open ${file.name}: ${error instanceof Error ? error.message : String(error)}`
+      )
+    }
   }
 
-  function saveDxf(fileName = 'drawing.dxf') {
+  async function openFromDxfText(name: string, dxfText: string) {
+    const manager = docManager.value
+    if (!manager) return
+    try {
+      const buffer = new TextEncoder().encode(dxfText).buffer
+      await manager.openDocument(name, buffer, {
+        mode: AcEdOpenMode.Write,
+        openViewMode: AcApOpenViewMode.Extents
+      })
+      fileName.value = name
+      refreshLayers()
+      refreshUndoRedo()
+    } catch (error) {
+      pushToast(
+        `Couldn't restore ${name}: ${error instanceof Error ? error.message : String(error)}`
+      )
+    }
+  }
+
+  function currentDxfOut(): string | null {
+    const manager = docManager.value
+    if (!manager?.curDocument) return null
+    const content = manager.curDocument.database.dxfOut(undefined, 6)
+    return typeof content === 'string' ? content : new TextDecoder().decode(content)
+  }
+
+  function saveDxf(name?: string) {
     const manager = docManager.value
     if (!manager) return
     const content = manager.curDocument.database.dxfOut(undefined, 6)
@@ -142,25 +188,33 @@ export function useCadViewer() {
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
-    a.download = fileName
+    a.download = name ?? fileName.value
     a.click()
     URL.revokeObjectURL(url)
+    isDirty.value = false
   }
 
   function undo() {
     docManager.value?.curDocument.database.transactionManager.undo()
     refreshLayers()
     refreshUndoRedo()
+    markDirty()
   }
 
   function redo() {
     docManager.value?.curDocument.database.transactionManager.redo()
     refreshLayers()
     refreshUndoRedo()
+    markDirty()
   }
 
   function zoomExtents() {
     docManager.value?.curView.zoomToFitDrawing()
+  }
+
+  function setCanvasBackground(colorHex: number) {
+    const view = docManager.value?.curView
+    if (view) view.backgroundColor = colorHex
   }
 
   function toggleLayer(name: string) {
@@ -171,6 +225,7 @@ export function useCadViewer() {
     layer.isOff = !layer.isOff
     docManager.value?.regen()
     refreshLayers()
+    markDirty()
   }
 
   return reactive({
@@ -180,14 +235,19 @@ export function useCadViewer() {
     canUndo,
     canRedo,
     documentOpen,
+    isDirty,
+    fileName,
     layers,
     init,
     openFile,
+    openFromDxfText,
+    currentDxfOut,
     saveDxf,
     undo,
     redo,
     zoomExtents,
-    toggleLayer
+    toggleLayer,
+    setCanvasBackground
   })
 }
 

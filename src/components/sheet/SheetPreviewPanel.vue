@@ -6,6 +6,7 @@ import { PAPER_SIZES } from '../../sheet/types'
 import { openPageSetup } from './pageSetupUiStore'
 import { exportSheetToPdf } from './pdfExport'
 import { useSheetRender } from './useSheetRender'
+import { pushToast } from '../../toast/toastStore'
 
 const PX_PER_MM = 96 / 25.4
 
@@ -81,7 +82,9 @@ async function onExportPdf() {
   try {
     await exportSheetToPdf(svg.value, sheetStore.current, `${getDrawingName()}.pdf`)
   } catch (err) {
-    exportError.value = err instanceof Error ? err.message : String(err)
+    const message = err instanceof Error ? err.message : String(err)
+    exportError.value = message
+    pushToast(`PDF export failed: ${message}`)
   } finally {
     exporting.value = false
   }
@@ -154,15 +157,15 @@ function getDrawingName(): string {
   align-items: center;
   gap: 4px;
   padding: 6px 8px;
-  border-bottom: 1px solid #1a1a1a;
+  border-bottom: 1px solid var(--border-strong);
   flex-shrink: 0;
   flex-wrap: wrap;
 }
 
 .preview-toolbar button {
-  background: #3c3c3c;
-  color: #e0e0e0;
-  border: 1px solid #4a4a4a;
+  background: var(--bg-button);
+  color: var(--text-primary);
+  border: 1px solid var(--border-color);
   border-radius: 3px;
   padding: 4px 8px;
   font-size: 11px;
@@ -170,7 +173,7 @@ function getDrawingName(): string {
 }
 
 .preview-toolbar button:hover:not(:disabled) {
-  background: #4a4a4a;
+  background: var(--bg-button-hover);
 }
 
 .preview-toolbar button:disabled {
@@ -179,19 +182,19 @@ function getDrawingName(): string {
 }
 
 .preview-toolbar button.active {
-  background: #0e639c;
-  border-color: #1177bb;
+  background: var(--accent);
+  border-color: var(--accent-border);
 }
 
 .export-btn {
-  background: #2e7d32 !important;
-  border-color: #388e3c !important;
+  background: var(--success-bg) !important;
+  border-color: var(--success-border) !important;
 }
 
 .sep {
   width: 1px;
   height: 18px;
-  background: #4a4a4a;
+  background: var(--border-color);
   margin: 0 2px;
 }
 
@@ -208,17 +211,17 @@ function getDrawingName(): string {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  background: #4a3b12;
-  color: #f0d080;
-  border-bottom: 1px solid #6a551c;
+  background: var(--warn-bg);
+  color: var(--warn-text);
+  border-bottom: 1px solid var(--warn-border);
   padding: 6px 10px;
   font-size: 11px;
 }
 
 .warning-banner.error {
-  background: #4a1414;
-  color: #f0a0a0;
-  border-bottom-color: #6a1c1c;
+  background: var(--error-bg);
+  color: var(--error-text);
+  border-bottom-color: var(--error-border);
 }
 
 .dismiss {
@@ -239,10 +242,11 @@ function getDrawingName(): string {
   align-items: flex-start;
   justify-content: center;
   padding: 12px;
-  background: #1a1a1a;
+  background: var(--bg-canvas);
 }
 
 .paper {
+  /* The paper preview represents a printed page — it stays white in both themes. */
   background: #ffffff;
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.55);
   transform-origin: top center;

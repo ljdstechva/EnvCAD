@@ -63,16 +63,16 @@ function summarize(value: unknown): string {
 
 <style scoped>
 .tool-chip {
-  border: 1px solid #3c3c3c;
+  border: 1px solid var(--border-color);
   border-radius: 6px;
-  background: #2a2a2a;
+  background: var(--bg-panel);
   font-size: 11px;
   overflow: hidden;
   max-width: 100%;
 }
 
 .tool-chip.error {
-  border-color: #6a2626;
+  border-color: var(--danger-border);
 }
 
 .chip-header {
@@ -82,7 +82,7 @@ function summarize(value: unknown): string {
   width: 100%;
   background: transparent;
   border: none;
-  color: #d0d0d0;
+  color: var(--text-primary);
   padding: 6px 8px;
   cursor: pointer;
   text-align: left;
@@ -91,7 +91,7 @@ function summarize(value: unknown): string {
 }
 
 .chip-header:hover {
-  background: #333333;
+  background: var(--bg-button-hover);
 }
 
 .status-dot {
@@ -123,7 +123,7 @@ function summarize(value: unknown): string {
 .tool-name {
   flex-shrink: 0;
   font-weight: 600;
-  color: #7fb8e6;
+  color: var(--accent);
 }
 
 .tool-input {
@@ -132,12 +132,12 @@ function summarize(value: unknown): string {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  color: #999;
+  color: var(--text-muted);
 }
 
 .chevron {
   flex-shrink: 0;
-  color: #888;
+  color: var(--text-muted);
   transition: transform 0.12s ease;
 }
 
@@ -154,12 +154,12 @@ function summarize(value: unknown): string {
 }
 
 .affected-label {
-  color: #888;
+  color: var(--text-muted);
 }
 
 .id-pill {
-  background: #1e3a4a;
-  color: #8fd0ff;
+  background: var(--info-bg);
+  color: var(--info-text);
   border-radius: 3px;
   padding: 1px 5px;
   font-family: ui-monospace, 'SFMono-Regular', Consolas, monospace;
@@ -168,11 +168,11 @@ function summarize(value: unknown): string {
 
 .tool-error {
   padding: 0 8px 6px 8px;
-  color: #f0a0a0;
+  color: var(--error-text);
 }
 
 .tool-details {
-  border-top: 1px solid #3c3c3c;
+  border-top: 1px solid var(--border-color);
   padding: 6px 8px;
   display: flex;
   flex-direction: column;
@@ -180,7 +180,7 @@ function summarize(value: unknown): string {
 }
 
 .detail-label {
-  color: #888;
+  color: var(--text-muted);
   margin-bottom: 2px;
   font-size: 10px;
   text-transform: uppercase;
@@ -191,10 +191,10 @@ function summarize(value: unknown): string {
   margin: 0;
   white-space: pre-wrap;
   word-break: break-word;
-  background: #1a1a1a;
+  background: var(--bg-canvas);
   border-radius: 4px;
   padding: 6px;
-  color: #c8c8c8;
+  color: var(--text-secondary);
   font-family: ui-monospace, 'SFMono-Regular', Consolas, monospace;
   font-size: 10px;
   max-height: 220px;

@@ -1,4 +1,5 @@
 import { reactive } from 'vue'
+import { pushToast } from '../toast/toastStore'
 import {
   parseClientMessage,
   parseServerMessage,
@@ -145,8 +146,12 @@ export class AgentBridge {
     })
     ws.addEventListener('close', () => {
       if (this.ws !== ws) return
+      const wasOnline = this.state.connectionState === 'online'
       this.ws = undefined
       this.state.connectionState = 'offline'
+      if (wasOnline) {
+        pushToast('Assistant sidecar disconnected — reconnecting…', 'info')
+      }
       if (!this.stopped) this.scheduleReconnect()
     })
     ws.addEventListener('error', (event) => {
@@ -216,6 +221,7 @@ export class AgentBridge {
       case 'error':
         console.error(`[agent-bridge] sidecar error: ${message.message}`)
         this.state.messages.push({ role: 'assistant', text: `[error] ${message.message}` })
+        pushToast(message.message)
         break
       case 'tool_call':
         this.emit(message)
@@ -266,6 +272,7 @@ export class AgentBridge {
   private reportBridgeError(message: string) {
     console.error(`[agent-bridge] ${message}`)
     this.state.messages.push({ role: 'assistant', text: `[error] ${message}` })
+    pushToast(message)
   }
 }
 
