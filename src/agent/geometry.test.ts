@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest'
 import {
   boundingBox,
   boundingBoxCenter,
+  hasBulgeArcs,
+  polylineArea,
   polylineLength,
   rotatePoint,
   shoelaceArea,
@@ -50,6 +52,77 @@ describe('agent geometry helpers', () => {
         false
       )
     ).toBeCloseTo(Math.PI)
+  })
+
+  it('rotates about a bounding-box center without moving that center', () => {
+    const box = boundingBox([
+      { x: 10, y: 4 },
+      { x: 30, y: 24 }
+    ])
+    const center = boundingBoxCenter(box!)
+    expect(center).toEqual({ x: 20, y: 14 })
+
+    const corners = [
+      { x: 10, y: 4 },
+      { x: 30, y: 4 },
+      { x: 30, y: 24 },
+      { x: 10, y: 24 }
+    ]
+    const rotated = corners.map((corner) => rotatePoint(corner, center, Math.PI / 2))
+    const rotatedCenter = boundingBoxCenter(boundingBox(rotated)!)
+    expect(rotatedCenter.x).toBeCloseTo(center.x)
+    expect(rotatedCenter.y).toBeCloseTo(center.y)
+    // A square is area-preserving under rotation about any point.
+    expect(shoelaceArea(rotated)).toBeCloseTo(400)
+    // 90° counter-clockwise sends the bottom-right corner to the top-right.
+    expect(rotated[1].x).toBeCloseTo(30)
+    expect(rotated[1].y).toBeCloseTo(24)
+  })
+
+  it('adds bulge arc areas with the sign of the bulge', () => {
+    const square = [
+      { x: 0, y: 0 },
+      { x: 10, y: 0 },
+      { x: 10, y: 10 },
+      { x: 0, y: 10 }
+    ]
+    const semicircle = (Math.PI * 25) / 2
+
+    expect(polylineArea(square, true)).toBe(100)
+    expect(polylineArea([{ ...square[0], bulge: 1 }, ...square.slice(1)], true)).toBeCloseTo(
+      100 + semicircle
+    )
+    expect(polylineArea([{ ...square[0], bulge: -1 }, ...square.slice(1)], true)).toBeCloseTo(
+      100 - semicircle
+    )
+    // Clockwise winding gives the same unsigned area, bulges included.
+    const clockwise = [...square].reverse()
+    expect(
+      polylineArea([{ ...clockwise[0], bulge: -1 }, ...clockwise.slice(1)], true)
+    ).toBeCloseTo(100 + (Math.PI * 25) / 2)
+  })
+
+  it('treats two vertices with bulges as a full circle', () => {
+    const circle = [
+      { x: 0, y: 0, bulge: 1 },
+      { x: 2, y: 0, bulge: 1 }
+    ]
+    expect(polylineArea(circle, true)).toBeCloseTo(Math.PI)
+    expect(polylineLength(circle, true)).toBeCloseTo(2 * Math.PI)
+    expect(hasBulgeArcs(circle)).toBe(true)
+    expect(hasBulgeArcs([{ x: 0, y: 0 }, { x: 1, y: 0, bulge: 0 }])).toBe(false)
+  })
+
+  it('ignores a duplicated closing vertex and open polylines when measuring area', () => {
+    const duplicated = [
+      { x: 0, y: 0, bulge: 1 },
+      { x: 10, y: 0 },
+      { x: 10, y: 10 },
+      { x: 0, y: 10 },
+      { x: 0, y: 0 }
+    ]
+    expect(polylineArea(duplicated, true)).toBeCloseTo(100 + (Math.PI * 25) / 2)
+    expect(polylineArea(duplicated, false)).toBe(0)
   })
 
   it('calculates and combines bounding boxes and their common center', () => {

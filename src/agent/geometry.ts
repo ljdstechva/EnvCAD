@@ -39,18 +39,30 @@ export function rotatePoint(point: Point2D, center: Point2D, angleRad: number): 
   }
 }
 
-/** Calculates unsigned polygon area using the shoelace formula. */
-export function shoelaceArea(points: readonly Point2D[]): number {
+/**
+ * Twice the signed polygon area (shoelace). Positive for counter-clockwise
+ * winding, negative for clockwise. Any duplicated closing vertex is dropped
+ * first so it does not contribute a zero-length edge.
+ */
+function twiceSignedPolygonArea(points: readonly Point2D[]): number {
   const vertices = withoutDuplicateClosingVertex(points)
   if (vertices.length < 3) return 0
 
-  let twiceSignedArea = 0
+  let total = 0
   for (let index = 0; index < vertices.length; index++) {
     const current = vertices[index]
     const next = vertices[(index + 1) % vertices.length]
-    twiceSignedArea += current.x * next.y - next.x * current.y
+    total += current.x * next.y - next.x * current.y
   }
-  return Math.abs(twiceSignedArea) / 2
+  return total
+}
+
+/**
+ * Calculates unsigned polygon area using the shoelace formula. Straight edges
+ * only — use {@link polylineArea} for vertices that may carry bulges.
+ */
+export function shoelaceArea(points: readonly Point2D[]): number {
+  return Math.abs(twiceSignedPolygonArea(points)) / 2
 }
 
 /** Returns the axis-aligned bounding box of a non-empty point set. */
@@ -97,14 +109,41 @@ export function distance(a: Point2D, b: Point2D): number {
   return Math.hypot(b.x - a.x, b.y - a.y)
 }
 
+/**
+ * Usable bulge at a vertex: `tan(θ/4)` of the following segment's included
+ * angle. Missing, non-finite, or negligible values mean "straight segment".
+ */
+function effectiveBulge(vertex: PolylineVertex): number {
+  const bulge = vertex.bulge
+  if (typeof bulge !== 'number' || !Number.isFinite(bulge)) return 0
+  return Math.abs(bulge) <= POINT_EPSILON ? 0 : bulge
+}
+
 function polylineSegmentLength(start: PolylineVertex, end: PolylineVertex): number {
   const chordLength = distance(start, end)
-  const bulge = Math.abs(start.bulge ?? 0)
-  if (chordLength === 0 || bulge <= POINT_EPSILON) return chordLength
+  const bulge = Math.abs(effectiveBulge(start))
+  if (chordLength === 0 || bulge === 0) return chordLength
 
   const includedAngle = 4 * Math.atan(bulge)
   const radius = (chordLength * (1 + bulge * bulge)) / (4 * bulge)
   return radius * includedAngle
+}
+
+/**
+ * Signed area between a bulge segment's arc and its chord, carrying the sign
+ * of the bulge: a positive bulge is a counter-clockwise arc and contributes
+ * positively, matching the sign convention of a counter-clockwise shoelace
+ * area, so the two can simply be added. (A positive bulge therefore *adds*
+ * area to a counter-clockwise loop and removes it from a clockwise one.)
+ */
+function bulgeSegmentSignedArea(start: PolylineVertex, end: PolylineVertex): number {
+  const bulge = effectiveBulge(start)
+  const chordLength = distance(start, end)
+  if (bulge === 0 || chordLength === 0) return 0
+
+  const includedAngle = 4 * Math.atan(bulge)
+  const radius = (chordLength * (1 + bulge * bulge)) / (4 * bulge)
+  return (radius * radius * (includedAngle - Math.sin(includedAngle))) / 2
 }
 
 /** Calculates polyline length, including exact bulge-defined circular arc segments. */
@@ -118,4 +157,27 @@ export function polylineLength(points: readonly PolylineVertex[], closed: boolea
     total += polylineSegmentLength(points[points.length - 1], points[0])
   }
   return total
+}
+
+/**
+ * Exact enclosed area of a closed polyline: the shoelace area of the chord
+ * polygon plus the signed circular-segment area of every bulge arc. Straight
+ * polylines reduce to {@link shoelaceArea}, and the result is unsigned so the
+ * winding order does not matter. Open polylines enclose nothing and return 0.
+ */
+export function polylineArea(vertices: readonly PolylineVertex[], closed: boolean): number {
+  if (!closed) return 0
+  const loop = withoutDuplicateClosingVertex(vertices)
+  if (loop.length < 2) return 0
+
+  let arcArea = 0
+  for (let index = 0; index < loop.length; index++) {
+    arcArea += bulgeSegmentSignedArea(loop[index], loop[(index + 1) % loop.length])
+  }
+  return Math.abs(twiceSignedPolygonArea(loop) / 2 + arcArea)
+}
+
+/** True when any segment of the vertex list is a bulge-defined arc. */
+export function hasBulgeArcs(vertices: readonly PolylineVertex[]): boolean {
+  return vertices.some((vertex) => effectiveBulge(vertex) !== 0)
 }

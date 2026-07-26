@@ -63,6 +63,14 @@ export class AgentBridge {
   private handlers = new Map<string, ToolHandler>()
   private listeners = new Set<AgentBridgeListener>()
   private stopped = true
+  /**
+   * Serializes tool execution. Claude can emit several tool calls in one
+   * assistant turn, and every database-mutating handler wraps its work in a
+   * single undo transaction — running two of them concurrently would let
+   * their edits land in one another's undo group, so one agent tool call
+   * would no longer be exactly one undo step.
+   */
+  private toolQueue: Promise<void> = Promise.resolve()
 
   registerHandler(name: string, handler: ToolHandler) {
     this.handlers.set(name, handler)
@@ -211,14 +219,26 @@ export class AgentBridge {
         break
       case 'tool_call':
         this.emit(message)
-        await this.handleToolCall(message.callId, message.name, message.input)
+        this.enqueueToolCall(message.callId, message.name, message.input)
         return
     }
     this.emit(message)
   }
 
-  private async handleToolCall(callId: string, name: string, input: unknown) {
+  private enqueueToolCall(callId: string, name: string, input: unknown) {
     this.state.pendingToolCalls.push({ callId, name, input })
+    this.toolQueue = this.toolQueue.then(() =>
+      this.handleToolCall(callId, name, input).catch((error) => {
+        this.reportBridgeError(
+          `Tool dispatch for ${name} failed: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        )
+      })
+    )
+  }
+
+  private async handleToolCall(callId: string, name: string, input: unknown) {
     const handler = this.handlers.get(name)
     let result: ToolResult
     try {

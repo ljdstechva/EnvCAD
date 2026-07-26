@@ -22,19 +22,22 @@ import {
   type AcDbDatabase
 } from '@mlightcad/data-model'
 import { sheetStore } from '../sheet/sheetStore'
+import { listTemplates } from '../sheet/templates/registry'
 import { PAPER_SIZES, type PaperSizeId, type SheetDefinition } from '../sheet/types'
 import { agentBridge, type ToolHandler } from './bridge'
 import {
   boundingBoxCenter,
   distance,
+  hasBulgeArcs,
+  polylineArea,
   polylineLength,
   shoelaceArea,
   unionBoundingBoxes,
   withoutDuplicateClosingVertex,
   type BoundingBox2D,
-  type Point2D,
-  type PolylineVertex
+  type Point2D
 } from './geometry'
+import { polylineVertices } from './polyline'
 import { CAD_TOOL_NAMES, type ToolResult } from './protocol'
 
 type InputRecord = Record<string, unknown>
@@ -134,31 +137,6 @@ function commonCenter(entities: AcDbEntity[]): Point2D {
   return boundingBoxCenter(box)
 }
 
-function polylinePoints(polyline: AcDbPolyline): Point2D[] {
-  const points: Point2D[] = []
-  for (let index = 0; index < polyline.numberOfVertices; index++) {
-    const point = polyline.getPoint3dAt(index)
-    points.push({ x: point.x, y: point.y })
-  }
-  return points
-}
-
-function polylineVertices(polyline: AcDbPolyline): PolylineVertex[] {
-  const geometry = (
-    polyline as unknown as {
-      _geo?: { vertices?: Array<{ x: number; y: number; bulge?: number }> }
-    }
-  )._geo
-  if (geometry?.vertices?.length === polyline.numberOfVertices) {
-    return geometry.vertices.map((vertex) => ({
-      x: vertex.x,
-      y: vertex.y,
-      ...(vertex.bulge === undefined ? {} : { bulge: vertex.bulge })
-    }))
-  }
-  return polylinePoints(polyline)
-}
-
 function point3D(point: Point2D): AcGePoint3d {
   return new AcGePoint3d(point.x, point.y, 0)
 }
@@ -237,12 +215,15 @@ function bboxData(entity: AcDbEntity) {
 
 function geometrySummary(entity: AcDbEntity): Record<string, unknown> {
   if (entity instanceof AcDbPolyline) {
-    const vertices = polylinePoints(entity)
+    const vertices = polylineVertices(entity)
     return {
       kind: 'polyline',
+      // Vertices carry an AutoCAD bulge when the following segment is a
+      // circular arc rather than a straight line.
       vertices: vertices.slice(0, 50),
       vertexCount: vertices.length,
-      truncated: vertices.length > 50
+      truncated: vertices.length > 50,
+      hasArcSegments: hasBulgeArcs(vertices)
     }
   }
   if (entity instanceof AcDbCircle) {
@@ -319,7 +300,16 @@ function getSelectedEntities(rawInput: unknown): ToolResult {
     entities.push(summary)
   }
 
-  return { data: { units: drawingUnits(db), entities, missingIds } }
+  return {
+    data: {
+      units: drawingUnits(db),
+      // An empty list means the user sent their message with nothing
+      // selected, not that the lookup failed.
+      selectedCount: entities.length,
+      entities,
+      missingIds
+    }
+  }
 }
 
 /** Reads units, layers, current layer, and extents from the live database. */
@@ -504,8 +494,10 @@ function calculateArea(rawInput: unknown): ToolResult {
 
   const measurements = entities.map((entity) => {
     let area: number
-    if (entity instanceof AcDbPolyline) area = shoelaceArea(polylinePoints(entity))
-    else if (entity instanceof AcDbCircle) area = Math.PI * entity.radius * entity.radius
+    if (entity instanceof AcDbPolyline) {
+      // Bulge-aware: the chord polygon plus each arc's circular segment.
+      area = polylineArea(polylineVertices(entity), entity.closed)
+    } else if (entity instanceof AcDbCircle) area = Math.PI * entity.radius * entity.radius
     else if (entity instanceof AcDbHatch) area = entity.area
     else throw new Error(`Area is not supported for entity ${entity.objectId} (${entity.type})`)
     return { entityId: entity.objectId, area }
@@ -727,12 +719,59 @@ function zoomExtents(): ToolResult {
   return { data: { zoomed: true } }
 }
 
+/** Current sheet, plus every paper size, template, and field key the agent may name. */
+function getSheetSetup(): ToolResult {
+  return {
+    data: {
+      entityIds: [],
+      current: { ...sheetStore.current },
+      paperSizes: Object.entries(PAPER_SIZES).map(([id, size]) => ({
+        id,
+        portraitWidthMm: size.widthMm,
+        portraitHeightMm: size.heightMm
+      })),
+      templates: listTemplates().map((template) => ({
+        id: template.id,
+        name: template.name,
+        description: template.description,
+        supportedPapers: template.supportedPapers,
+        fieldKeys: template.fields.map((field) => field.key)
+      }))
+    }
+  }
+}
+
+function resolveTemplateId(value: unknown): string {
+  const templateId = nonEmptyString(value, 'templateId')
+  const templates = listTemplates()
+  if (!templates.some((template) => template.id === templateId)) {
+    throw new Error(
+      `Unknown title-block template: ${templateId}. Available templates: ${templates
+        .map((template) => `${template.id} (${template.name})`)
+        .join('; ')}`
+    )
+  }
+  return templateId
+}
+
+/** Field keys not defined by the active template, so the caller can be told they will not render. */
+function unknownFieldKeys(fields: Record<string, string>, templateId: string | undefined): string[] {
+  const template = listTemplates().find((candidate) => candidate.id === templateId)
+  if (!template) return []
+  const known = new Set(template.fields.map((field) => field.key))
+  return Object.keys(fields).filter((key) => !known.has(key))
+}
+
 function setSheetDefinition(rawInput: unknown): ToolResult {
   const input = asRecord(rawInput, 'set_sheet_definition')
   const update: Partial<SheetDefinition> = {}
   if (input.paper !== undefined) {
-    const paper = nonEmptyString(input.paper, 'paper') as PaperSizeId
-    if (!(paper in PAPER_SIZES)) throw new Error(`Unsupported paper size: ${paper}`)
+    const paper = nonEmptyString(input.paper, 'paper').toUpperCase() as PaperSizeId
+    if (!(paper in PAPER_SIZES)) {
+      throw new Error(
+        `Unsupported paper size: ${String(input.paper)}. Supported sizes: ${Object.keys(PAPER_SIZES).join(', ')}`
+      )
+    }
     update.paper = paper
   }
   if (input.orientation !== undefined) {
@@ -745,17 +784,23 @@ function setSheetDefinition(rawInput: unknown): ToolResult {
     update.scaleDenominator = positiveNumber(input.scaleDenominator, 'scaleDenominator')
   }
   if (input.templateId !== undefined) {
-    update.templateId = nonEmptyString(input.templateId, 'templateId')
+    update.templateId = resolveTemplateId(input.templateId)
   }
+
+  let ignoredFieldKeys: string[] = []
   if (input.fields !== undefined) {
     const fields = asRecord(input.fields, 'fields')
     if (!Object.values(fields).every((value) => typeof value === 'string')) {
       throw new Error('fields must contain only string values')
     }
+    ignoredFieldKeys = unknownFieldKeys(
+      fields as Record<string, string>,
+      update.templateId ?? sheetStore.current.templateId
+    )
     update.fields = { ...(sheetStore.current.fields ?? {}), ...(fields as Record<string, string>) }
   }
   sheetStore.current = { ...sheetStore.current, ...update }
-  return { data: { entityIds: [], sheet: { ...sheetStore.current } } }
+  return { data: { entityIds: [], sheet: { ...sheetStore.current }, ignoredFieldKeys } }
 }
 
 function setTitleBlockFields(rawInput: unknown): ToolResult {
@@ -764,11 +809,15 @@ function setTitleBlockFields(rawInput: unknown): ToolResult {
   if (!Object.values(fields).every((value) => typeof value === 'string')) {
     throw new Error('fields must contain only string values')
   }
+  const ignoredFieldKeys = unknownFieldKeys(
+    fields as Record<string, string>,
+    sheetStore.current.templateId
+  )
   sheetStore.current = {
     ...sheetStore.current,
     fields: { ...(sheetStore.current.fields ?? {}), ...(fields as Record<string, string>) }
   }
-  return { data: { entityIds: [], fields: { ...sheetStore.current.fields } } }
+  return { data: { entityIds: [], fields: { ...sheetStore.current.fields }, ignoredFieldKeys } }
 }
 
 const REAL_HANDLERS: Record<(typeof CAD_TOOL_NAMES)[number], ToolHandler> = {
@@ -793,6 +842,7 @@ const REAL_HANDLERS: Record<(typeof CAD_TOOL_NAMES)[number], ToolHandler> = {
   create_layer: (input) => createLayer(input),
   set_current_layer: (input) => setCurrentLayer(input),
   zoom_extents: () => zoomExtents(),
+  get_sheet_setup: () => getSheetSetup(),
   set_sheet_definition: (input) => setSheetDefinition(input),
   set_title_block_fields: (input) => setTitleBlockFields(input)
 }

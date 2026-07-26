@@ -223,14 +223,40 @@ The full list of registered tool names is `CAD_TOOL_NAMES` in
 `delete_entities`, `set_entity_layer`, `change_text`, `calculate_area`,
 `calculate_length`, `draw_line`, `draw_polyline`, `draw_rectangle`,
 `draw_circle`, `draw_arc`, `draw_text`, `draw_hatch`, `create_layer`,
-`set_current_layer`, `zoom_extents`, `set_sheet_definition`,
-`set_title_block_fields`.
+`set_current_layer`, `zoom_extents`, `get_sheet_setup`,
+`set_sheet_definition`, `set_title_block_fields`.
 
 The browser (`src/agent/handlers.ts`) implements every registered tool.
-Database modifications use the viewer's transaction mechanism so one tool
-operation is one undoable step; sheet tools update the reactive sheet store.
 Pure rotation, bounding-box, area, and length math lives in
-`src/agent/geometry.ts`.
+`src/agent/geometry.ts`; bulge extraction from `AcDbPolyline` lives in
+`src/agent/polyline.ts`.
+
+### One tool call, one undo step
+
+Every database-modifying handler wraps all of its mutations in a single
+`acapRunDatabaseEdit(db, label, fn)`, which delegates to
+`AcDbDatabase.runDatabaseEdit` → `transactionManager.runUndoable`. That opens
+exactly one undo mark, so a multi-entity move, a copy that clones and appends
+several entities, and a layer change that also creates the layer each collapse
+into one Ctrl+Z. `runDatabaseEdit` is re-entrant (a nested call joins the
+outer mark), so handlers can call viewer services that wrap their own edits
+without splitting the group — `set_current_layer` relies on this.
+
+Two things protect that invariant:
+
+- `AgentBridge` runs tool calls through a serial queue. Claude may emit
+  several tool calls in one assistant turn; without the queue an async handler
+  could interleave with another handler's open transaction and merge two
+  operations into one undo step.
+- The toolbar's `canUndo`/`canRedo` are refreshed from the viewer's
+  `undo-stack-changed` event (`src/viewer/useCadViewer.ts`), which
+  `acapRunDatabaseEdit` emits, so agent edits enable Undo just like
+  toolbar-driven ones.
+
+Sheet tools (`get_sheet_setup`, `set_sheet_definition`,
+`set_title_block_fields`) update the reactive sheet store, which lives outside
+the drawing database and is therefore **not** covered by undo. The tool
+descriptions and the system prompt both say so.
 
 ## Session and credentials
 

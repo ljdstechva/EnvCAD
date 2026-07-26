@@ -99,6 +99,46 @@ describe('AgentBridge', () => {
     bridge.disconnect()
   })
 
+  it('runs concurrent tool calls one at a time so each stays its own undo step', async () => {
+    const bridge = new AgentBridge()
+    const running: string[] = []
+    let maxConcurrent = 0
+    const release: Array<() => void> = []
+
+    const handler = (name: string) => async () => {
+      running.push(name)
+      maxConcurrent = Math.max(maxConcurrent, running.length)
+      await new Promise<void>((resolve) => release.push(resolve))
+      running.splice(running.indexOf(name), 1)
+      return { data: { name } }
+    }
+    bridge.registerHandler('move_entities', handler('move_entities'))
+    bridge.registerHandler('copy_entities', handler('copy_entities'))
+
+    bridge.connect()
+    await vi.waitFor(() => expect(bridge.state.connectionState).toBe('online'))
+    const socket = FakeBrowserWebSocket.instances[0]
+
+    // Both arrive before either has finished, as they would from one
+    // assistant turn that emits parallel tool calls.
+    socket.receive({ type: 'tool_call', callId: 'call-1', name: 'move_entities', input: {} })
+    socket.receive({ type: 'tool_call', callId: 'call-2', name: 'copy_entities', input: {} })
+
+    await vi.waitFor(() => expect(release).toHaveLength(1))
+    expect(running).toEqual(['move_entities'])
+    release[0]()
+
+    await vi.waitFor(() => expect(release).toHaveLength(2))
+    expect(running).toEqual(['copy_entities'])
+    release[1]()
+
+    await vi.waitFor(() => expect(socket.sent).toHaveLength(2))
+    expect(maxConcurrent).toBe(1)
+    expect(socket.sent.map((raw) => JSON.parse(raw).callId)).toEqual(['call-1', 'call-2'])
+
+    bridge.disconnect()
+  })
+
   it('rejects an invalid inbound tool name before invoking a handler', async () => {
     const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
     const handler = vi.fn(() => ({ data: null }))

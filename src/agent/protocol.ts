@@ -71,6 +71,7 @@ export const CAD_TOOL_NAMES = [
   'create_layer',
   'set_current_layer',
   'zoom_extents',
+  'get_sheet_setup',
   'set_sheet_definition',
   'set_title_block_fields'
 ] as const

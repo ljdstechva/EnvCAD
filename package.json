@@ -3,6 +3,9 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
+  "dependencyNotes": {
+    "@mlightcad/*": "Pinned to exact versions on purpose — no ^ ranges. src/agent/polyline.ts reads AcDbPolyline's private _geo field to recover vertex bulges (the public API exposes positions only), so a silent minor-version bump could change that internal representation. The reader is written to fall back to straight vertices if it does, but the pin keeps the upgrade a deliberate, testable step. See docs/agent-test-plan.md."
+  },
   "scripts": {
     "dev": "concurrently --kill-others-on-fail -n vite,sidecar -c blue,green \"vite\" \"npm run sidecar\"",
     "sidecar": "tsx sidecar/src/index.ts",
@@ -14,10 +17,10 @@
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.0",
-    "@mlightcad/cad-agent-plugin": "^1.5.8",
-    "@mlightcad/cad-simple-viewer": "^1.5.8",
-    "@mlightcad/cad-svg-plugin": "^1.5.8",
-    "@mlightcad/data-model": "^1.11.1",
+    "@mlightcad/cad-agent-plugin": "1.5.8",
+    "@mlightcad/cad-simple-viewer": "1.5.8",
+    "@mlightcad/cad-svg-plugin": "1.5.8",
+    "@mlightcad/data-model": "1.12.0",
     "jspdf": "^2.5.2",
     "lodash-es": "4.17.21",
     "svg2pdf.js": "^2.2.3",

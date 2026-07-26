@@ -1,3 +1,5 @@
+import { AcApDocManager } from '@mlightcad/cad-simple-viewer'
+import { sheetStore } from '../sheet/sheetStore'
 import { agentBridge } from './bridge'
 import { captureSelectionSnapshot, captureSheetSnapshot } from './context'
 import type { ToolResult } from './protocol'
@@ -7,9 +9,83 @@ export interface AgentTestResult {
   toolCalls: Array<{ callId: string; name: string; input: unknown; result?: ToolResult }>
 }
 
+export interface CadTestEntity {
+  id: string
+  type: string
+  layer: string
+  bbox: { minX: number; minY: number; maxX: number; maxY: number } | null
+}
+
+/**
+ * Dev-only inspection and selection control, so the scripted dialogues in
+ * docs/agent-test-plan.md can set up a deterministic selection instead of
+ * clicking canvas pixels.
+ */
+export interface CadTestApi {
+  entities(): CadTestEntity[]
+  select(ids: string[]): number
+  selectByLayer(layer: string): string[]
+  clearSelection(): void
+  selection(): string[]
+  sheet(): unknown
+  canUndo(): boolean
+}
+
 declare global {
   interface Window {
     __agentTest?: (text: string) => Promise<AgentTestResult>
+    __cadTest?: CadTestApi
+  }
+}
+
+function installCadTestApi() {
+  const listEntities = (): CadTestEntity[] => {
+    const db = AcApDocManager.instance.curDocument.database
+    return Array.from(db.tables.blockTable.modelSpace.newIterator()).map((entity) => {
+      const extents = entity.geometricExtents
+      return {
+        id: entity.objectId,
+        type: entity.type,
+        layer: entity.layer,
+        bbox: extents.isEmpty()
+          ? null
+          : {
+              minX: extents.min.x,
+              minY: extents.min.y,
+              maxX: extents.max.x,
+              maxY: extents.max.y
+            }
+      }
+    })
+  }
+
+  window.__cadTest = {
+    entities: listEntities,
+    select(ids) {
+      const selectionSet = AcApDocManager.instance.curView.selectionSet
+      selectionSet.clear()
+      selectionSet.add(ids)
+      return selectionSet.count
+    },
+    selectByLayer(layer) {
+      const ids = listEntities()
+        .filter((entity) => entity.layer === layer)
+        .map((entity) => entity.id)
+      window.__cadTest?.select(ids)
+      return ids
+    },
+    clearSelection() {
+      AcApDocManager.instance.curView.selectionSet.clear()
+    },
+    selection() {
+      return [...AcApDocManager.instance.curView.selectionSet.ids]
+    },
+    sheet() {
+      return JSON.parse(JSON.stringify(sheetStore.current))
+    },
+    canUndo() {
+      return AcApDocManager.instance.curDocument.database.transactionManager.canUndo()
+    }
   }
 }
 
@@ -24,6 +100,7 @@ let testRunning = false
  */
 export function installAgentTestHarness() {
   if (!import.meta.env.DEV) return
+  installCadTestApi()
   window.__agentTest = async (text: string) => {
     if (testRunning) throw new Error('An agent acceptance test is already running')
     if (agentBridge.state.connectionState !== 'online') {
@@ -96,5 +173,5 @@ export function installAgentTestHarness() {
       testRunning = false
     }
   }
-  console.log('[agentTest] window.__agentTest(text) is ready')
+  console.log('[agentTest] window.__agentTest(text) and window.__cadTest are ready')
 }

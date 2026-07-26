@@ -40,9 +40,11 @@ export function createCadMcpServer(bridge: ToolBridge) {
   const getSelectedEntities = tool(
     'get_selected_entities',
     'Get the entities in the selection snapshot attached to the current user message. ' +
-      'Always call this before acting on "this/these/selected" — never guess entity ids. ' +
-      'Returns an empty selection if the user did not have anything selected when they sent ' +
-      'their message.',
+      'Always call this before acting on "this/these/it/selected" — never guess entity ids. ' +
+      'Returns selectedCount: 0 with an empty entities list when the user had nothing selected ' +
+      'at the moment they sent their message; that is a definitive "no selection", not a ' +
+      'failure, and you must stop and ask them to select something rather than picking entities ' +
+      'yourself.',
     {},
     async () => {
       const snapshot = bridge.getSelectionSnapshot()
@@ -87,24 +89,38 @@ export function createCadMcpServer(bridge: ToolBridge) {
   const rotateEntities = passthrough(
     bridge,
     'rotate_entities',
-    'Rotate one or more entities by an angle in degrees, about an optional center point ' +
-      '(defaults to each entity\'s own origin/base point if omitted).',
+    'Rotate one or more entities by an angle in degrees. If center is omitted, all the listed ' +
+      'entities are rotated together about the center of their combined bounding box, which is ' +
+      'NOT the same as rotating each entity about its own base point. Pass center explicitly ' +
+      'whenever the pivot matters. The center actually used is echoed in the result.',
     {
       entityIds: z.array(z.string()).min(1).describe('Ids of the entities to rotate'),
       angleDeg: z.number().describe('Rotation angle in degrees, counter-clockwise positive'),
-      center: z.object(Point2D).optional().describe('Center of rotation, in drawing units')
+      center: z
+        .object(Point2D)
+        .optional()
+        .describe(
+          'Pivot point in drawing units; defaults to the center of the combined bounding box of entityIds'
+        )
     }
   )
 
   const scaleEntities = passthrough(
     bridge,
     'scale_entities',
-    'Scale one or more entities by a factor, about an optional center point (defaults to each ' +
-      "entity's own origin/base point if omitted).",
+    'Scale one or more entities by a factor. If center is omitted, all the listed entities are ' +
+      'scaled together about the center of their combined bounding box, which is NOT the same as ' +
+      'scaling each entity about its own base point. Pass center explicitly whenever the base ' +
+      'point matters. The center actually used is echoed in the result.',
     {
       entityIds: z.array(z.string()).min(1).describe('Ids of the entities to scale'),
-      factor: z.number().describe('Scale factor, e.g. 2 doubles size, 0.5 halves it'),
-      center: z.object(Point2D).optional().describe('Center of scaling, in drawing units')
+      factor: z.number().positive().describe('Scale factor, e.g. 2 doubles size, 0.5 halves it'),
+      center: z
+        .object(Point2D)
+        .optional()
+        .describe(
+          'Base point in drawing units; defaults to the center of the combined bounding box of entityIds'
+        )
     }
   )
 
@@ -120,10 +136,13 @@ export function createCadMcpServer(bridge: ToolBridge) {
   const setEntityLayer = passthrough(
     bridge,
     'set_entity_layer',
-    'Move one or more entities to a different layer.',
+    'Move one or more entities to a different layer. If the layer does not exist it is created ' +
+      'automatically and the result reports layerCreated: true — so check the existing layer ' +
+      'names with get_drawing_context first and confirm with the user before introducing a new ' +
+      'layer, rather than silently creating one from a misspelled name.',
     {
       entityIds: z.array(z.string()).min(1).describe('Ids of the entities to re-layer'),
-      layerName: z.string().describe('Name of the destination layer (must already exist)')
+      layerName: z.string().describe('Name of the destination layer')
     }
   )
 
@@ -140,8 +159,10 @@ export function createCadMcpServer(bridge: ToolBridge) {
   const calculateArea = passthrough(
     bridge,
     'calculate_area',
-    'Compute the enclosed area of one or more closed entities (e.g. closed polylines, circles, ' +
-      'hatches), in drawing units squared. Always use this instead of estimating an area yourself.',
+    'Compute the enclosed area of one or more closed entities (closed polylines, circles, ' +
+      'hatches), in drawing units squared. Bulge (arc) segments of a polyline are included ' +
+      'exactly. Fails on open entities rather than assuming a closing segment. Always use this ' +
+      'instead of estimating an area yourself, and report the units it returns.',
     {
       entityIds: z.array(z.string()).min(1).describe('Ids of the entities to measure')
     }
@@ -150,8 +171,10 @@ export function createCadMcpServer(bridge: ToolBridge) {
   const calculateLength = passthrough(
     bridge,
     'calculate_length',
-    'Compute the total length of one or more entities (lines, polylines, arcs, circles\' ' +
-      'circumference), in drawing units. Always use this instead of estimating a length yourself.',
+    "Compute the total length of one or more entities (lines, polylines, arcs, circles' " +
+      'circumference), in drawing units. Bulge (arc) segments of a polyline are measured along ' +
+      'the arc, not the chord. Always use this instead of estimating a length yourself, and ' +
+      'report the units it returns.',
     {
       entityIds: z.array(z.string()).min(1).describe('Ids of the entities to measure')
     }
@@ -264,27 +287,57 @@ export function createCadMcpServer(bridge: ToolBridge) {
     {}
   )
 
+  const getSheetSetup = passthrough(
+    bridge,
+    'get_sheet_setup',
+    'Get the current sheet/page setup together with the exact ids you are allowed to pass to ' +
+      'set_sheet_definition: every supported paper size id, and every title-block template with ' +
+      'its id, description, supported papers, and the field keys it renders. Call this before ' +
+      'setting a paper size, template, or title-block field so you use real ids instead of ' +
+      'guessing them.',
+    {}
+  )
+
   const setSheetDefinition = passthrough(
     bridge,
     'set_sheet_definition',
     'Partially update the current sheet/page-setup definition. Only the fields provided are ' +
-      'changed; omit a field to leave it unchanged.',
+      'changed; omit a field to leave it unchanged. paper and templateId must be ids returned ' +
+      'by get_sheet_setup. Sheet settings live outside the drawing database, so this change is ' +
+      'NOT undoable with Ctrl+Z — say so when you report it.',
     {
-      paper: z.string().optional().describe('Paper size id, e.g. "A3", "LETTER"'),
+      paper: z
+        .string()
+        .optional()
+        .describe('Paper size id from get_sheet_setup, e.g. "A3", "LETTER"'),
       orientation: z.enum(['portrait', 'landscape']).optional(),
-      scaleDenominator: z.number().positive().optional().describe('Denominator of the drawing scale, e.g. 200 for 1:200'),
-      templateId: z.string().optional().describe('Id of the title-block template to use'),
-      fields: z.record(z.string(), z.string()).optional().describe('Title-block field values, by field name')
+      scaleDenominator: z
+        .number()
+        .positive()
+        .optional()
+        .describe('Denominator of the drawing scale, e.g. 250 for 1:250'),
+      templateId: z
+        .string()
+        .optional()
+        .describe('Id of the title-block template, from get_sheet_setup'),
+      fields: z
+        .record(z.string(), z.string())
+        .optional()
+        .describe('Title-block field values keyed by the template field keys from get_sheet_setup')
     }
   )
 
   const setTitleBlockFields = passthrough(
     bridge,
     'set_title_block_fields',
-    'Update one or more title-block field values (e.g. project name, drawn-by, date) without ' +
-      'changing any other sheet settings.',
+    'Update one or more title-block field values (e.g. PROJECT, DRAWING_TITLE, CLIENT) without ' +
+      'changing any other sheet settings. Keys must be field keys of the active template — see ' +
+      'get_sheet_setup; any key the template does not define is stored but never rendered and ' +
+      'comes back in ignoredFieldKeys. Not undoable with Ctrl+Z.',
     {
-      fields: z.record(z.string(), z.string()).describe('Title-block field values, by field name')
+      fields: z
+        .record(z.string(), z.string())
+        .describe('Title-block field values, keyed by template field key')
     }
   )
 
@@ -313,6 +366,7 @@ export function createCadMcpServer(bridge: ToolBridge) {
       createLayer,
       setCurrentLayer,
       zoomExtents,
+      getSheetSetup,
       setSheetDefinition,
       setTitleBlockFields
     ]
