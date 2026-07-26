@@ -1,9 +1,9 @@
 import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { AcApDocManager } from '@mlightcad/cad-simple-viewer'
 import type { AcDbDatabase } from '@mlightcad/data-model'
+import { sheetRenderer } from '../../sheet/renderSheet'
 import { sheetStore } from '../../sheet/sheetStore'
 import type { SheetRenderResult } from '../../sheet/types'
-import { getSheetRenderer } from './stubRenderer'
 
 const RENDER_DEBOUNCE_MS = 500
 const MANAGER_POLL_MS = 300
@@ -92,8 +92,10 @@ export function useSheetRender() {
     renderError.value = null
     try {
       const doc = getCurrentDocument()
-      const renderer = await getSheetRenderer()
-      const result: SheetRenderResult = await renderer.render(doc, sheetStore.current)
+      const result: SheetRenderResult = await sheetRenderer.render(
+        doc,
+        sheetStore.current
+      )
       if (token !== renderToken) return
       svg.value = result.svg
       warnings.value = result.warnings

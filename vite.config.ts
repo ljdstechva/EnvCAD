@@ -6,7 +6,7 @@ export default defineConfig({
   plugins: [vue()],
   test: {
     environment: 'jsdom',
-    include: ['test/**/*.test.ts'],
+    include: ['test/**/*.test.ts', 'src/sheet/__tests__/**/*.test.ts'],
     server: {
       deps: {
         inline: [/@mlightcad/]

@@ -1,9 +1,14 @@
 import { reactive, ref, shallowRef, type Ref } from 'vue'
 import {
   AcApDocManager,
+  AcApOpenViewMode,
   AcEdOpenMode,
   type AcEdSelectionEventArgs
 } from '@mlightcad/cad-simple-viewer'
+import { AcDbLayout } from '@mlightcad/data-model'
+import dxfParserWorkerUrl from '../../node_modules/@mlightcad/cad-simple-viewer/dist/dxf-parser-worker.js?url'
+import dwgParserWorkerUrl from '../../node_modules/@mlightcad/cad-simple-viewer/dist/libredwg-parser-worker.js?url'
+import mtextRendererWorkerUrl from '../../node_modules/@mlightcad/cad-simple-viewer/dist/mtext-renderer-worker.js?url'
 
 export interface LayerInfo {
   name: string
@@ -45,11 +50,32 @@ export function useCadViewer() {
     canRedo.value = tm?.canRedo() ?? false
   }
 
+  function ensureLayoutViews(manager: AcApDocManager) {
+    const db = manager.curDocument.database
+    let hasActiveLayout = false
+    for (const layout of db.objects.layout.newIterator()) {
+      manager.curView.addLayout(layout)
+      hasActiveLayout ||= layout.blockTableRecordId === db.currentSpaceId
+    }
+
+    if (!hasActiveLayout) {
+      const modelLayout = new AcDbLayout()
+      modelLayout.layoutName = 'Model'
+      modelLayout.blockTableRecordId = db.currentSpaceId
+      manager.curView.addLayout(modelLayout)
+    }
+  }
+
   function init(container: HTMLElement) {
     const manager = AcApDocManager.createInstance({
       container,
       autoResize: true,
-      baseUrl: 'https://cdn.jsdelivr.net/gh/mlightcad/cad-data@main/'
+      baseUrl: 'https://cdn.jsdelivr.net/gh/mlightcad/cad-data@main/',
+      webworkerFileUrls: {
+        dxfParser: dxfParserWorkerUrl,
+        dwgParser: dwgParserWorkerUrl,
+        mtextRender: mtextRendererWorkerUrl
+      }
     })
     if (!manager) {
       throw new Error('Failed to create AcApDocManager instance')
@@ -68,6 +94,11 @@ export function useCadViewer() {
     )
 
     manager.events.documentActivated.addEventListener(() => {
+      // Minimal DXFs can rely on the database's pre-existing model layout
+      // instead of emitting a layout-added event during parsing. Ensure the
+      // corresponding view exists before AcApDocManager applies its initial
+      // zoom immediately after this event.
+      ensureLayoutViews(manager)
       documentOpen.value = true
       refreshLayers()
       refreshUndoRedo()
@@ -81,7 +112,10 @@ export function useCadViewer() {
     const manager = docManager.value
     if (!manager) return
     const buffer = await file.arrayBuffer()
-    await manager.openDocument(file.name, buffer, { mode: AcEdOpenMode.Write })
+    await manager.openDocument(file.name, buffer, {
+      mode: AcEdOpenMode.Write,
+      openViewMode: AcApOpenViewMode.Extents
+    })
     refreshLayers()
     refreshUndoRedo()
   }
