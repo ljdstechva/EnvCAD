@@ -62,8 +62,16 @@ export function useChatTimeline() {
     switch (message.type) {
       case 'assistant_text_delta': {
         if (!streamingEntry) {
-          streamingEntry = { id: nextId(), kind: 'assistant', text: '', streaming: true }
-          entries.value.push(streamingEntry)
+          const entry: ChatAssistantEntry = {
+            id: nextId(),
+            kind: 'assistant',
+            text: '',
+            streaming: true
+          }
+          entries.value.push(entry)
+          // Keep the reactive proxy from the ref array. Mutating the raw
+          // object after insertion does not reliably trigger a Vue update.
+          streamingEntry = entries.value[entries.value.length - 1] as ChatAssistantEntry
         }
         streamingEntry.text += message.text
         break
@@ -80,6 +88,12 @@ export function useChatTimeline() {
         break
       }
       case 'tool_call': {
+        // Text before and after a tool call belongs on opposite sides of the
+        // tool chip in the timeline.
+        if (streamingEntry) {
+          streamingEntry.streaming = false
+          streamingEntry = null
+        }
         entries.value.push({
           id: nextId(),
           kind: 'tool',

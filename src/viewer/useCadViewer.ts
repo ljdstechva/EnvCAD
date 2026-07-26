@@ -6,7 +6,7 @@ import {
   eventBus,
   type AcEdSelectionEventArgs
 } from '@mlightcad/cad-simple-viewer'
-import { AcDbLayout } from '@mlightcad/data-model'
+import { AcDbLayout, AcDbUnitsValue } from '@mlightcad/data-model'
 import dxfParserWorkerUrl from '../../node_modules/@mlightcad/cad-simple-viewer/dist/dxf-parser-worker.js?url'
 import dwgParserWorkerUrl from '../../node_modules/@mlightcad/cad-simple-viewer/dist/libredwg-parser-worker.js?url'
 import mtextRendererWorkerUrl from '../../node_modules/@mlightcad/cad-simple-viewer/dist/mtext-renderer-worker.js?url'
@@ -43,12 +43,18 @@ export function useCadViewer() {
     }
     layers.value = result
     currentLayer.value = db.clayer
+    drawingUnit.value = AcDbUnitsValue[db.insunits as AcDbUnitsValue] ?? 'Unknown'
   }
 
   function refreshUndoRedo() {
     const tm = docManager.value?.curDocument?.database.transactionManager
     canUndo.value = tm?.canUndo() ?? false
     canRedo.value = tm?.canRedo() ?? false
+  }
+
+  function refreshAfterDatabaseEdit() {
+    refreshLayers()
+    refreshUndoRedo()
   }
 
   function ensureLayoutViews(manager: AcApDocManager) {
@@ -109,7 +115,7 @@ export function useCadViewer() {
     // Undo/redo state must also refresh after edits made outside the
     // toolbar's own undo/redo/open calls (e.g. agent tool handlers editing
     // the database via acapRunDatabaseEdit, which emits this event).
-    eventBus.on('undo-stack-changed', refreshUndoRedo)
+    eventBus.on('undo-stack-changed', refreshAfterDatabaseEdit)
 
     return manager
   }

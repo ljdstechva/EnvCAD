@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { AcDbPolyline, AcGePoint2d } from '@mlightcad/data-model'
 import { polylineArea, polylineLength } from '../geometry'
-import { polylinePoints, polylineVertices } from '../polyline'
+import { extractPolylineVertices, polylinePoints, polylineVertices } from '../polyline'
 
 /**
  * A 10x10 square whose bottom edge is a semicircular arc of radius 5. A
@@ -22,17 +22,27 @@ function straightSquare(): AcDbPolyline {
   return bulgedSquare(0)
 }
 
-/**
- * A polyline whose public vertex API still works but whose private geometry
- * has been replaced — i.e. exactly what a @mlightcad/data-model upgrade that
- * reshapes the internal representation would look like to our bulge reader.
- */
-function withInternalGeometry(source: AcDbPolyline, geometry: unknown): AcDbPolyline {
+/** A polyline whose two public vertex APIs return controlled data. */
+function withPropertyVertices(source: AcDbPolyline, vertices: unknown): AcDbPolyline {
   const points = polylinePoints(source)
   return {
     numberOfVertices: points.length,
     getPoint3dAt: (index: number) => ({ x: points[index].x, y: points[index].y, z: 0 }),
-    _geo: geometry
+    properties: {
+      type: 'AcDbPolyline',
+      groups: [
+        {
+          groupName: 'geometry',
+          properties: [
+            {
+              name: 'vertices',
+              type: 'array',
+              accessor: { get: () => vertices }
+            }
+          ]
+        }
+      ]
+    }
   } as unknown as AcDbPolyline
 }
 
@@ -40,7 +50,7 @@ const SEMICIRCLE_AREA = (Math.PI * 5 * 5) / 2
 const SEMICIRCLE_LENGTH = Math.PI * 5
 
 describe('polylineVertices bulge extraction', () => {
-  it('reads bulges from the data-model geometry when it lines up with the public vertices', () => {
+  it('reads bulges from the public property accessor when it lines up with public points', () => {
     const vertices = polylineVertices(bulgedSquare(1))
     expect(vertices).toHaveLength(4)
     expect(vertices[0]).toEqual({ x: 0, y: 0, bulge: 1 })
@@ -69,13 +79,13 @@ describe('polylineVertices bulge extraction', () => {
     }
   })
 
-  it('takes vertex positions from the public API, never from the internal geometry', () => {
+  it('takes vertex positions from getPoint3dAt, never from property records', () => {
     const source = bulgedSquare(1)
     const publicPoints = polylinePoints(source)
-    const polyline = withInternalGeometry(source, {
-      // Same length and shape, but coordinates that disagree with getPoint3dAt.
-      vertices: publicPoints.map((point) => ({ x: point.x + 1000, y: point.y, bulge: 0.5 }))
-    })
+    const polyline = withPropertyVertices(
+      source,
+      publicPoints.map((point) => ({ x: point.x + 1000, y: point.y, bulge: 0.5 }))
+    )
 
     const vertices = polylineVertices(polyline)
     expect(vertices.map((vertex) => ({ x: vertex.x, y: vertex.y }))).toEqual(publicPoints)
@@ -84,32 +94,28 @@ describe('polylineVertices bulge extraction', () => {
   })
 
   describe('straight-vertex fallback', () => {
-    const brokenGeometries: Array<[string, unknown]> = [
-      ['the internal field is missing entirely', undefined],
-      ['the internal field is not an object', 42],
-      ['the vertex array is missing', {}],
-      ['the vertex array is not an array', { vertices: { 0: { x: 0, y: 0, bulge: 1 } } }],
-      ['the vertex count does not match', { vertices: [{ x: 0, y: 0, bulge: 1 }] }],
+    const brokenVertexValues: Array<[string, unknown]> = [
+      ['the accessor returns undefined', undefined],
+      ['the accessor value is not an array', 42],
+      ['the vertex count does not match', [{ x: 0, y: 0, bulge: 1 }]],
       [
         'a vertex entry is not an object',
-        { vertices: [null, { x: 10, y: 0 }, { x: 10, y: 10 }, { x: 0, y: 10 }] }
+        [null, { x: 10, y: 0 }, { x: 10, y: 10 }, { x: 0, y: 10 }]
       ],
       [
         'a vertex entry has no numeric coordinates',
-        {
-          vertices: [
-            { x: '0', y: '0', bulge: 1 },
-            { x: 10, y: 0 },
-            { x: 10, y: 10 },
-            { x: 0, y: 10 }
-          ]
-        }
+        [
+          { x: '0', y: '0', bulge: 1 },
+          { x: 10, y: 0 },
+          { x: 10, y: 10 },
+          { x: 0, y: 10 }
+        ]
       ]
     ]
 
-    it.each(brokenGeometries)('falls back to straight vertices when %s', (_label, geometry) => {
+    it.each(brokenVertexValues)('falls back to straight vertices when %s', (_label, value) => {
       const source = bulgedSquare(1)
-      const polyline = withInternalGeometry(source, geometry)
+      const polyline = withPropertyVertices(source, value)
 
       const vertices = polylineVertices(polyline)
       expect(vertices).toEqual(polylinePoints(source))
@@ -119,20 +125,25 @@ describe('polylineVertices bulge extraction', () => {
     it('treats a non-finite bulge as a straight segment', () => {
       const source = bulgedSquare(1)
       const points = polylinePoints(source)
-      const polyline = withInternalGeometry(source, {
-        vertices: points.map((point, index) => ({
+      const polyline = withPropertyVertices(
+        source,
+        points.map((point, index) => ({
           ...point,
           bulge: index === 0 ? Number.NaN : 0
         }))
-      })
+      )
 
       expect(polylineVertices(polyline)).toEqual(points)
     })
 
     it('degrades measurements to the chord polygon rather than producing wrong ones', () => {
-      const fallback = polylineVertices(withInternalGeometry(bulgedSquare(1), undefined))
+      const extraction = extractPolylineVertices(
+        withPropertyVertices(bulgedSquare(1), undefined)
+      )
+      const fallback = extraction.vertices
 
       // Exactly the straight 10x10 square a bulge-unaware CAD reader would see.
+      expect(extraction.bulgesVerified).toBe(false)
       expect(polylineArea(fallback, true)).toBeCloseTo(100)
       expect(polylineLength(fallback, true)).toBeCloseTo(40)
       expect(fallback).toEqual(polylineVertices(straightSquare()))

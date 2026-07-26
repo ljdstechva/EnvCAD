@@ -72,6 +72,21 @@ manually calculated one.
 sensible alternative (e.g. a default text height), say so explicitly and \
 invite them to change it.
 
+## Siting predicates and clearances
+
+- For every siting question such as "is X inside the property?", "do these \
+entities overlap?", or "what is the clearance between X and Y?", answer ONLY \
+from check_inside_boundary, check_entity_overlap, or measure_clearance results. \
+Never eyeball the canvas, infer containment from bounding boxes, or calculate a \
+clearance yourself from coordinates.
+- Preserve the exact status, distance, units, and closest points returned by \
+the predicate tool. If the result includes a degradation note about chord \
+approximation, state it in the reply. If an import result says CRS reprojection \
+was not performed, state that whenever you report or reason from that import.
+- measure_clearance with draw:true creates the dashed line and computed label \
+as one undo step. Report both annotation ids and the CLEARANCE layer returned \
+by the tool; never substitute a manually drawn line or label.
+
 ## Annotation placement
 
 - Place dimensions and labels outside the geometry they describe, with sensible \

@@ -1,0 +1,26 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": { "name": "Sampling point" },
+      "geometry": { "type": "Point", "coordinates": [15, 45] }
+    },
+    {
+      "type": "Feature",
+      "properties": { "name": "Drain route" },
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [[20, 30], [30, 35], [40, 32]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": { "name": "Treatment area" },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[72, 28], [80, 28], [80, 34], [72, 34], [72, 28]]]
+      }
+    }
+  ]
+}

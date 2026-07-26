@@ -2,7 +2,8 @@ import { AcApDocManager } from '@mlightcad/cad-simple-viewer'
 import { sheetStore } from '../sheet/sheetStore'
 import { agentBridge } from './bridge'
 import { captureSelectionSnapshot, captureSheetSnapshot } from './context'
-import type { ToolResult } from './protocol'
+import { executeCadTool } from './handlers'
+import type { CadToolName, ToolResult } from './protocol'
 
 export interface AgentTestResult {
   assistantText: string
@@ -29,6 +30,7 @@ export interface CadTestApi {
   selection(): string[]
   sheet(): unknown
   canUndo(): boolean
+  callTool(name: CadToolName, input: unknown): Promise<ToolResult>
 }
 
 declare global {
@@ -85,6 +87,9 @@ function installCadTestApi() {
     },
     canUndo() {
       return AcApDocManager.instance.curDocument.database.transactionManager.canUndo()
+    },
+    callTool(name, input) {
+      return executeCadTool(name, input)
     }
   }
 }

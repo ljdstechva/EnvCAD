@@ -296,16 +296,14 @@ further adjustment was needed once the dialogues ran.
 
 ## Regression notes
 
-- **Bulge-dependent measurements.** `src/agent/polyline.ts` recovers per-vertex
-  bulges from `AcDbPolyline`'s private `_geo` field, because the public API
-  exposes positions only. Positions always come from the public
-  `getPoint3dAt`, and bulges are trusted only when the internal array has the
-  same length as the public vertex list *and* every entry's x/y matches; on any
-  mismatch it falls back to straight vertices, so a representation change
-  degrades a curved polyline to its chord polygon rather than producing a wrong
-  number. `src/agent/__tests__/polyline.test.ts` drives every fallback branch
-  and cross-checks the closed-form arc area against the package's own
-  tessellated `AcDbPolyline.area`.
+- **Bulge-dependent measurements.** `src/agent/polyline.ts` gets positions from
+  public `getPoint3dAt` and bulges from the public `properties` accessor used by
+  the property palette. Bulges are trusted only when the property array has the
+  same length as the public point list *and* every entry's x/y matches; on any
+  mismatch it falls back to straight vertices. `src/agent/__tests__/polyline.test.ts`
+  drives the fallback branches and cross-checks the closed-form arc area
+  against the package's own tessellated `AcDbPolyline.area`. No `_geo` access
+  exists in the application source.
 - **Dependency pinning.** For that reason the `@mlightcad/*` versions in
   `package.json` are pinned exactly, with no `^`. An upgrade is a deliberate
   step: bump the pins, run `npx vitest run src/agent`, and re-run D7 and D12
@@ -382,3 +380,101 @@ the one-tool-call/one-undo-step assertions above are from the corrected run.
 
 As an extra tool check, `add_mtext` placed `Inspection note` at `(50,50)` with
 height `2` on `DIMENSIONS`, returned entity `90`, and one Ctrl+Z removed it.
+
+## Environmental siting and import dialogues
+
+These four dialogues were run through the visible chat UI on 2026-07-26. The
+fixture drawing unit was **Meters**. Browser snapshots recorded every tool
+input/result and the final assistant reply; rendered screenshots were inspected
+for the clearance annotation and monitoring-well symbols.
+
+### D16 — Import a five-point CSV boundary
+
+- **Selection:** none
+- **Prompt:**
+
+  ```text
+  Import this 5-point CSV boundary on BOUNDARY and report the computed area and perimeter:
+  x,y
+  0,0
+  100,0
+  100,60
+  0,60
+  0,0
+  ```
+
+- **Expected:** one `import_boundary_from_csv` call with the five CSV rows and
+  `layer:"BOUNDARY"`. The duplicated closing point is accepted, one closed
+  four-vertex polyline is created, and the reply reports code-computed area
+  `6000 m²` and perimeter `320 m`.
+- **Result: PASS.** `import_boundary_from_csv` returned entity `57`,
+  `inputRowCount:5`, `vertexCount:4`, `area:6000`, `perimeter:320`, and
+  `units:"Meters"`. The visible reply reported **6000 m²** and **320 m**. The
+  Undo button changed from disabled to enabled after this single tool call.
+
+### D17 — Are the selected tanks inside the property boundary?
+
+- **Selection:** fixture building polylines `36` and `37` (intentionally used
+  to verify the acceptance fixture; the assistant was expected to disclose
+  that these selected entities were BUILDINGS, despite the prompt calling them
+  tanks).
+- **Prompt:** `Are the selected tanks inside the property boundary? Use the closed BOUNDARY polyline with entity id 35.`
+- **Expected:** `get_selected_entities` first, then
+  `check_inside_boundary {"entityIds":["36","37"],"boundaryEntityId":"35"}`.
+  No visual inference. Both fixture buildings are `inside`.
+- **Result: PASS.** The exact two calls ran in order. The predicate returned
+  `36:inside`, `37:inside`, and no degradation notes. The reply reported both
+  statuses and correctly disclosed that the selected objects were building
+  footprints, not tank symbols.
+
+### D18 — Clearance between the generator and nearest building, drawn
+
+- **Setup:** `insert_symbol` placed a scale-1, rotation-0 generator at `(80,16)`
+  as entity `5C`; its exact footprint was x=`77..83`, y=`14..18`. The nearest
+  fixture building was entity `37`, whose footprint ends at x=`70`.
+- **Selection:** generator `5C` and building `37`.
+- **Prompt:** `Measure the clearance between the selected generator and its nearest building. Draw the clearance annotation with draw:true.`
+- **Expected:** `get_selected_entities`, then
+  `measure_clearance {"fromEntityId":"5C","toEntityId":"37","draw":true}`.
+  Exact clearance is `77 - 70 = 7 m`; the closest points belong to the correct
+  entities. A dashed line and computed label are added on `CLEARANCE` in one
+  undo record.
+- **Result: PASS.** The tool returned distance `7`, generator closest point
+  `(77,14)`, building closest point `(70,14)`, dashed-line id `5F`, label id
+  `60`, and label `7.00 Meters`. The rendered line and label were visibly
+  present. One Ctrl+Z removed both `5F` and `60` while preserving generator
+  `5C` and all nine pre-annotation model-space entities, proving the annotation
+  was one undo step.
+
+### D19 — Place MW-1 through MW-3
+
+- **Selection:** none
+- **Prompt:** `Place monitoring wells at (20,40), (40,40), and (60,40), using the default MW prefix so they are labelled MW-1 through MW-3.`
+- **Expected:** one `place_monitoring_points` call with the three coordinate
+  objects and no explicit prefix (therefore the `MW` default). Three circle +
+  crosshair + label blocks are created on `MONITORING`.
+- **Result: PASS.** One call returned block-reference ids `67`, `6D`, and `73`
+  with labels `MW-1`, `MW-2`, and `MW-3`. Visual inspection confirmed all
+  three circle/crosshair symbols and all three labels at the requested
+  positions, with no clipping or overlap.
+
+### Additional runtime verification
+
+- The toolbar **Import** menu exposed both **CSV boundary** and **GeoJSON**.
+  Importing `test/fixtures/boundary-5-point.csv` through the menu produced
+  entity `74` and the visible status `area 4000, perimeter 260 Meters`, using
+  the same `executeCadTool` path as the agent registry.
+- Importing `test/fixtures/environmental-features.geojson` through that menu
+  created one point, one line string, and one polygon and visibly stated:
+  `CRS reprojection was not performed.`
+- A direct browser-registry check classified three imported test points as
+  `inside`, `outside`, and `intersecting` against boundary `35`, respectively.
+- `check_entity_overlap` on boundary `35` and buildings `36`/`37` returned
+  exactly the two containment-overlap pairs and no building/building pair.
+- Circle-to-polyline clearance (`3B` → `37`) returned
+  `19.459060435491963 m`; the closest point ordering was verified as circle
+  point `(80.62985775562463,38.29911522529109)` then building point `(70,22)`.
+
+All four new dialogues passed after the implementation, and the toolbar paths,
+predicate edge cases, rendered output, and granular undo behavior were also
+verified live.

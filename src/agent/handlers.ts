@@ -13,7 +13,9 @@ import {
   AcDbLeader,
   AcDbLeaderAnnotationType,
   AcDbLine,
+  AcDbLinetypeTableRecord,
   AcDbMText,
+  AcDbPoint,
   AcDbPolyline,
   AcDbSolid,
   AcDbText,
@@ -46,12 +48,37 @@ import {
   type LinearDimensionOrientation,
   type Point2D
 } from './geometry'
-import { polylineVertices } from './polyline'
-import { CAD_TOOL_NAMES, type ToolResult } from './protocol'
+import { extractPolylineVertices, polylineVertices } from './polyline'
+import { parseBoundaryCsv, parseSupportedGeoJson } from './importers'
+import { CAD_TOOL_NAMES, type CadToolName, type ToolResult } from './protocol'
+import {
+  entityGeometriesOverlap,
+  minimumDistance,
+  pointInPolygon,
+  polygonsOverlap,
+  type EntityGeometry,
+  type PolylineGeometry
+} from '../geo/geometry'
+import {
+  SYMBOL_NAMES,
+  createMonitoringPointBlock,
+  ensureSymbolBlock,
+  symbolClearanceGeometry,
+  symbolNameFromBlock,
+  type SymbolName
+} from '../symbols/library'
 
 type InputRecord = Record<string, unknown>
 
 const DIMENSION_LAYER = 'DIMENSIONS'
+const BOUNDARY_LAYER = 'BOUNDARY'
+const CLEARANCE_LAYER = 'CLEARANCE'
+const MONITORING_LAYER = 'MONITORING'
+const IMPORT_LAYER = 'IMPORT'
+const CHORD_DEGRADATION_NOTE =
+  'Polyline bulges were approximated by straight chord geometry for this predicate; arc data were present or could not be verified through the public API.'
+const NO_REPROJECTION_NOTE =
+  'Coordinates were used as-is; CRS reprojection was NOT performed.'
 
 function errorResult(err: unknown): ToolResult {
   return { error: err instanceof Error ? err.message : String(err) }
@@ -1137,6 +1164,476 @@ function setTitleBlockFields(rawInput: unknown): ToolResult {
   return { data: { entityIds: [], fields: { ...sheetStore.current.fields }, ignoredFieldKeys } }
 }
 
+interface ExtractedGeometry {
+  geometry: EntityGeometry
+  chordApproximation: boolean
+}
+
+function entityGeometry(entity: AcDbEntity): ExtractedGeometry {
+  if (entity instanceof AcDbPoint) {
+    return {
+      geometry: { kind: 'point', point: { x: entity.position.x, y: entity.position.y } },
+      chordApproximation: false
+    }
+  }
+  if (entity instanceof AcDbLine) {
+    return {
+      geometry: {
+        kind: 'segment',
+        start: { x: entity.startPoint.x, y: entity.startPoint.y },
+        end: { x: entity.endPoint.x, y: entity.endPoint.y }
+      },
+      chordApproximation: false
+    }
+  }
+  if (entity instanceof AcDbPolyline) {
+    const extraction = extractPolylineVertices(entity)
+    const vertices = extraction.vertices
+    return {
+      geometry: {
+        kind: 'polyline',
+        points: vertices.map(({ x, y }) => ({ x, y })),
+        closed: entity.closed
+      },
+      chordApproximation: !extraction.bulgesVerified || hasBulgeArcs(vertices)
+    }
+  }
+  if (entity instanceof AcDbCircle) {
+    return {
+      geometry: {
+        kind: 'circle',
+        center: { x: entity.center.x, y: entity.center.y },
+        radius: entity.radius
+      },
+      chordApproximation: false
+    }
+  }
+  if (entity instanceof AcDbBlockReference) {
+    const scaleX = entity.scaleFactors.x
+    const scaleY = entity.scaleFactors.y
+    if (
+      !Number.isFinite(scaleX) ||
+      !Number.isFinite(scaleY) ||
+      Math.abs(Math.abs(scaleX) - Math.abs(scaleY)) > 1e-9
+    ) {
+      throw new Error(
+        `Block reference ${entity.objectId} has non-uniform scale and cannot be measured exactly`
+      )
+    }
+    const scale = Math.abs(scaleX)
+    const position = { x: entity.position.x, y: entity.position.y }
+    const rotationDeg = (entity.rotation * 180) / Math.PI
+    const symbolName = symbolNameFromBlock(entity.blockName)
+    if (symbolName) {
+      return {
+        geometry: symbolClearanceGeometry(symbolName, position, rotationDeg, scale),
+        chordApproximation: false
+      }
+    }
+    if (entity.blockName.startsWith('ENVCAD_MONITORING_')) {
+      return {
+        geometry: symbolClearanceGeometry('monitoring well', position, rotationDeg, scale),
+        chordApproximation: false
+      }
+    }
+  }
+  throw new Error(
+    `Entity ${entity.objectId} (${entity.type}) is not supported; use a point, line, polyline, circle, or EnvCAD symbol`
+  )
+}
+
+function chordNotes(extracted: readonly ExtractedGeometry[]): string[] {
+  return extracted.some((item) => item.chordApproximation) ? [CHORD_DEGRADATION_NOTE] : []
+}
+
+function createPolylineEntity(points: readonly Point2D[], closed: boolean, layer: string): AcDbPolyline {
+  const entity = new AcDbPolyline()
+  const vertices = closed ? withoutDuplicateClosingVertex(points) : [...points]
+  vertices.forEach((point, index) =>
+    entity.addVertexAt(index, new AcGePoint2d(point.x, point.y))
+  )
+  entity.closed = closed
+  entity.layer = layer
+  return entity
+}
+
+function importBoundaryFromCsv(rawInput: unknown): ToolResult {
+  const input = asRecord(rawInput, 'import_boundary_from_csv')
+  const csvText = nonEmptyString(input.csvText, 'csvText')
+  const suppliedPoints = parseBoundaryCsv(csvText)
+  const points = withoutDuplicateClosingVertex(suppliedPoints)
+  if (points.length < 3 || shoelaceArea(points) <= 0) {
+    throw new Error('CSV boundary must enclose a non-zero area')
+  }
+  const layer = layerFromInput(input) ?? BOUNDARY_LAYER
+  const area = shoelaceArea(points)
+  const perimeter = polylineLength(points, true)
+  const result = runEdit('Agent: import_boundary_from_csv', () => {
+    const layerResult = createLayerRecord(currentDatabase(), layer)
+    const entity = createPolylineEntity(points, true, layer)
+    currentDatabase().tables.blockTable.modelSpace.appendEntity(entity)
+    return { entityId: entity.objectId, layerCreated: layerResult.created }
+  })
+
+  return {
+    data: {
+      entityIds: [result.entityId],
+      entityId: result.entityId,
+      layer,
+      layerCreated: result.layerCreated,
+      inputRowCount: suppliedPoints.length,
+      vertexCount: points.length,
+      area,
+      perimeter,
+      units: drawingUnits(),
+      areaUnits: `${drawingUnits()} squared`
+    }
+  }
+}
+
+function importBoundaryFromGeoJson(rawInput: unknown): ToolResult {
+  const input = asRecord(rawInput, 'import_boundary_from_geojson')
+  const geojsonText = nonEmptyString(input.geojsonText, 'geojsonText')
+  const geometries = parseSupportedGeoJson(geojsonText)
+  if (geometries.length === 0) throw new Error('GeoJSON contains no supported geometries')
+  const layer = layerFromInput(input) ?? IMPORT_LAYER
+
+  const result = runEdit('Agent: import_boundary_from_geojson', () => {
+    const db = currentDatabase()
+    const layerResult = createLayerRecord(db, layer)
+    const entityIds: string[] = []
+    for (const geometry of geometries) {
+      if (geometry.kind === 'point') {
+        const point = new AcDbPoint()
+        point.position = point3D(geometry.point)
+        point.layer = layer
+        db.tables.blockTable.modelSpace.appendEntity(point)
+        entityIds.push(point.objectId)
+      } else {
+        const entity = createPolylineEntity(geometry.points, geometry.closed, layer)
+        db.tables.blockTable.modelSpace.appendEntity(entity)
+        entityIds.push(entity.objectId)
+      }
+    }
+    return { entityIds, layerCreated: layerResult.created }
+  })
+
+  return {
+    data: {
+      entityIds: result.entityIds,
+      importedCount: result.entityIds.length,
+      layer,
+      layerCreated: result.layerCreated,
+      geometryKinds: geometries.map((geometry) => geometry.kind),
+      crsNote: NO_REPROJECTION_NOTE
+    }
+  }
+}
+
+type BoundaryStatus = 'inside' | 'outside' | 'intersecting'
+
+function boundaryOutline(boundary: PolylineGeometry): PolylineGeometry {
+  return {
+    kind: 'polyline',
+    points: [...boundary.points, boundary.points[0]],
+    closed: false
+  }
+}
+
+function classifyAgainstBoundary(
+  candidate: EntityGeometry,
+  boundary: PolylineGeometry
+): BoundaryStatus {
+  const outline = boundaryOutline(boundary)
+  if (candidate.kind === 'composite') {
+    const statuses = candidate.parts.map((part) => classifyAgainstBoundary(part, boundary))
+    if (statuses.every((status) => status === 'inside')) return 'inside'
+    if (statuses.every((status) => status === 'outside')) return 'outside'
+    return 'intersecting'
+  }
+  if (candidate.kind === 'point') {
+    const location = pointInPolygon(candidate.point, boundary.points)
+    return location === 'boundary' ? 'intersecting' : location
+  }
+  if (candidate.kind === 'circle') {
+    const centerLocation = pointInPolygon(candidate.center, boundary.points)
+    const edgeDistance = minimumDistance(
+      { kind: 'point', point: candidate.center },
+      outline
+    ).distance
+    if (Math.abs(edgeDistance - candidate.radius) <= 1e-9 || edgeDistance < candidate.radius) {
+      return 'intersecting'
+    }
+    return centerLocation === 'inside' ? 'inside' : 'outside'
+  }
+
+  const points =
+    candidate.kind === 'segment' ? [candidate.start, candidate.end] : candidate.points
+  const locations = points.map((point) => pointInPolygon(point, boundary.points))
+  if (locations.some((location) => location === 'boundary')) return 'intersecting'
+  if (minimumDistance(candidate, outline).distance <= 1e-9) return 'intersecting'
+  if (locations.every((location) => location === 'inside')) return 'inside'
+
+  if (
+    candidate.kind === 'polyline' &&
+    candidate.closed &&
+    candidate.points.length >= 3 &&
+    polygonsOverlap(candidate.points, boundary.points)
+  ) {
+    return 'intersecting'
+  }
+  return locations.every((location) => location === 'outside') ? 'outside' : 'intersecting'
+}
+
+function checkInsideBoundary(rawInput: unknown): ToolResult {
+  const input = asRecord(rawInput, 'check_inside_boundary')
+  const ids = entityIds(input.entityIds)
+  const boundaryEntityId = nonEmptyString(input.boundaryEntityId, 'boundaryEntityId')
+  const db = currentDatabase()
+  const boundaryEntity = db.tables.blockTable.getEntityById(boundaryEntityId)
+  if (!boundaryEntity) throw new Error(`Boundary entity id not found: ${boundaryEntityId}`)
+  if (!(boundaryEntity instanceof AcDbPolyline) || !boundaryEntity.closed) {
+    throw new Error('boundaryEntityId must identify a closed polyline')
+  }
+  const boundaryExtracted = entityGeometry(boundaryEntity)
+  const boundary = boundaryExtracted.geometry
+  if (boundary.kind !== 'polyline' || boundary.points.length < 3) {
+    throw new Error('Boundary polyline must contain at least three vertices')
+  }
+  const entities = resolveEntities(ids, db)
+  const extracted = entities.map(entityGeometry)
+  const results = entities.map((entity, index) => ({
+    entityId: entity.objectId,
+    status: classifyAgainstBoundary(extracted[index].geometry, boundary)
+  }))
+
+  return {
+    data: {
+      boundaryEntityId,
+      results,
+      degradationNotes: chordNotes([boundaryExtracted, ...extracted])
+    }
+  }
+}
+
+function checkEntityOverlap(rawInput: unknown): ToolResult {
+  const input = asRecord(rawInput, 'check_entity_overlap')
+  const ids = entityIds(input.entityIds)
+  if (ids.length < 2) throw new Error('entityIds must contain at least two distinct ids')
+  const entities = resolveEntities(ids)
+  const extracted = entities.map(entityGeometry)
+  const overlappingPairs: Array<{ entityIdA: string; entityIdB: string }> = []
+  for (let first = 0; first < entities.length; first++) {
+    for (let second = first + 1; second < entities.length; second++) {
+      if (entityGeometriesOverlap(extracted[first].geometry, extracted[second].geometry)) {
+        overlappingPairs.push({
+          entityIdA: entities[first].objectId,
+          entityIdB: entities[second].objectId
+        })
+      }
+    }
+  }
+  return {
+    data: {
+      checkedEntityIds: ids,
+      overlappingPairs,
+      overlapCount: overlappingPairs.length,
+      degradationNotes: chordNotes(extracted)
+    }
+  }
+}
+
+function ensureDashedLinetype(db: AcDbDatabase): boolean {
+  if (db.tables.linetypeTable.has('DASHED')) return false
+  db.tables.linetypeTable.add(
+    new AcDbLinetypeTableRecord({
+      name: 'DASHED',
+      standardFlag: 0,
+      description: 'EnvCAD clearance annotation',
+      totalPatternLength: 2,
+      pattern: [
+        { elementLength: 1, elementTypeFlag: 0 },
+        { elementLength: -1, elementTypeFlag: 0 }
+      ]
+    })
+  )
+  return true
+}
+
+function drawClearanceAnnotation(
+  closest: ReturnType<typeof minimumDistance>,
+  units: string
+): {
+  entityIds: string[]
+  layerCreated: boolean
+  linetypeCreated: boolean
+  label: string
+} {
+  const db = currentDatabase()
+  const layerResult = createLayerRecord(db, CLEARANCE_LAYER)
+  const linetypeCreated = ensureDashedLinetype(db)
+  const line = new AcDbLine(point3D(closest.pointOnA), point3D(closest.pointOnB))
+  line.layer = CLEARANCE_LAYER
+  line.lineType = 'DASHED'
+  line.linetypeScale = Math.max(0.25, closest.distance / 10)
+  db.tables.blockTable.modelSpace.appendEntity(line)
+
+  const label = `${closest.distance.toFixed(2)} ${units}`
+  const labelEntity = new AcDbText()
+  labelEntity.position = point3D({
+    x: (closest.pointOnA.x + closest.pointOnB.x) / 2,
+    y: (closest.pointOnA.y + closest.pointOnB.y) / 2
+  })
+  labelEntity.textString = label
+  labelEntity.height = Math.min(2.5, Math.max(0.5, closest.distance / 8))
+  labelEntity.layer = CLEARANCE_LAYER
+  db.tables.blockTable.modelSpace.appendEntity(labelEntity)
+  return {
+    entityIds: [line.objectId, labelEntity.objectId],
+    layerCreated: layerResult.created,
+    linetypeCreated,
+    label
+  }
+}
+
+function measureClearance(rawInput: unknown): ToolResult {
+  const input = asRecord(rawInput, 'measure_clearance')
+  const fromEntityId = nonEmptyString(input.fromEntityId, 'fromEntityId')
+  const toEntityId = nonEmptyString(input.toEntityId, 'toEntityId')
+  if (fromEntityId === toEntityId) throw new Error('fromEntityId and toEntityId must be different')
+  const draw = input.draw === undefined ? false : input.draw
+  if (typeof draw !== 'boolean') throw new Error('draw must be a boolean')
+  const [fromEntity, toEntity] = resolveEntities([fromEntityId, toEntityId])
+  const from = entityGeometry(fromEntity)
+  const to = entityGeometry(toEntity)
+  const closest = minimumDistance(from.geometry, to.geometry)
+  const units = drawingUnits()
+  const annotation = draw
+    ? runEdit('Agent: measure_clearance', () => drawClearanceAnnotation(closest, units))
+    : null
+
+  return {
+    data: {
+      fromEntityId,
+      toEntityId,
+      distance: closest.distance,
+      units,
+      fromClosestPoint: closest.pointOnA,
+      toClosestPoint: closest.pointOnB,
+      drawn: draw,
+      annotationEntityIds: annotation?.entityIds ?? [],
+      annotationLayer: annotation ? CLEARANCE_LAYER : null,
+      annotationLabel: annotation?.label ?? null,
+      layerCreated: annotation?.layerCreated ?? false,
+      linetypeCreated: annotation?.linetypeCreated ?? false,
+      degradationNotes: chordNotes([from, to])
+    }
+  }
+}
+
+function nextMonitoringBlockName(db: AcDbDatabase, label: string): string {
+  const safeLabel = label.toUpperCase().replace(/[^A-Z0-9]+/g, '_').replace(/^_|_$/g, '') || 'POINT'
+  let suffix = 1
+  let candidate = `ENVCAD_MONITORING_${safeLabel}`
+  while (db.tables.blockTable.has(candidate)) {
+    suffix += 1
+    candidate = `ENVCAD_MONITORING_${safeLabel}_${suffix}`
+  }
+  return candidate
+}
+
+function placeMonitoringPoints(rawInput: unknown): ToolResult {
+  const input = asRecord(rawInput, 'place_monitoring_points')
+  if (!Array.isArray(input.points) || input.points.length === 0) {
+    throw new Error('points must contain at least one monitoring point')
+  }
+  const prefix = input.prefix === undefined ? 'MW' : nonEmptyString(input.prefix, 'prefix')
+  const points = input.points.map((value, index) => {
+    const record = asRecord(value, `points[${index}]`)
+    return {
+      position: point2D(record, `points[${index}]`),
+      label:
+        record.label === undefined
+          ? `${prefix}-${index + 1}`
+          : nonEmptyString(record.label, `points[${index}].label`)
+    }
+  })
+
+  const placed = runEdit('Agent: place_monitoring_points', () => {
+    const db = currentDatabase()
+    const layerCreated = createLayerRecord(db, MONITORING_LAYER).created
+    const results: Array<{ entityId: string; blockName: string; position: Point2D; label: string }> = []
+    for (const point of points) {
+      const name = nextMonitoringBlockName(db, point.label)
+      createMonitoringPointBlock(db, name, point.label)
+      const insert = new AcDbBlockReference(name)
+      insert.position = point3D(point.position)
+      insert.layer = MONITORING_LAYER
+      db.tables.blockTable.modelSpace.appendEntity(insert)
+      results.push({
+        entityId: insert.objectId,
+        blockName: name,
+        position: point.position,
+        label: point.label
+      })
+    }
+    return { layerCreated, results }
+  })
+
+  return {
+    data: {
+      entityIds: placed.results.map((result) => result.entityId),
+      points: placed.results,
+      layer: MONITORING_LAYER,
+      layerCreated: placed.layerCreated,
+      prefix
+    }
+  }
+}
+
+function symbolName(value: unknown): SymbolName {
+  const name = nonEmptyString(value, 'name')
+  if (!(SYMBOL_NAMES as readonly string[]).includes(name)) {
+    throw new Error(`Unknown symbol: ${name}. Available symbols: ${SYMBOL_NAMES.join(', ')}`)
+  }
+  return name as SymbolName
+}
+
+function insertSymbol(rawInput: unknown): ToolResult {
+  const input = asRecord(rawInput, 'insert_symbol')
+  const name = symbolName(input.name)
+  const position = point2D(input.position, 'position')
+  const rotationDeg =
+    input.rotationDeg === undefined ? 0 : finiteNumber(input.rotationDeg, 'rotationDeg')
+  const scale = input.scale === undefined ? 1 : positiveNumber(input.scale, 'scale')
+  const result = runEdit('Agent: insert_symbol', () => {
+    const db = currentDatabase()
+    const block = ensureSymbolBlock(db, name)
+    const insert = new AcDbBlockReference(block.blockName)
+    insert.position = point3D(position)
+    insert.rotation = (rotationDeg * Math.PI) / 180
+    insert.scaleFactors = new AcGePoint3d(scale, scale, scale)
+    insert.layer = db.clayer
+    db.tables.blockTable.modelSpace.appendEntity(insert)
+    return {
+      entityId: insert.objectId,
+      blockName: block.blockName,
+      blockCreated: block.created,
+      layer: insert.layer
+    }
+  })
+  return {
+    data: {
+      entityIds: [result.entityId],
+      ...result,
+      name,
+      position,
+      rotationDeg,
+      scale
+    }
+  }
+}
+
 const REAL_HANDLERS: Record<(typeof CAD_TOOL_NAMES)[number], ToolHandler> = {
   get_selected_entities: (input) => getSelectedEntities(input),
   get_drawing_context: () => getDrawingContext(),
@@ -1163,21 +1660,30 @@ const REAL_HANDLERS: Record<(typeof CAD_TOOL_NAMES)[number], ToolHandler> = {
   create_layer: (input) => createLayer(input),
   set_current_layer: (input) => setCurrentLayer(input),
   zoom_extents: () => zoomExtents(),
+  import_boundary_from_csv: (input) => importBoundaryFromCsv(input),
+  import_boundary_from_geojson: (input) => importBoundaryFromGeoJson(input),
+  check_inside_boundary: (input) => checkInsideBoundary(input),
+  check_entity_overlap: (input) => checkEntityOverlap(input),
+  measure_clearance: (input) => measureClearance(input),
+  place_monitoring_points: (input) => placeMonitoringPoints(input),
+  insert_symbol: (input) => insertSymbol(input),
   get_sheet_setup: () => getSheetSetup(),
   set_sheet_definition: (input) => setSheetDefinition(input),
   set_title_block_fields: (input) => setTitleBlockFields(input)
 }
 
+/** Runs the same deterministic browser executor used by both agent and toolbar calls. */
+export async function executeCadTool(name: CadToolName, input: unknown): Promise<ToolResult> {
+  try {
+    return await REAL_HANDLERS[name](input)
+  } catch (err) {
+    return errorResult(err)
+  }
+}
+
 /** Registers deterministic browser implementations for every CAD agent tool. */
 export function registerCadHandlers() {
   for (const name of CAD_TOOL_NAMES) {
-    const handler = REAL_HANDLERS[name]
-    agentBridge.registerHandler(name, (input) => {
-      try {
-        return handler(input)
-      } catch (err) {
-        return errorResult(err)
-      }
-    })
+    agentBridge.registerHandler(name, (input) => executeCadTool(name, input))
   }
 }

@@ -75,6 +75,13 @@ export const CAD_TOOL_NAMES = [
   'create_layer',
   'set_current_layer',
   'zoom_extents',
+  'import_boundary_from_csv',
+  'import_boundary_from_geojson',
+  'check_inside_boundary',
+  'check_entity_overlap',
+  'measure_clearance',
+  'place_monitoring_points',
+  'insert_symbol',
   'get_sheet_setup',
   'set_sheet_definition',
   'set_title_block_fields'

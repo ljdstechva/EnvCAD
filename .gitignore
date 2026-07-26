@@ -5,3 +5,4 @@ reference/
 *.log
 *.tsbuildinfo
 .playwright-cli/
+output/

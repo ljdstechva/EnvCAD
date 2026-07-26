@@ -10,6 +10,8 @@ export default defineConfig({
       'test/**/*.test.ts',
       'sidecar/src/**/*.test.ts',
       'src/agent/**/*.test.ts',
+      'src/geo/**/*.test.ts',
+      'src/symbols/**/*.test.ts',
       'src/sheet/__tests__/**/*.test.ts',
       'src/sheet/**/__tests__/**/*.test.ts'
     ],

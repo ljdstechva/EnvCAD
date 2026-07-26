@@ -352,6 +352,106 @@ export function createCadMcpServer(bridge: ToolBridge) {
     {}
   )
 
+  const importBoundaryFromCsv = passthrough(
+    bridge,
+    'import_boundary_from_csv',
+    'Import x,y CSV rows (optional x,y header; coordinates are drawing units) as one closed ' +
+      'boundary polyline. The browser computes and returns its exact straight-edge area and ' +
+      'perimeter. A duplicated final closing row is accepted. Defaults to the BOUNDARY layer.',
+    {
+      csvText: z.string().min(1).describe('CSV text containing x,y coordinate rows'),
+      layer: z.string().optional().describe('Destination layer; defaults to BOUNDARY')
+    }
+  )
+
+  const importBoundaryFromGeoJson = passthrough(
+    bridge,
+    'import_boundary_from_geojson',
+    'Import GeoJSON Point, LineString, and Polygon features as CAD points and polylines. ' +
+      'Polygon exterior and interior rings become separate closed polylines. Coordinates are ' +
+      'used as-is: CRS reprojection is NOT performed, and that note is returned to the caller.',
+    {
+      geojsonText: z.string().min(1).describe('GeoJSON FeatureCollection, Feature, or geometry text'),
+      layer: z.string().optional().describe('Destination layer; defaults to IMPORT')
+    }
+  )
+
+  const checkInsideBoundary = passthrough(
+    bridge,
+    'check_inside_boundary',
+    'Classify each entity as inside, outside, or intersecting a closed boundary polyline. ' +
+      'This is the authoritative tool for siting questions; never eyeball containment. ' +
+      'Arc-segmented polylines use their chord polygons and the result reports that degradation.',
+    {
+      entityIds: z.array(z.string()).min(1).describe('Entity ids to classify'),
+      boundaryEntityId: z.string().describe('Id of the closed boundary polyline')
+    }
+  )
+
+  const checkEntityOverlap = passthrough(
+    bridge,
+    'check_entity_overlap',
+    'Return every overlapping pair among two or more point, line, polyline/polygon, circle, or ' +
+      'EnvCAD symbol entities. Closed polylines and circles are treated as regions. ' +
+      'Arc-segmented polylines use chords and the result reports that degradation.',
+    {
+      entityIds: z.array(z.string()).min(2).describe('Entity ids to check pairwise')
+    }
+  )
+
+  const measureClearance = passthrough(
+    bridge,
+    'measure_clearance',
+    'Compute the exact minimum distance and the closest point on each of two supported entities. ' +
+      'When draw is true, add one dashed clearance line and one computed distance label on the ' +
+      'CLEARANCE layer; the entire annotation is one Ctrl+Z undo step. Arc-segmented polylines ' +
+      'use chord geometry and the result reports that degradation.',
+    {
+      fromEntityId: z.string().describe('First entity id'),
+      toEntityId: z.string().describe('Second entity id'),
+      draw: z.boolean().optional().describe('Draw the dashed annotation; defaults to false')
+    }
+  )
+
+  const placeMonitoringPoints = passthrough(
+    bridge,
+    'place_monitoring_points',
+    'Place labelled monitoring-well symbol blocks (circle, crosshair, and label) on the ' +
+      'MONITORING layer. Missing labels are generated as prefix-1 through prefix-n. The whole ' +
+      'call is one Ctrl+Z undo step.',
+    {
+      points: z
+        .array(
+          z.object({
+            ...Point2D,
+            label: z.string().min(1).optional().describe('Optional explicit point label')
+          })
+        )
+        .min(1),
+      prefix: z.string().min(1).optional().describe('Generated-label prefix; defaults to MW')
+    }
+  )
+
+  const insertSymbol = passthrough(
+    bridge,
+    'insert_symbol',
+    'Insert a reusable block from the EnvCAD environmental symbol library at the supplied ' +
+      'drawing position. Rotation is counter-clockwise in degrees and scale is uniform.',
+    {
+      name: z.enum([
+        'monitoring well',
+        'storage tank',
+        'generator',
+        'drain arrow',
+        'tree',
+        'north arrow'
+      ]),
+      position: z.object(Point2D),
+      rotationDeg: z.number().optional().describe('Counter-clockwise rotation; defaults to 0'),
+      scale: z.number().positive().optional().describe('Uniform scale; defaults to 1')
+    }
+  )
+
   const getSheetSetup = passthrough(
     bridge,
     'get_sheet_setup',
@@ -435,6 +535,13 @@ export function createCadMcpServer(bridge: ToolBridge) {
       createLayer,
       setCurrentLayer,
       zoomExtents,
+      importBoundaryFromCsv,
+      importBoundaryFromGeoJson,
+      checkInsideBoundary,
+      checkEntityOverlap,
+      measureClearance,
+      placeMonitoringPoints,
+      insertSymbol,
       getSheetSetup,
       setSheetDefinition,
       setTitleBlockFields
