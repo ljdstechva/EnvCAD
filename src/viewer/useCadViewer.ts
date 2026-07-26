@@ -3,6 +3,7 @@ import {
   AcApDocManager,
   AcApOpenViewMode,
   AcEdOpenMode,
+  eventBus,
   type AcEdSelectionEventArgs
 } from '@mlightcad/cad-simple-viewer'
 import { AcDbLayout } from '@mlightcad/data-model'
@@ -104,6 +105,11 @@ export function useCadViewer() {
       refreshUndoRedo()
       selectionCount.value = manager.curView.selectionSet.count
     })
+
+    // Undo/redo state must also refresh after edits made outside the
+    // toolbar's own undo/redo/open calls (e.g. agent tool handlers editing
+    // the database via acapRunDatabaseEdit, which emits this event).
+    eventBus.on('undo-stack-changed', refreshUndoRedo)
 
     return manager
   }

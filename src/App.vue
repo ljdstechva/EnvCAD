@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { onBeforeUnmount, onMounted, ref } from 'vue'
 import Toolbar from './components/Toolbar.vue'
 import LayersPanel from './components/LayersPanel.vue'
 import SidePanel from './components/SidePanel.vue'
@@ -12,10 +12,33 @@ const canvasContainer = ref<HTMLDivElement | null>(null)
 const layersOpen = ref(false)
 const sidePanelOpen = ref(true)
 
+function isTextEntryTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false
+  return target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable
+}
+
+function onGlobalKeydown(event: KeyboardEvent) {
+  if (isTextEntryTarget(event.target)) return
+  if (!(event.ctrlKey || event.metaKey)) return
+  const key = event.key.toLowerCase()
+  if (key === 'z' && !event.shiftKey) {
+    event.preventDefault()
+    viewer.undo()
+  } else if ((key === 'z' && event.shiftKey) || key === 'y') {
+    event.preventDefault()
+    viewer.redo()
+  }
+}
+
 onMounted(() => {
   if (canvasContainer.value) {
     viewer.init(canvasContainer.value)
   }
+  window.addEventListener('keydown', onGlobalKeydown)
+})
+
+onBeforeUnmount(() => {
+  window.removeEventListener('keydown', onGlobalKeydown)
 })
 
 function toggleLayers() {
