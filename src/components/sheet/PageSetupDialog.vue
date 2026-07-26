@@ -1,6 +1,12 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import { sheetStore } from '../../sheet/sheetStore'
+import {
+  exportTemplateToJson,
+  importTemplateFromJson
+} from '../../sheet/templates/customTemplates'
+import { listTemplates } from '../../sheet/templates/registry'
+import type { TitleBlockTemplate } from '../../sheet/templates/types'
 import { PAPER_SIZES, type Orientation, type PaperSizeId } from '../../sheet/types'
 import { closePageSetup, pageSetupOpen } from './pageSetupUiStore'
 import { pickModeActive, requestPickCenter } from './pickCenter'
@@ -71,6 +77,113 @@ const pickedCenter = computed(() => {
   const center = sheetStore.current.viewportCenter
   return center === 'extents' ? null : center
 })
+
+const availableTemplates = computed(() =>
+  listTemplates().filter(t => t.supportedPapers.includes(sheetStore.current.paper))
+)
+
+const selectedTemplate = computed<TitleBlockTemplate | undefined>(() =>
+  availableTemplates.value.find(t => t.id === sheetStore.current.templateId)
+)
+
+const editableFields = computed(() =>
+  (selectedTemplate.value?.fields ?? []).filter(f => f.key !== 'SCALE')
+)
+
+const templateImportError = ref<string | null>(null)
+const templateFileInput = ref<HTMLInputElement | null>(null)
+
+watch(
+  () => sheetStore.current.paper,
+  () => {
+    if (sheetStore.current.templateId && !selectedTemplate.value) {
+      sheetStore.current.templateId = undefined
+    }
+  }
+)
+
+function selectTemplate(id: string | undefined) {
+  sheetStore.current.templateId = id
+}
+
+function fieldValue(key: string): string {
+  return sheetStore.current.fields?.[key] ?? ''
+}
+
+function setFieldValue(key: string, value: string) {
+  if (!sheetStore.current.fields) sheetStore.current.fields = {}
+  sheetStore.current.fields[key] = value
+}
+
+function triggerImport() {
+  templateImportError.value = null
+  templateFileInput.value?.click()
+}
+
+async function onImportFile(event: Event) {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = ''
+  if (!file) return
+  try {
+    const text = await file.text()
+    const template = importTemplateFromJson(text)
+    sheetStore.current.templateId = template.id
+    templateImportError.value = null
+  } catch (err) {
+    templateImportError.value = err instanceof Error ? err.message : String(err)
+  }
+}
+
+function exportSelectedTemplate() {
+  const template = selectedTemplate.value
+  if (!template) return
+  const json = exportTemplateToJson(template)
+  const blob = new Blob([json], { type: 'application/json' })
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = `${template.id}.json`
+  link.click()
+  URL.revokeObjectURL(url)
+}
+
+function previewSvg(template: TitleBlockTemplate): string {
+  const W = 80
+  const H = 56
+  const parts = [`<rect x="2" y="2" width="${W - 4}" height="${H - 4}" fill="none" stroke="#888" stroke-width="1"/>`]
+
+  if (template.frame.length > 0) {
+    const xs = template.frame.flatMap(s => [s.x1, s.x2])
+    const ys = template.frame.flatMap(s => [s.y1, s.y2])
+    const boundsW = Math.max(...xs, 1)
+    const boundsH = Math.max(...ys, 1)
+    const targetW = Math.min(40, W - 6)
+    const scale = targetW / boundsW
+    const originX = W - 3
+    const originY = H - 3
+    for (const seg of template.frame) {
+      const x1 = originX - seg.x1 * scale
+      const y1 = originY - seg.y1 * scale
+      const x2 = originX - seg.x2 * scale
+      const y2 = originY - seg.y2 * scale
+      parts.push(`<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="#333" stroke-width="0.8"/>`)
+    }
+  }
+
+  if (template.northArrow) {
+    parts.push(
+      `<circle cx="${W - 8}" cy="8" r="3" fill="none" stroke="#333" stroke-width="0.8"/>` +
+        `<text x="${W - 8}" y="9.5" font-size="4" text-anchor="middle" fill="#333">N</text>`
+    )
+  }
+
+  if (template.scaleBar) {
+    parts.push(`<line x1="8" y1="${H - 8}" x2="24" y2="${H - 8}" stroke="#333" stroke-width="1.5"/>`)
+  }
+
+  return `<svg viewBox="0 0 ${W} ${H}" width="100%" height="100%">${parts.join('')}</svg>`
+}
 </script>
 
 <template>
@@ -159,6 +272,58 @@ const pickedCenter = computed(() => {
           <div v-if="pickModeActive" class="pick-hint">Click a point on the canvas… (Esc to cancel)</div>
           <div v-else-if="pickedCenter" class="hint">
             Center: {{ pickedCenter.x.toFixed(2) }}, {{ pickedCenter.y.toFixed(2) }}
+          </div>
+        </div>
+
+        <div class="field-group">
+          <label class="group-label">Title block template</label>
+          <div class="template-grid">
+            <button
+              class="template-card"
+              :class="{ active: !sheetStore.current.templateId }"
+              @click="selectTemplate(undefined)"
+            >
+              <div class="template-preview none-preview">None</div>
+              <span class="template-name">No template</span>
+            </button>
+            <button
+              v-for="template in availableTemplates"
+              :key="template.id"
+              class="template-card"
+              :class="{ active: sheetStore.current.templateId === template.id }"
+              :title="template.description"
+              @click="selectTemplate(template.id)"
+            >
+              <div class="template-preview" v-html="previewSvg(template)"></div>
+              <span class="template-name">{{ template.name }}</span>
+            </button>
+          </div>
+
+          <div class="template-io">
+            <button @click="triggerImport">Import…</button>
+            <button :disabled="!selectedTemplate" @click="exportSelectedTemplate">Export…</button>
+            <input
+              ref="templateFileInput"
+              type="file"
+              accept="application/json"
+              class="hidden-file-input"
+              @change="onImportFile"
+            />
+          </div>
+          <div v-if="templateImportError" class="hint error-hint">{{ templateImportError }}</div>
+        </div>
+
+        <div v-if="editableFields.length" class="field-group">
+          <label class="group-label">Title block fields</label>
+          <div class="fields-grid">
+            <label v-for="field in editableFields" :key="field.key" class="field-input">
+              {{ field.label }}
+              <input
+                type="text"
+                :value="fieldValue(field.key)"
+                @input="setFieldValue(field.key, ($event.target as HTMLInputElement).value)"
+              />
+            </label>
           </div>
         </div>
       </div>
@@ -316,6 +481,99 @@ input[type='number'] {
 .pick-hint {
   font-size: 11px;
   color: #e0b84e;
+}
+
+.template-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 8px;
+}
+
+.template-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  background: #3c3c3c;
+  border: 1px solid #4a4a4a;
+  border-radius: 3px;
+  padding: 6px;
+  cursor: pointer;
+  color: #ccc;
+}
+
+.template-card.active {
+  background: #0e639c;
+  border-color: #1177bb;
+  color: #fff;
+}
+
+.template-preview {
+  width: 100%;
+  height: 56px;
+  background: #fff;
+  border-radius: 2px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.template-preview.none-preview {
+  color: #999;
+  font-size: 11px;
+}
+
+.template-name {
+  font-size: 10px;
+  text-align: center;
+  line-height: 1.3;
+}
+
+.template-io {
+  display: flex;
+  gap: 8px;
+}
+
+.template-io button {
+  flex: 1;
+  background: #3c3c3c;
+  color: #ccc;
+  border: 1px solid #4a4a4a;
+  border-radius: 3px;
+  padding: 6px 8px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.template-io button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.hidden-file-input {
+  display: none;
+}
+
+.error-hint {
+  color: #f0a0a0;
+}
+
+.fields-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.field-input {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 11px;
+  color: #999;
+}
+
+.field-input input {
+  width: 100%;
 }
 
 .dialog-footer {

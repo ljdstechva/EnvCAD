@@ -41,6 +41,8 @@ export interface SheetDefinition {
   viewportCenter: { x: number; y: number } | 'extents'
   templateId?: string
   fields?: Record<string, string>
+  /** Rotation of the north arrow in degrees, clockwise from up. */
+  northRotationDeg?: number
 }
 
 export interface SheetRenderResult {

@@ -9,6 +9,8 @@ import type {
   DrawingExtents,
   SheetLayout
 } from './sheetGeometry'
+import { getTemplateById } from './templates/registry'
+import { renderTitleBlockOverlay } from './templates/renderTitleBlock'
 import type {
   SheetDefinition,
   SheetRenderer,
@@ -68,7 +70,7 @@ export class CadSheetRenderer implements SheetRenderer {
     const drawingSvg = await renderModelSpace(cadDoc.database, entities)
 
     return {
-      svg: composePageSvg(drawingSvg, layout),
+      svg: composePageSvg(drawingSvg, layout, sheet),
       warnings: layout.warnings
     }
   }
@@ -136,7 +138,8 @@ async function renderEntitiesInDeterministicOrder(
 
 function composePageSvg(
   drawingSvg: string,
-  layout: SheetLayout
+  layout: SheetLayout,
+  sheet: SheetDefinition
 ): string {
   const { page, printableArea, viewport } = layout
   const drawingBody = extractSvgBody(drawingSvg)
@@ -150,6 +153,10 @@ function composePageSvg(
   const viewBoxY = formatNumber(-viewport.top)
   const viewBoxWidth = formatNumber(viewport.width)
   const viewBoxHeight = formatNumber(viewport.height)
+  const template = getTemplateById(sheet.templateId)
+  const titleBlockSvg = template
+    ? renderTitleBlockOverlay(sheet, template, printableArea)
+    : ''
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" version="1.1"
@@ -169,6 +176,7 @@ ${indent(drawingBody, 6)}
   </g>
   <rect x="${printableX}" y="${printableY}" width="${printableWidth}" height="${printableHeight}"
     fill="none" stroke="#000000" stroke-width="0.2"/>
+${indent(titleBlockSvg, 2)}
 </svg>`
 }
 
