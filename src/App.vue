@@ -4,6 +4,7 @@ import Toolbar from './components/Toolbar.vue'
 import LayersPanel from './components/LayersPanel.vue'
 import SidePanel from './components/SidePanel.vue'
 import StatusBar from './components/StatusBar.vue'
+import PageSetupDialog from './components/sheet/PageSetupDialog.vue'
 import { useCadViewer } from './viewer/useCadViewer'
 
 const viewer = useCadViewer()
@@ -40,6 +41,7 @@ function toggleLayers() {
       </div>
     </div>
     <StatusBar :viewer="viewer" />
+    <PageSetupDialog />
   </div>
 </template>
 

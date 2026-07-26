@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref } from 'vue'
 import type { CadViewerApi } from '../viewer/useCadViewer'
+import { openPageSetup } from './sheet/pageSetupUiStore'
 
 const props = defineProps<{
   viewer: CadViewerApi
@@ -45,6 +46,8 @@ function onFileChosen(e: Event) {
     <button @click="viewer.zoomExtents()" :disabled="!viewer.documentOpen">Zoom Extents</button>
     <span class="sep"></span>
     <button :class="{ active: layersOpen }" @click="emit('toggle-layers')">Layers</button>
+    <span class="sep"></span>
+    <button @click="openPageSetup">Page Setup</button>
   </div>
 </template>
 

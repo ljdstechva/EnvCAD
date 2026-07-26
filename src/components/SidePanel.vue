@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref } from 'vue'
+import SheetPreviewPanel from './sheet/SheetPreviewPanel.vue'
 
 type TabId = 'ai' | 'sheet'
 
@@ -18,7 +19,7 @@ const activeTab = ref<TabId>('ai')
     </div>
     <div class="tab-content">
       <div v-if="activeTab === 'ai'" class="placeholder">AI Assistant (coming soon)</div>
-      <div v-else class="placeholder">Sheet Preview (coming soon)</div>
+      <SheetPreviewPanel v-else />
     </div>
   </div>
 </template>
