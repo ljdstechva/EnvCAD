@@ -1,6 +1,12 @@
 <script setup lang="ts">
 import { ref } from 'vue'
 import SheetPreviewPanel from './sheet/SheetPreviewPanel.vue'
+import ChatPanel from './chat/ChatPanel.vue'
+import type { CadViewerApi } from '../viewer/useCadViewer'
+
+const props = defineProps<{
+  viewer: CadViewerApi
+}>()
 
 type TabId = 'ai' | 'sheet'
 
@@ -17,8 +23,8 @@ const activeTab = ref<TabId>('ai')
         Sheet Preview
       </button>
     </div>
-    <div class="tab-content">
-      <div v-if="activeTab === 'ai'" class="placeholder">AI Assistant (coming soon)</div>
+    <div class="tab-content" :class="{ chat: activeTab === 'ai' }">
+      <ChatPanel v-if="activeTab === 'ai'" :viewer="props.viewer" />
       <SheetPreviewPanel v-else />
     </div>
   </div>
@@ -57,13 +63,11 @@ const activeTab = ref<TabId>('ai')
 
 .tab-content {
   flex: 1;
+  min-height: 0;
   overflow: auto;
 }
 
-.placeholder {
-  color: #888;
-  font-style: italic;
-  padding: 16px;
-  text-align: center;
+.tab-content.chat {
+  overflow: hidden;
 }
 </style>

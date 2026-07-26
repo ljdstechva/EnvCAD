@@ -37,7 +37,7 @@ function toggleLayers() {
         </button>
       </div>
       <div v-if="sidePanelOpen" class="side-dock">
-        <SidePanel />
+        <SidePanel :viewer="viewer" />
       </div>
     </div>
     <StatusBar :viewer="viewer" />
