@@ -13,6 +13,23 @@ export interface BoundingBox2D {
   max: Point2D
 }
 
+export type LinearDimensionOrientation = 'horizontal' | 'vertical' | 'aligned'
+
+export interface LinearDimensionGeometry {
+  extensionLine1: { start: Point2D; end: Point2D }
+  extensionLine2: { start: Point2D; end: Point2D }
+  dimensionLine: { start: Point2D; end: Point2D }
+  textPosition: Point2D
+  angleRad: number
+  measurement: number
+}
+
+export interface ArrowheadGeometry {
+  tip: Point2D
+  baseLeft: Point2D
+  baseRight: Point2D
+}
+
 const POINT_EPSILON = 1e-12
 
 function samePoint(a: Point2D, b: Point2D): boolean {
@@ -107,6 +124,100 @@ export function boundingBoxCenter(box: BoundingBox2D): Point2D {
 
 export function distance(a: Point2D, b: Point2D): number {
   return Math.hypot(b.x - a.x, b.y - a.y)
+}
+
+function addScaled(point: Point2D, vector: Point2D, scale: number): Point2D {
+  return { x: point.x + vector.x * scale, y: point.y + vector.y * scale }
+}
+
+/**
+ * Computes the exact construction geometry for a linear dimension.
+ *
+ * Horizontal and vertical dimensions measure the corresponding projected
+ * coordinate difference. Aligned dimensions measure the Euclidean distance
+ * between the supplied definition points.
+ */
+export function linearDimensionGeometry(
+  p1: Point2D,
+  p2: Point2D,
+  offset: number,
+  orientation: LinearDimensionOrientation
+): LinearDimensionGeometry {
+  let direction: Point2D
+  let normal: Point2D
+  let measurement: number
+  let dimensionStart: Point2D
+  let dimensionEnd: Point2D
+
+  if (orientation === 'horizontal') {
+    measurement = Math.abs(p2.x - p1.x)
+    if (measurement <= POINT_EPSILON) {
+      throw new Error('Horizontal dimension points must have different X coordinates')
+    }
+    const sign = Math.sign(p2.x - p1.x)
+    direction = { x: sign, y: 0 }
+    normal = { x: 0, y: 1 }
+    dimensionStart = { x: p1.x, y: p1.y + offset }
+    dimensionEnd = { x: p2.x, y: p1.y + offset }
+  } else if (orientation === 'vertical') {
+    measurement = Math.abs(p2.y - p1.y)
+    if (measurement <= POINT_EPSILON) {
+      throw new Error('Vertical dimension points must have different Y coordinates')
+    }
+    const sign = Math.sign(p2.y - p1.y)
+    direction = { x: 0, y: sign }
+    normal = { x: 1, y: 0 }
+    dimensionStart = { x: p1.x + offset, y: p1.y }
+    dimensionEnd = { x: p1.x + offset, y: p2.y }
+  } else {
+    measurement = distance(p1, p2)
+    if (measurement <= POINT_EPSILON) {
+      throw new Error('Aligned dimension points must be distinct')
+    }
+    direction = { x: (p2.x - p1.x) / measurement, y: (p2.y - p1.y) / measurement }
+    normal = { x: -direction.y, y: direction.x }
+    dimensionStart = addScaled(p1, normal, offset)
+    dimensionEnd = addScaled(p2, normal, offset)
+  }
+
+  return {
+    extensionLine1: { start: { ...p1 }, end: { ...dimensionStart } },
+    extensionLine2: { start: { ...p2 }, end: { ...dimensionEnd } },
+    dimensionLine: { start: dimensionStart, end: dimensionEnd },
+    textPosition: {
+      x: (dimensionStart.x + dimensionEnd.x) / 2,
+      y: (dimensionStart.y + dimensionEnd.y) / 2
+    },
+    angleRad: Math.atan2(direction.y, direction.x),
+    measurement
+  }
+}
+
+/**
+ * Returns a filled triangular arrowhead whose tip is at `tip` and whose body
+ * extends in `inwardDirection`. The direction need not already be normalized.
+ */
+export function arrowheadGeometry(
+  tip: Point2D,
+  inwardDirection: Point2D,
+  length: number,
+  width: number
+): ArrowheadGeometry {
+  const magnitude = Math.hypot(inwardDirection.x, inwardDirection.y)
+  if (magnitude <= POINT_EPSILON) throw new Error('Arrow direction must be non-zero')
+  if (!(length > 0) || !(width > 0)) throw new Error('Arrow length and width must be positive')
+
+  const direction = {
+    x: inwardDirection.x / magnitude,
+    y: inwardDirection.y / magnitude
+  }
+  const perpendicular = { x: -direction.y, y: direction.x }
+  const baseCenter = addScaled(tip, direction, length)
+  return {
+    tip: { ...tip },
+    baseLeft: addScaled(baseCenter, perpendicular, width / 2),
+    baseRight: addScaled(baseCenter, perpendicular, -width / 2)
+  }
 }
 
 /**

@@ -263,10 +263,13 @@ sidecar on the Claude Code subscription login.
 | D10 ambiguous referent | none (refusal) | PASS |
 | D11 no selection | none (refusal) | PASS |
 | D12 compound | `create_layer` → `set_current_layer` → `draw_line` → `calculate_length` | PASS |
+| D13 rectangle dimensions | `get_selected_entities` → `add_linear_dimension` → `add_linear_dimension` | PASS |
+| D14 leader | `add_leader` | PASS |
+| D15 radius dimension | `get_selected_entities` → `add_radius_dimension` | PASS |
 | S1 undo invariant | — | PASS |
 | S2 no invented dimension | — | PASS |
 
-12 / 12 dialogues behaved as documented, with no tool-call deviations, no
+15 / 15 dialogues behaved as documented, with no tool-call deviations, no
 sidecar or protocol errors, and no unintended database edits.
 
 ### Changes made before this run
@@ -309,3 +312,73 @@ further adjustment was needed once the dialogues ran.
   from this plan.
 - The fixture contains no bulged polyline, so D7 exercises the straight-vertex
   path only; the arc path is covered by unit tests.
+
+## Technical annotation dialogues
+
+These dialogues extend the live acceptance run for the annotation tools. As
+with D1-D12, prompts are sent through the visible chat UI and the recorded tool
+calls come from the browser bridge.
+
+### D13 — Dimension the selected building rectangle
+
+- **Selection:** the closed building rectangle.
+- **Prompt:** `Add dimensions to this. Show its width below the rectangle and its height to the right.`
+- **Expected:** `get_selected_entities` first, using the returned polyline
+  vertices as the actual definition points, then two separate
+  `add_linear_dimension` calls. The width uses `orientation: "horizontal"` and
+  a negative outside offset; the height uses `orientation: "vertical"` and a
+  positive outside offset. Labels show the exact values to two decimals on
+  `DIMENSIONS`.
+- **Result: PASS.** `get_selected_entities {"ids":["36"]}` returned the
+  rectangle's four public vertices. The agent then called
+  `add_linear_dimension` with `(10,10)` → `(30,10)`, offset `-3`,
+  `horizontal`, followed by `(30,10)` → `(30,25)`, offset `+3`, `vertical`.
+  The returned inserts were `6F` and `77`; the visible labels were `20.00` and
+  `15.00`. One Ctrl+Z removed only `77` and left `6F` with `canUndo: true`; a
+  second Ctrl+Z removed `6F` and returned `canUndo: false`.
+
+### D14 — Leader with text
+
+- **Selection:** none.
+- **Prompt:** `Add a leader pointing to (30, 25) with the text "Sampling point". Put the text at (42, 34).`
+- **Expected:** one `add_leader` call with the exact target, text, and text
+  position. The returned leader and MTEXT ids are reported, both are on
+  `DIMENSIONS`, and one Ctrl+Z removes both.
+- **Result: PASS.** One `add_leader` call used target `(30,25)`, text
+  `Sampling point`, and text position `(42,34)`, returning leader `81` and
+  MTEXT `80`. A single Ctrl+Z removed both ids while leaving the earlier
+  dimension inserts in the drawing.
+
+### D15 — Radius dimension on the tank circle
+
+- **Selection:** the tank circle.
+- **Prompt:** `Add a radius dimension to this tank circle at 45 degrees.`
+- **Expected:** `get_selected_entities` first, followed by one
+  `add_radius_dimension` call using the returned circle id and
+  `angleDeg: 45`. The displayed label is `R ` plus the database radius to
+  exactly two decimals.
+- **Result: PASS.** `get_selected_entities {"ids":["3B"]}` returned the tank
+  circle at `(85,45)` with radius `8`. `add_radius_dimension
+  {"circleEntityId":"3B","angleDeg":45}` returned insert `86` and displayed
+  `R 8.00`. A supplementary 135° radius call returned insert `94`; one
+  Ctrl+Z removed `94` while the previously reopened insert `86` remained.
+
+### Annotation round-trip and rendering
+
+After D13-D15, Save DXF produced a 9,562-byte file containing three
+`ENVCAD_DIM_*` block definitions, filled `SOLID` arrowheads, MTEXT labels
+`20.00`, `15.00`, and `R 8.00`, and three model-space `INSERT` entities on
+`DIMENSIONS`. Reopening that exact downloaded DXF in EnvCAD restored block
+references `6F`, `7F`, and `86` with non-empty extents and visibly rendered
+the two rectangle dimensions and the tank radius annotation. (The height
+insert is `7F` in the saved file because it was re-added after the granular
+undo check.)
+
+The first granular undo attempt exposed two keyboard listeners handling the
+same Ctrl+Z: EnvCAD's application listener and the viewer's built-in global
+shortcut. `src/App.vue` now leaves undo/redo keyboard ownership to the viewer,
+whose command also refreshes the toolbar. D13 was rerun after that fix, and
+the one-tool-call/one-undo-step assertions above are from the corrected run.
+
+As an extra tool check, `add_mtext` placed `Inspection note` at `(50,50)` with
+height `2` on `DIMENSIONS`, returned entity `90`, and one Ctrl+Z removed it.

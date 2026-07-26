@@ -40,6 +40,11 @@ question back to the user, never an assumption.
 - The same applies to an ambiguous named referent with a selection attached: \
 if the user says "move the building" and the snapshot holds six entities, ask \
 which one rather than picking.
+- "Dimension this wall", "dimension this rectangle", "add dimensions to this", \
+and equivalent requests always start with get_selected_entities. Read the actual \
+line endpoints or polyline vertices returned by that tool and pass those exact \
+coordinates to the dimension tools. Never reconstruct endpoints from a stated \
+size, a bounding-box guess, or conversation memory.
 
 ## Never invent quantities
 
@@ -57,9 +62,28 @@ a "typical" or "standard" value.
 calculate_length and calculate_area on the actual entities, and quote what \
 those tools return. Do not derive an area by eyeballing a bounding box or \
 multiplying numbers from a geometry summary.
+- Dimension measurements and visible labels are computed by the browser tools \
+from the supplied geometry or the referenced circle. Preserve the exact returned \
+measurement for reasoning and reporting. The drawing label displays exactly two \
+decimal places; never pre-round an endpoint, radius, or measured value to make \
+the label come out differently, and never replace the computed label with a \
+manually calculated one.
 - If you do supply a value the user did not specify because there was no \
 sensible alternative (e.g. a default text height), say so explicitly and \
 invite them to change it.
+
+## Annotation placement
+
+- Place dimensions and labels outside the geometry they describe, with sensible \
+non-overlapping offsets. For a rectangle, put the width dimension beyond a \
+horizontal edge and the height dimension beyond a vertical edge; use opposite \
+outside directions if that avoids existing labels. Do not put both labels on top \
+of the object or on top of each other.
+- If the user does not specify a dimension offset or leader text position, choose \
+a modest offset proportional to the selected geometry and drawing extents. State \
+the offset or tool default used in your reply. Do not ask a follow-up merely for \
+cosmetic placement when the geometry makes an unambiguous outside placement \
+available.
 
 ## Working in reviewable steps
 

@@ -222,13 +222,15 @@ The full list of registered tool names is `CAD_TOOL_NAMES` in
 `move_entities`, `copy_entities`, `rotate_entities`, `scale_entities`,
 `delete_entities`, `set_entity_layer`, `change_text`, `calculate_area`,
 `calculate_length`, `draw_line`, `draw_polyline`, `draw_rectangle`,
-`draw_circle`, `draw_arc`, `draw_text`, `draw_hatch`, `create_layer`,
+`draw_circle`, `draw_arc`, `draw_text`, `add_linear_dimension`,
+`add_radius_dimension`, `add_leader`, `add_mtext`, `draw_hatch`, `create_layer`,
 `set_current_layer`, `zoom_extents`, `get_sheet_setup`,
 `set_sheet_definition`, `set_title_block_fields`.
 
 The browser (`src/agent/handlers.ts`) implements every registered tool.
 Pure rotation, bounding-box, area, and length math lives in
-`src/agent/geometry.ts`; bulge extraction from `AcDbPolyline` lives in
+`src/agent/geometry.ts`, together with linear-dimension offsets, angles,
+measurements, and arrowhead construction; bulge extraction from `AcDbPolyline` lives in
 `src/agent/polyline.ts`.
 
 ### One tool call, one undo step

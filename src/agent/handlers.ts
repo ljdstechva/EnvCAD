@@ -2,17 +2,23 @@ import { AcApDocManager, acapRunDatabaseEdit } from '@mlightcad/cad-simple-viewe
 import {
   AcCmColor,
   AcDbArc,
+  AcDbBlockReference,
+  AcDbBlockTableRecord,
   AcDbCircle,
   AcDbEntity,
   AcDbHatch,
   AcDbHatchPatternType,
   AcDbHatchStyle,
   AcDbLayerTableRecord,
+  AcDbLeader,
+  AcDbLeaderAnnotationType,
   AcDbLine,
   AcDbMText,
   AcDbPolyline,
+  AcDbSolid,
   AcDbText,
   AcDbUnitsValue,
+  AcGiMTextAttachmentPoint,
   AcGeLine2d,
   AcGeLoop2d,
   AcGeMatrix3d,
@@ -26,21 +32,26 @@ import { listTemplates } from '../sheet/templates/registry'
 import { PAPER_SIZES, type PaperSizeId, type SheetDefinition } from '../sheet/types'
 import { agentBridge, type ToolHandler } from './bridge'
 import {
+  arrowheadGeometry,
   boundingBoxCenter,
   distance,
   hasBulgeArcs,
+  linearDimensionGeometry,
   polylineArea,
   polylineLength,
   shoelaceArea,
   unionBoundingBoxes,
   withoutDuplicateClosingVertex,
   type BoundingBox2D,
+  type LinearDimensionOrientation,
   type Point2D
 } from './geometry'
 import { polylineVertices } from './polyline'
 import { CAD_TOOL_NAMES, type ToolResult } from './protocol'
 
 type InputRecord = Record<string, unknown>
+
+const DIMENSION_LAYER = 'DIMENSIONS'
 
 function errorResult(err: unknown): ToolResult {
   return { error: err instanceof Error ? err.message : String(err) }
@@ -201,6 +212,83 @@ function appendEntity(entity: AcDbEntity, layer?: string): string {
   }
   db.tables.blockTable.modelSpace.appendEntity(entity)
   return entity.objectId
+}
+
+function annotationLayer(input: InputRecord, db = currentDatabase()): {
+  name: string
+  created: boolean
+} {
+  const name = layerFromInput(input) ?? DIMENSION_LAYER
+  const { created } = createLayerRecord(db, name)
+  return { name, created }
+}
+
+function nextAnnotationBlockName(db = currentDatabase()): string {
+  let suffix = 1
+  while (db.tables.blockTable.has(`ENVCAD_DIM_${suffix}`)) suffix += 1
+  return `ENVCAD_DIM_${suffix}`
+}
+
+function localPoint(point: Point2D, origin: Point2D): Point2D {
+  return { x: point.x - origin.x, y: point.y - origin.y }
+}
+
+function blockLine(start: Point2D, end: Point2D, origin: Point2D): AcDbLine {
+  const line = new AcDbLine(point3D(localPoint(start, origin)), point3D(localPoint(end, origin)))
+  line.layer = '0'
+  return line
+}
+
+function blockMText(
+  position: Point2D,
+  origin: Point2D,
+  contents: string,
+  height: number,
+  rotation = 0,
+  attachmentPoint = AcGiMTextAttachmentPoint.MiddleCenter
+): AcDbMText {
+  const text = new AcDbMText()
+  text.location = point3D(localPoint(position, origin))
+  text.contents = contents
+  text.height = height
+  text.rotation = rotation
+  text.attachmentPoint = attachmentPoint
+  text.layer = '0'
+  return text
+}
+
+function blockArrow(
+  arrow: ReturnType<typeof arrowheadGeometry>,
+  origin: Point2D
+): AcDbSolid {
+  const solid = new AcDbSolid()
+  const tip = point3D(localPoint(arrow.tip, origin))
+  const baseLeft = point3D(localPoint(arrow.baseLeft, origin))
+  const baseRight = point3D(localPoint(arrow.baseRight, origin))
+  solid.setPointAt(0, tip)
+  solid.setPointAt(1, baseLeft)
+  solid.setPointAt(2, baseRight)
+  solid.setPointAt(3, baseRight)
+  solid.layer = '0'
+  return solid
+}
+
+function annotationScale(measurement: number): number {
+  return Math.min(2.5, Math.max(0.25, measurement / 10))
+}
+
+function appendAnnotationBlock(
+  db: AcDbDatabase,
+  block: AcDbBlockTableRecord,
+  origin: Point2D,
+  layer: string
+): { entityId: string; blockName: string } {
+  db.tables.blockTable.add(block)
+  const insert = new AcDbBlockReference(block.name)
+  insert.position = point3D(origin)
+  insert.layer = layer
+  db.tables.blockTable.modelSpace.appendEntity(insert)
+  return { entityId: insert.objectId, blockName: block.name }
 }
 
 function bboxData(entity: AcDbEntity) {
@@ -659,6 +747,235 @@ function drawText(rawInput: unknown): ToolResult {
   }
 }
 
+function addLinearDimension(rawInput: unknown): ToolResult {
+  const input = asRecord(rawInput, 'add_linear_dimension')
+  const p1 = point2D(input.p1, 'p1')
+  const p2 = point2D(input.p2, 'p2')
+  const offset = finiteNumber(input.offset, 'offset')
+  if (
+    input.orientation !== 'horizontal' &&
+    input.orientation !== 'vertical' &&
+    input.orientation !== 'aligned'
+  ) {
+    throw new Error('orientation must be horizontal, vertical, or aligned')
+  }
+  const orientation = input.orientation as LinearDimensionOrientation
+  const geometry = linearDimensionGeometry(p1, p2, offset, orientation)
+  const displayText = geometry.measurement.toFixed(2)
+  const scale = annotationScale(geometry.measurement)
+  const direction = {
+    x: (geometry.dimensionLine.end.x - geometry.dimensionLine.start.x) / geometry.measurement,
+    y: (geometry.dimensionLine.end.y - geometry.dimensionLine.start.y) / geometry.measurement
+  }
+
+  const result = runEdit('Agent: add_linear_dimension', () => {
+    const db = currentDatabase()
+    const layer = annotationLayer({}, db)
+    const block = new AcDbBlockTableRecord()
+    block.name = nextAnnotationBlockName(db)
+    block.appendEntity([
+      blockLine(geometry.extensionLine1.start, geometry.extensionLine1.end, p1),
+      blockLine(geometry.extensionLine2.start, geometry.extensionLine2.end, p1),
+      blockLine(geometry.dimensionLine.start, geometry.dimensionLine.end, p1),
+      blockArrow(
+        arrowheadGeometry(geometry.dimensionLine.start, direction, scale, scale * 0.6),
+        p1
+      ),
+      blockArrow(
+        arrowheadGeometry(
+          geometry.dimensionLine.end,
+          { x: -direction.x, y: -direction.y },
+          scale,
+          scale * 0.6
+        ),
+        p1
+      ),
+      blockMText(
+        geometry.textPosition,
+        p1,
+        displayText,
+        scale,
+        geometry.angleRad,
+        AcGiMTextAttachmentPoint.MiddleCenter
+      )
+    ])
+    return { ...appendAnnotationBlock(db, block, p1, layer.name), layer }
+  })
+
+  return {
+    data: {
+      entityIds: [result.entityId],
+      blockName: result.blockName,
+      p1,
+      p2,
+      offset,
+      orientation,
+      measurement: geometry.measurement,
+      displayText,
+      layer: result.layer.name,
+      layerCreated: result.layer.created
+    }
+  }
+}
+
+function addRadiusDimension(rawInput: unknown): ToolResult {
+  const input = asRecord(rawInput, 'add_radius_dimension')
+  const circleEntityId = nonEmptyString(input.circleEntityId, 'circleEntityId')
+  const angleDeg =
+    input.angleDeg === undefined ? 45 : finiteNumber(input.angleDeg, 'angleDeg')
+  const db = currentDatabase()
+  const entity = db.tables.blockTable.getEntityById(circleEntityId)
+  if (!entity) throw new Error(`Entity id not found: ${circleEntityId}`)
+  if (!(entity instanceof AcDbCircle)) {
+    throw new Error(
+      `add_radius_dimension requires a circle entity; ${circleEntityId} is ${entity.type}`
+    )
+  }
+
+  const center = { x: entity.center.x, y: entity.center.y }
+  const radius = entity.radius
+  const angleRad = (angleDeg * Math.PI) / 180
+  const direction = { x: Math.cos(angleRad), y: Math.sin(angleRad) }
+  const chordPoint = {
+    x: center.x + direction.x * radius,
+    y: center.y + direction.y * radius
+  }
+  const scale = annotationScale(radius * 2)
+  const extension = Math.max(scale * 3, radius * 0.35)
+  const leaderEnd = {
+    x: center.x + direction.x * (radius + extension),
+    y: center.y + direction.y * (radius + extension)
+  }
+  const displayText = `R ${radius.toFixed(2)}`
+
+  const result = runEdit('Agent: add_radius_dimension', () => {
+    const liveDb = currentDatabase()
+    const layer = annotationLayer({}, liveDb)
+    const block = new AcDbBlockTableRecord()
+    block.name = nextAnnotationBlockName(liveDb)
+    block.appendEntity([
+      blockLine(center, leaderEnd, center),
+      blockArrow(
+        arrowheadGeometry(
+          chordPoint,
+          { x: -direction.x, y: -direction.y },
+          scale,
+          scale * 0.6
+        ),
+        center
+      ),
+      blockMText(
+        leaderEnd,
+        center,
+        displayText,
+        scale,
+        0,
+        AcGiMTextAttachmentPoint.MiddleCenter
+      )
+    ])
+    return { ...appendAnnotationBlock(liveDb, block, center, layer.name), layer }
+  })
+
+  return {
+    data: {
+      entityIds: [result.entityId],
+      blockName: result.blockName,
+      circleEntityId,
+      center,
+      radius,
+      measurement: radius,
+      displayText,
+      angleDeg,
+      layer: result.layer.name,
+      layerCreated: result.layer.created
+    }
+  }
+}
+
+function addLeader(rawInput: unknown): ToolResult {
+  const input = asRecord(rawInput, 'add_leader')
+  const targetPoint = point2D(input.targetPoint, 'targetPoint')
+  const text = nonEmptyString(input.text, 'text')
+  const textPosition =
+    input.textPosition === undefined
+      ? { x: targetPoint.x + 10, y: targetPoint.y + 10 }
+      : point2D(input.textPosition, 'textPosition')
+  if (distance(targetPoint, textPosition) <= 1e-12) {
+    throw new Error('textPosition must differ from targetPoint')
+  }
+  const height = 2.5
+
+  const result = runEdit('Agent: add_leader', () => {
+    const db = currentDatabase()
+    const layer = annotationLayer({}, db)
+    const annotation = new AcDbMText()
+    annotation.location = point3D(textPosition)
+    annotation.contents = text
+    annotation.height = height
+    annotation.attachmentPoint =
+      textPosition.x >= targetPoint.x
+        ? AcGiMTextAttachmentPoint.MiddleLeft
+        : AcGiMTextAttachmentPoint.MiddleRight
+    annotation.layer = layer.name
+    db.tables.blockTable.modelSpace.appendEntity(annotation)
+
+    const leader = new AcDbLeader()
+    leader.appendVertex(point3D(targetPoint))
+    leader.appendVertex(point3D(textPosition))
+    leader.hasArrowHead = true
+    leader.hasHookLine = true
+    leader.annoType = AcDbLeaderAnnotationType.MText
+    leader.textHeight = height
+    leader.associatedAnnotation = annotation.objectId
+    leader.layer = layer.name
+    db.tables.blockTable.modelSpace.appendEntity(leader)
+    return { leaderId: leader.objectId, textId: annotation.objectId, layer }
+  })
+
+  return {
+    data: {
+      entityIds: [result.leaderId, result.textId],
+      targetPoint,
+      text,
+      textPosition,
+      height,
+      layer: result.layer.name,
+      layerCreated: result.layer.created
+    }
+  }
+}
+
+function addMText(rawInput: unknown): ToolResult {
+  const input = asRecord(rawInput, 'add_mtext')
+  const position = point2D(input.position, 'position')
+  const text = nonEmptyString(input.text, 'text')
+  const height = input.height === undefined ? 2.5 : positiveNumber(input.height, 'height')
+
+  const result = runEdit('Agent: add_mtext', () => {
+    const db = currentDatabase()
+    const layer = annotationLayer(input, db)
+    const mtext = new AcDbMText()
+    mtext.location = point3D(position)
+    mtext.contents = text
+    mtext.height = height
+    mtext.attachmentPoint = AcGiMTextAttachmentPoint.TopLeft
+    mtext.layer = layer.name
+    db.tables.blockTable.modelSpace.appendEntity(mtext)
+    return { entityId: mtext.objectId, layer }
+  })
+
+  return {
+    data: {
+      entityIds: [result.entityId],
+      position,
+      text,
+      height,
+      layer: result.layer.name,
+      layerCreated: result.layer.created
+    }
+  }
+}
+
 function createClosedBoundary(points: Point2D[]): AcGeLoop2d {
   const vertices = withoutDuplicateClosingVertex(points)
   const loop = new AcGeLoop2d()
@@ -838,6 +1155,10 @@ const REAL_HANDLERS: Record<(typeof CAD_TOOL_NAMES)[number], ToolHandler> = {
   draw_circle: (input) => drawCircle(input),
   draw_arc: (input) => drawArc(input),
   draw_text: (input) => drawText(input),
+  add_linear_dimension: (input) => addLinearDimension(input),
+  add_radius_dimension: (input) => addRadiusDimension(input),
+  add_leader: (input) => addLeader(input),
+  add_mtext: (input) => addMText(input),
   draw_hatch: (input) => drawHatch(input),
   create_layer: (input) => createLayer(input),
   set_current_layer: (input) => setCurrentLayer(input),

@@ -250,6 +250,71 @@ export function createCadMcpServer(bridge: ToolBridge) {
     }
   )
 
+  const addLinearDimension = passthrough(
+    bridge,
+    'add_linear_dimension',
+    'Add an exact linear dimension between two definition points. Horizontal dimensions ' +
+      'measure the X projection, vertical dimensions measure the Y projection, and aligned ' +
+      'dimensions measure the true point-to-point distance. The browser computes the value and ' +
+      'formats the visible label to exactly two decimals; never calculate or substitute the ' +
+      'label yourself. Positive horizontal offsets place the dimension above p1; positive ' +
+      'vertical offsets place it to the right of p1; positive aligned offsets use the left-hand ' +
+      'normal from p1 toward p2. Creates the DIMENSIONS layer if needed.',
+    {
+      p1: z.object(Point2D).describe('First dimension definition point from actual entity geometry'),
+      p2: z.object(Point2D).describe('Second dimension definition point from actual entity geometry'),
+      offset: z.number().describe('Signed dimension-line offset in drawing units'),
+      orientation: z
+        .enum(['horizontal', 'vertical', 'aligned'])
+        .describe('Direction in which the dimension is measured')
+    }
+  )
+
+  const addRadiusDimension = passthrough(
+    bridge,
+    'add_radius_dimension',
+    'Add an exact radius dimension to an existing circle. The browser reads the circle center ' +
+      'and radius from the drawing database, computes the visible R label to exactly two decimals, ' +
+      'and creates the DIMENSIONS layer if needed. Use the id returned by ' +
+      'get_selected_entities; do not infer a radius or center.',
+    {
+      circleEntityId: z.string().describe('Object id of an existing AcDbCircle'),
+      angleDeg: z
+        .number()
+        .optional()
+        .describe('Leader angle counter-clockwise from +X; defaults to 45 degrees')
+    }
+  )
+
+  const addLeader = passthrough(
+    bridge,
+    'add_leader',
+    'Add an arrowed leader and associated multiline annotation text. Creates the DIMENSIONS ' +
+      'layer if needed. If textPosition is omitted, the browser places the label diagonally ' +
+      'away from the target to avoid covering it.',
+    {
+      targetPoint: z.object(Point2D).describe('Point the leader arrow identifies'),
+      text: z.string().min(1).describe('Leader annotation text'),
+      textPosition: z
+        .object(Point2D)
+        .optional()
+        .describe('Annotation insertion point; omit for a non-overlapping default')
+    }
+  )
+
+  const addMText = passthrough(
+    bridge,
+    'add_mtext',
+    'Place multiline text at a drawing position. Height is in drawing units. Defaults to the ' +
+      'DIMENSIONS layer, which is created automatically; a named layer is also created if needed.',
+    {
+      position: z.object(Point2D).describe('Top-left text insertion point'),
+      text: z.string().min(1).describe('Multiline text content'),
+      height: z.number().positive().optional().describe('Text height in drawing units; defaults to 2.5'),
+      layer: z.string().optional().describe('Destination layer; defaults to DIMENSIONS')
+    }
+  )
+
   const drawHatch = passthrough(
     bridge,
     'draw_hatch',
@@ -362,6 +427,10 @@ export function createCadMcpServer(bridge: ToolBridge) {
       drawCircle,
       drawArc,
       drawText,
+      addLinearDimension,
+      addRadiusDimension,
+      addLeader,
+      addMText,
       drawHatch,
       createLayer,
       setCurrentLayer,

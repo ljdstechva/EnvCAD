@@ -1,8 +1,11 @@
 import { describe, expect, it } from 'vitest'
 import {
+  arrowheadGeometry,
   boundingBox,
   boundingBoxCenter,
+  distance,
   hasBulgeArcs,
+  linearDimensionGeometry,
   polylineArea,
   polylineLength,
   rotatePoint,
@@ -140,5 +143,73 @@ describe('agent geometry helpers', () => {
     const combined = unionBoundingBoxes([first!, second!])
     expect(combined).toEqual({ min: { x: 10, y: 10 }, max: { x: 70, y: 25 } })
     expect(boundingBoxCenter(combined!)).toEqual({ x: 40, y: 17.5 })
+  })
+
+  it('offsets horizontal and vertical dimension extension lines exactly', () => {
+    const horizontal = linearDimensionGeometry(
+      { x: 10, y: 20 },
+      { x: 40, y: 20 },
+      -6,
+      'horizontal'
+    )
+    expect(horizontal.extensionLine1).toEqual({
+      start: { x: 10, y: 20 },
+      end: { x: 10, y: 14 }
+    })
+    expect(horizontal.extensionLine2).toEqual({
+      start: { x: 40, y: 20 },
+      end: { x: 40, y: 14 }
+    })
+    expect(horizontal.dimensionLine).toEqual({
+      start: { x: 10, y: 14 },
+      end: { x: 40, y: 14 }
+    })
+    expect(horizontal.measurement).toBe(30)
+
+    const vertical = linearDimensionGeometry(
+      { x: 10, y: 20 },
+      { x: 10, y: 45 },
+      8,
+      'vertical'
+    )
+    expect(vertical.dimensionLine).toEqual({
+      start: { x: 18, y: 20 },
+      end: { x: 18, y: 45 }
+    })
+    expect(vertical.extensionLine2.end).toEqual({ x: 18, y: 45 })
+    expect(vertical.measurement).toBe(25)
+  })
+
+  it('computes aligned angle, offset, and true measurement without display rounding', () => {
+    const aligned = linearDimensionGeometry(
+      { x: 2, y: 3 },
+      { x: 5, y: 7 },
+      2,
+      'aligned'
+    )
+    expect(aligned.measurement).toBe(5)
+    expect(aligned.angleRad).toBeCloseTo(Math.atan2(4, 3))
+    expect(aligned.dimensionLine.start.x).toBeCloseTo(0.4)
+    expect(aligned.dimensionLine.start.y).toBeCloseTo(4.2)
+    expect(aligned.dimensionLine.end.x).toBeCloseTo(3.4)
+    expect(aligned.dimensionLine.end.y).toBeCloseTo(8.2)
+    expect(aligned.textPosition.x).toBeCloseTo(1.9)
+    expect(aligned.textPosition.y).toBeCloseTo(6.2)
+  })
+
+  it('builds symmetric filled arrowhead triangles in any direction', () => {
+    const arrow = arrowheadGeometry({ x: 10, y: 4 }, { x: 1, y: 0 }, 2, 1)
+    expect(arrow).toEqual({
+      tip: { x: 10, y: 4 },
+      baseLeft: { x: 12, y: 4.5 },
+      baseRight: { x: 12, y: 3.5 }
+    })
+
+    const diagonal = arrowheadGeometry({ x: 0, y: 0 }, { x: 3, y: 4 }, 5, 2)
+    expect(distance(diagonal.tip, {
+      x: (diagonal.baseLeft.x + diagonal.baseRight.x) / 2,
+      y: (diagonal.baseLeft.y + diagonal.baseRight.y) / 2
+    })).toBeCloseTo(5)
+    expect(distance(diagonal.baseLeft, diagonal.baseRight)).toBeCloseTo(2)
   })
 })
