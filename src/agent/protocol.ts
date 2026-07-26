@@ -77,8 +77,8 @@ export const CAD_TOOL_NAMES = [
 
 export type CadToolName = (typeof CAD_TOOL_NAMES)[number]
 
-/** Tool names with a real browser-side implementation as of this session. */
-export const REAL_TOOL_NAMES = ['get_drawing_context', 'zoom_extents', 'draw_line'] as const
+/** Tool names with a real browser-side implementation. */
+export const REAL_TOOL_NAMES = CAD_TOOL_NAMES
 
 export type ProtocolParseResult<T> =
   | { ok: true; value: T }

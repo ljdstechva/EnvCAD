@@ -226,12 +226,11 @@ The full list of registered tool names is `CAD_TOOL_NAMES` in
 `set_current_layer`, `zoom_extents`, `set_sheet_definition`,
 `set_title_block_fields`.
 
-As of this session, the browser (`src/agent/handlers.ts`) implements real
-handlers for `get_drawing_context`, `zoom_extents`, and `draw_line` (the
-latter through the viewer's transaction mechanism, so it participates in
-undo/redo). Every other tool has a stub handler that returns
-`{ error: "not implemented yet" }` — a follow-up session should replace
-these one at a time, following the pattern of the three real handlers.
+The browser (`src/agent/handlers.ts`) implements every registered tool.
+Database modifications use the viewer's transaction mechanism so one tool
+operation is one undoable step; sheet tools update the reactive sheet store.
+Pure rotation, bounding-box, area, and length math lives in
+`src/agent/geometry.ts`.
 
 ## Session and credentials
 
