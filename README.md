@@ -45,6 +45,95 @@ Because the assistant runs through Claude Code, every message you send it
 draws on your Claude plan's rate limits — the same limits Claude Code itself
 uses. There's no separate quota or billing to think about.
 
+## Install with an AI coding agent
+
+You can paste the following instruction into a terminal-capable coding agent
+such as Codex CLI or Claude Code:
+
+```text
+You are installing EnvCAD from its public GitHub repository.
+
+Repository:
+https://github.com/ljdstechva/EnvCAD
+
+Goal:
+Safely clone EnvCAD, verify its prerequisites, install its locked dependencies, validate the installation, and start both the Vue application and Claude sidecar.
+
+Use the native shell for this computer. Prefer PowerShell on Windows.
+
+Safety requirements:
+
+- Do not create, request, store, or use an Anthropic API key.
+- Do not create an `.env` file containing credentials.
+- Do not print existing environment-variable values or other secrets.
+- EnvCAD must use an installed and authenticated Claude Code subscription.
+- If `ANTHROPIC_API_KEY` is present, do not display its value. Stop and tell me that it must be removed or unset before EnvCAD can start.
+- Do not use `--force`, bypass dependency checks, or modify EnvCAD source code merely to make installation pass.
+- Do not overwrite an existing EnvCAD directory.
+- Inspect repository scripts before executing them.
+- Ask before performing an administrator-level or system-wide installation.
+
+Perform these steps:
+
+1. Check whether this is already an EnvCAD checkout.
+   - If it is, inspect its Git status and do not clone another copy over it.
+   - If it is not, clone:
+     https://github.com/ljdstechva/EnvCAD.git
+
+2. Enter the EnvCAD repository directory.
+
+3. Read `README.md`, `package.json`, the lockfile, and the declared `postinstall` script before installing anything.
+
+4. Verify that these prerequisites are available:
+   - Git
+   - A current supported Node.js LTS release
+   - npm
+   - Claude Code
+
+5. Show only safe version information. Never display authentication tokens or secret environment-variable values.
+
+6. Verify that Claude Code is logged in through the user's Claude subscription.
+   - If interactive authentication is required, pause and guide me through the official Claude Code login.
+   - Do not substitute an API key or metered API account.
+
+7. Install the exact locked dependencies using:
+
+   npm ci
+
+   Allow the repository's documented `patch-package` postinstall step to run. If installation fails, diagnose the actual failure instead of deleting the lockfile or forcing an upgrade.
+
+8. Validate the installation using:
+
+   npm run test
+   npm run typecheck
+   npm run build
+
+9. If validation passes, start EnvCAD using:
+
+   npm run dev
+
+10. Confirm that:
+    - The Vite frontend starts.
+    - The Claude sidecar starts.
+    - A local application URL is printed.
+    - No API key is being used.
+    - The assistant reports connected or gives a clear login/setup instruction.
+
+11. Give me:
+    - The installation directory
+    - Node.js and npm versions
+    - Test, typecheck, and build results
+    - The local EnvCAD URL
+    - Any remaining action I must perform
+
+Keep `npm run dev` available for me to use. If your execution environment cannot leave a persistent development server running, tell me to run `npm run dev` manually from the EnvCAD directory.
+```
+
+The installing AI agent needs terminal and filesystem access. You must complete
+any interactive Claude authentication yourself; installation does not grant the
+agent access to your Claude credentials. EnvCAD deliberately refuses API-key
+mode. If you prefer, follow the ordinary [manual setup](#setup) instead.
+
 ## Feature tour
 
 The canonical workflow exercises most of the app:

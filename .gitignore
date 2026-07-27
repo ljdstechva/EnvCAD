@@ -2,6 +2,16 @@ node_modules/
 dist/
 reference/
 .DS_Store
+
+# Local credentials and agent state
+.env
+.env.*
+!.env.example
+!.env.e2e
+.npmrc
+.claude/
+.codex/
+
 *.log
 *.tsbuildinfo
 .playwright-cli/
