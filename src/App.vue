@@ -23,6 +23,7 @@ const layersOpen = ref(false)
 const sidePanelOpen = ref(true)
 const toolbarRef = ref<InstanceType<typeof Toolbar> | null>(null)
 const restoreSnapshot = ref<AutosaveSnapshot | null>(null)
+const restoring = ref(false)
 let stopAutosave: (() => void) | null = null
 
 function formatSavedAt(savedAt: number): string {
@@ -33,12 +34,20 @@ function formatSavedAt(savedAt: number): string {
   }
 }
 
+// The snapshot is the only copy of the user's unsaved work, so it is deleted
+// only once the restore has actually succeeded — a failed restore keeps both
+// the banner and the stored snapshot so the attempt can be repeated.
 async function restoreDrawing() {
   const snapshot = restoreSnapshot.value
-  if (!snapshot) return
-  restoreSnapshot.value = null
-  await viewer.openFromDxfText(snapshot.fileName, snapshot.dxf)
-  clearAutosaveSnapshot()
+  if (!snapshot || restoring.value) return
+  restoring.value = true
+  try {
+    if (!(await viewer.openFromDxfText(snapshot.fileName, snapshot.dxf))) return
+    restoreSnapshot.value = null
+    clearAutosaveSnapshot()
+  } finally {
+    restoring.value = false
+  }
 }
 
 function discardSnapshot() {
@@ -108,8 +117,10 @@ function toggleLayers() {
         Restore unsaved drawing "{{ restoreSnapshot.fileName }}" from
         {{ formatSavedAt(restoreSnapshot.savedAt) }}?
       </span>
-      <button @click="restoreDrawing">Restore</button>
-      <button @click="discardSnapshot">Discard</button>
+      <button :disabled="restoring" @click="restoreDrawing">
+        {{ restoring ? 'Restoring…' : 'Restore' }}
+      </button>
+      <button :disabled="restoring" @click="discardSnapshot">Discard</button>
     </div>
     <div class="main-row">
       <div v-if="layersOpen" class="layers-dock">
@@ -199,8 +210,13 @@ function toggleLayers() {
   cursor: pointer;
 }
 
-.restore-banner button:hover {
+.restore-banner button:hover:not(:disabled) {
   background: var(--bg-button-hover);
+}
+
+.restore-banner button:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
 
 .side-toggle {

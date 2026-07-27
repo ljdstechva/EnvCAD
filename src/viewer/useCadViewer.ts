@@ -11,7 +11,7 @@ import dxfParserWorkerUrl from '../../node_modules/@mlightcad/cad-simple-viewer/
 import dwgParserWorkerUrl from '../../node_modules/@mlightcad/cad-simple-viewer/dist/libredwg-parser-worker.js?url'
 import mtextRendererWorkerUrl from '../../node_modules/@mlightcad/cad-simple-viewer/dist/mtext-renderer-worker.js?url'
 import { pushToast } from '../toast/toastStore'
-import { pushRecentFile } from '../autosave/autosave'
+import { clearAutosaveSnapshot, pushRecentFile } from '../autosave/autosave'
 
 export interface LayerInfo {
   name: string
@@ -31,8 +31,40 @@ export function useCadViewer() {
   const layers: Ref<LayerInfo[]> = ref([])
   const docManager = shallowRef<AcApDocManager | null>(null)
 
+  /**
+   * True when the drawing was last opened or saved with an empty undo stack,
+   * which is the only clean state we can recognise again later: the
+   * transaction manager exposes `canUndo()` but not the stack depth.
+   */
+  let cleanWithEmptyUndoStack = true
+  /** Set by edits that leave no undo record, so undoing can't clear them. */
+  let dirtyOutsideUndoStack = false
+
+  function hasUndoRecords(): boolean {
+    return docManager.value?.curDocument?.database.transactionManager.canUndo() ?? false
+  }
+
   function markDirty() {
+    dirtyOutsideUndoStack = true
     isDirty.value = true
+  }
+
+  function markClean() {
+    dirtyOutsideUndoStack = false
+    cleanWithEmptyUndoStack = !hasUndoRecords()
+    isDirty.value = false
+  }
+
+  /**
+   * Recomputes the dirty flag after the undo stack moves. Without a stack
+   * depth only the unambiguous case can be recognised — a drawing whose clean
+   * state had an empty undo stack is clean again once the stack is empty, i.e.
+   * the user undid everything back to the file on disk. Everything else stays
+   * dirty, which is the safe direction: autosave keeps a snapshot it may not
+   * have needed rather than dropping real work.
+   */
+  function syncDirtyAfterUndoStackChange() {
+    isDirty.value = dirtyOutsideUndoStack || !cleanWithEmptyUndoStack || hasUndoRecords()
   }
 
   function refreshLayers() {
@@ -115,7 +147,7 @@ export function useCadViewer() {
       // zoom immediately after this event.
       ensureLayoutViews(manager)
       documentOpen.value = true
-      isDirty.value = false
+      markClean()
       refreshLayers()
       refreshUndoRedo()
       selectionCount.value = manager.curView.selectionSet.count
@@ -126,48 +158,72 @@ export function useCadViewer() {
     // the database via acapRunDatabaseEdit, which emits this event).
     eventBus.on('undo-stack-changed', () => {
       refreshAfterDatabaseEdit()
-      markDirty()
+      syncDirtyAfterUndoStackChange()
     })
 
     return manager
   }
 
-  async function openFile(file: File) {
+  /**
+   * `AcApDocManager.openDocument` catches parse failures itself and resolves
+   * `false` instead of throwing, so the boolean — not just the catch — decides
+   * whether the open succeeded. On failure nothing about the previous document
+   * may change: it is still the one on screen.
+   */
+  async function openFile(file: File): Promise<boolean> {
     const manager = docManager.value
-    if (!manager) return
+    if (!manager) return false
     try {
       const buffer = await file.arrayBuffer()
-      await manager.openDocument(file.name, buffer, {
+      const opened = await manager.openDocument(file.name, buffer, {
         mode: AcEdOpenMode.Write,
         openViewMode: AcApOpenViewMode.Extents
       })
+      if (!opened) {
+        pushToast(`Couldn't open ${file.name}. It may be corrupt or in an unsupported format.`)
+        return false
+      }
       fileName.value = file.name
       pushRecentFile(file.name)
       refreshLayers()
       refreshUndoRedo()
+      return true
     } catch (error) {
       pushToast(
         `Couldn't open ${file.name}: ${error instanceof Error ? error.message : String(error)}`
       )
+      return false
     }
   }
 
-  async function openFromDxfText(name: string, dxfText: string) {
+  async function openFromDxfText(name: string, dxfText: string): Promise<boolean> {
     const manager = docManager.value
-    if (!manager) return
+    if (!manager) {
+      pushToast(`Couldn't restore ${name}: the drawing view isn't ready yet.`)
+      return false
+    }
     try {
       const buffer = new TextEncoder().encode(dxfText).buffer
-      await manager.openDocument(name, buffer, {
+      const opened = await manager.openDocument(name, buffer, {
         mode: AcEdOpenMode.Write,
         openViewMode: AcApOpenViewMode.Extents
       })
+      if (!opened) {
+        pushToast(`Couldn't restore ${name}. The saved snapshot could not be read.`)
+        return false
+      }
       fileName.value = name
       refreshLayers()
       refreshUndoRedo()
+      // Restored content only exists in the browser, so it counts as unsaved
+      // work: autosave has to keep protecting it until the user saves.
+      markDirty()
+      return true
     } catch (error) {
       pushToast(
         `Couldn't restore ${name}: ${error instanceof Error ? error.message : String(error)}`
       )
+      return false
     }
   }
 
@@ -176,6 +232,18 @@ export function useCadViewer() {
     if (!manager?.curDocument) return null
     const content = manager.curDocument.database.dxfOut(undefined, 6)
     return typeof content === 'string' ? content : new TextDecoder().decode(content)
+  }
+
+  /**
+   * The Open dialog also accepts `.dwg`, but this always writes DXF text, so
+   * the download always carries a `.dxf` extension — DXF content under a
+   * `.dwg` name is rejected by AutoCAD and by EnvCAD itself, which picks its
+   * parser from the extension.
+   */
+  function dxfDownloadName(name: string): string {
+    const trimmed = name.trim()
+    if (!trimmed) return 'drawing.dxf'
+    return `${trimmed.replace(/\.[^./\\]*$/, '')}.dxf`
   }
 
   function saveDxf(name?: string) {
@@ -188,24 +256,27 @@ export function useCadViewer() {
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
-    a.download = name ?? fileName.value
+    a.download = dxfDownloadName(name ?? fileName.value)
     a.click()
     URL.revokeObjectURL(url)
-    isDirty.value = false
+    markClean()
+    // The drawing is now on disk, so the pre-save snapshot must go: leaving it
+    // would make the next launch offer stale work as if it were newer.
+    clearAutosaveSnapshot()
   }
 
   function undo() {
     docManager.value?.curDocument.database.transactionManager.undo()
     refreshLayers()
     refreshUndoRedo()
-    markDirty()
+    syncDirtyAfterUndoStackChange()
   }
 
   function redo() {
     docManager.value?.curDocument.database.transactionManager.redo()
     refreshLayers()
     refreshUndoRedo()
-    markDirty()
+    syncDirtyAfterUndoStackChange()
   }
 
   function zoomExtents() {

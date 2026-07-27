@@ -18,6 +18,10 @@
   --text-muted: #888888;
   --accent: #0e639c;
   --accent-border: #1177bb;
+  /* Accent as a foreground colour, readable on the panel backgrounds. */
+  --accent-text: #7fb8e6;
+  /* Foreground for anything painted on --accent or --success-bg. */
+  --text-on-accent: #ffffff;
   --statusbar-bg: #007acc;
   --statusbar-text: #ffffff;
   --warn-bg: #4a3b12;
@@ -53,6 +57,8 @@
   --text-muted: #6b6b6b;
   --accent: #0e639c;
   --accent-border: #1177bb;
+  --accent-text: #0b5a8a;
+  --text-on-accent: #ffffff;
   --statusbar-bg: #0e639c;
   --statusbar-text: #ffffff;
   --warn-bg: #fff3cd;

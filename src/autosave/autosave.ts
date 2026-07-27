@@ -1,3 +1,5 @@
+import { pushToast } from '../toast/toastStore'
+
 const SNAPSHOT_KEY = 'envcad.autosaveSnapshot'
 const RECENT_FILES_KEY = 'envcad.recentFiles'
 const AUTOSAVE_INTERVAL_MS = 2 * 60 * 1000
@@ -17,11 +19,13 @@ function readStorage(key: string): string | null {
   }
 }
 
-function writeStorage(key: string, value: string): void {
+/** Returns false when the write was rejected (private browsing, quota exceeded). */
+function writeStorage(key: string, value: string): boolean {
   try {
     window.localStorage.setItem(key, value)
+    return true
   } catch {
-    // localStorage unavailable (private browsing, quota) — autosave is best-effort
+    return false
   }
 }
 
@@ -45,9 +49,10 @@ export function loadAutosaveSnapshot(): AutosaveSnapshot | null {
   }
 }
 
-export function saveAutosaveSnapshot(fileName: string, dxf: string): void {
+/** Returns false when the snapshot could not be stored. */
+export function saveAutosaveSnapshot(fileName: string, dxf: string): boolean {
   const snapshot: AutosaveSnapshot = { fileName, dxf, savedAt: Date.now() }
-  writeStorage(SNAPSHOT_KEY, JSON.stringify(snapshot))
+  return writeStorage(SNAPSHOT_KEY, JSON.stringify(snapshot))
 }
 
 export function clearAutosaveSnapshot(): void {
@@ -85,11 +90,27 @@ export interface AutosaveTarget {
  * interval and removes the beforeunload listener.
  */
 export function startAutosave(target: AutosaveTarget): () => void {
+  // A drawing whose DXF exceeds the localStorage quota fails every tick, so
+  // the warning is shown once per run of failures rather than every two
+  // minutes. Silence would be worse: the user would believe autosave is
+  // protecting work that is not being stored at all.
+  let warnedAboutFailure = false
+
   function snapshotIfDirty() {
     if (!target.documentOpen || !target.isDirty) return
     const dxf = target.dxfOut()
     if (dxf === null) return
-    saveAutosaveSnapshot(target.fileName, dxf)
+    if (saveAutosaveSnapshot(target.fileName, dxf)) {
+      warnedAboutFailure = false
+      return
+    }
+    if (!warnedAboutFailure) {
+      warnedAboutFailure = true
+      pushToast(
+        "Autosave failed — this drawing doesn't fit in the browser's local storage. " +
+          'Save it with Ctrl+S to avoid losing work.'
+      )
+    }
   }
 
   const interval = setInterval(snapshotIfDirty, AUTOSAVE_INTERVAL_MS)

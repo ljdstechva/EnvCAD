@@ -30,6 +30,9 @@ This runs Vitest once and exits. The suite covers:
   absence checks for templates without a scale bar;
 - sheet rendering, fixture integrity, protocol validation, browser bridge
   queuing, and sidecar bridge sessions;
+- autosave snapshot round-trips, recent-file bookkeeping, and the
+  storage-quota path (a rejected write is reported once, keeps the previous
+  snapshot, and warns again after a recovery);
 - pure agent and predicate geometry, public polyline/bulge extraction,
   import parsing, and environmental symbol footprints;
 - real executor dispatch against a headless `AcDbDatabase`, including CSV and

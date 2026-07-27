@@ -184,11 +184,13 @@ function getDrawingName(): string {
 .preview-toolbar button.active {
   background: var(--accent);
   border-color: var(--accent-border);
+  color: var(--text-on-accent);
 }
 
 .export-btn {
   background: var(--success-bg) !important;
   border-color: var(--success-border) !important;
+  color: var(--text-on-accent) !important;
 }
 
 .sep {

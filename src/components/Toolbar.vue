@@ -186,6 +186,7 @@ summary.disabled {
 button.active {
   background: var(--accent);
   border-color: var(--accent-border);
+  color: var(--text-on-accent);
 }
 
 .sep {

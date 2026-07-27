@@ -123,7 +123,7 @@ function summarize(value: unknown): string {
 .tool-name {
   flex-shrink: 0;
   font-weight: 600;
-  color: var(--accent);
+  color: var(--accent-text);
 }
 
 .tool-input {

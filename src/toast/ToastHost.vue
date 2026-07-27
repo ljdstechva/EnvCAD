@@ -12,10 +12,17 @@ import { toasts, dismissToast } from './toastStore'
 </template>
 
 <style scoped>
+/*
+ * Anchored bottom-left, above the 24px status bar: the right edge belongs to
+ * the chat dock, and a toast there would sit on top of the Send button
+ * precisely when an agent error makes the user want to retry. Toasts stay
+ * click-through so they never swallow a click meant for the canvas; only the
+ * dismiss button takes pointer events.
+ */
 .toast-host {
   position: fixed;
-  right: 14px;
-  bottom: 14px;
+  left: 14px;
+  bottom: 34px;
   z-index: 1000;
   display: flex;
   flex-direction: column-reverse;
@@ -25,7 +32,6 @@ import { toasts, dismissToast } from './toastStore'
 }
 
 .toast {
-  pointer-events: auto;
   display: flex;
   align-items: flex-start;
   gap: 8px;
@@ -57,6 +63,7 @@ import { toasts, dismissToast } from './toastStore'
 }
 
 .dismiss {
+  pointer-events: auto;
   flex-shrink: 0;
   background: transparent;
   border: none;
