@@ -60,8 +60,9 @@ const config: ForgeConfig = {
     new MakerSquirrel({
       name: 'EnvCAD',
       authors: 'ljdstechva',
-      description: 'Environmental CAD drafting and Claude-assisted drawing tools',
-      setupExe: 'EnvCAD Setup.exe',
+      description:
+        'Environmental CAD drafting with a secure multi-provider AI Assistant',
+      setupExe: 'EnvCAD-0.2.0 Setup.exe',
       setupIcon: icon,
       noMsi: true
     })
