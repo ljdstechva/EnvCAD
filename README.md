@@ -23,7 +23,8 @@ drawing open in your browser.
 2. Install and log in to [Claude Code](https://claude.com/claude-code) on
    this machine (`claude` on your PATH, authenticated). The sidecar drives
    the Claude Agent SDK through your existing Claude Code session — **there
-   is no API key anywhere in this project, and none should ever be added.**
+   are no API keys required or supported by EnvCAD, and none should ever be
+   added.**
    The sidecar actively refuses to start if an `ANTHROPIC_API_KEY`
    environment variable is set, specifically to keep it off the metered API
    and on your Claude Code subscription.
@@ -38,7 +39,7 @@ drawing open in your browser.
    `concurrently`) and prints both processes' output to one terminal. Open
    the printed local URL — the AI Assistant tab will be usable once the
    sidecar connects; if the sidecar isn't running, that tab shows an offline
-   banner and the chat input is disabled.
+   banner and the chat input is disabled while CAD editing remains available.
 
 Because the assistant runs through Claude Code, every message you send it
 draws on your Claude plan's rate limits — the same limits Claude Code itself
@@ -63,22 +64,72 @@ The canonical workflow exercises most of the app:
 6. **Export a PDF** — the Sheet Preview tab renders the plotted sheet;
    Export PDF produces the final drawing.
 
-Other things worth knowing:
+## Reliability and file safety
 
-- **Keyboard shortcuts**: `Ctrl+O` open, `Ctrl+S` save DXF, `Ctrl+Z`/`Ctrl+Y`
-  undo/redo, `Delete` deletes the selection, `Escape` clears it, `F2` opens
-  Page Setup. None of these fire while you're typing in the chat box or any
-  other text field.
-- **Autosave**: while a drawing is open and has unsaved changes, EnvCAD
-  snapshots it to your browser's local storage every two minutes and again
-  when you close the tab. Reopening the app offers to restore it.
-- **Theme**: the toolbar's sun/moon button toggles light and dark mode; your
-  choice is remembered.
-- **Offline handling**: if the sidecar isn't running or crashes mid-session,
-  the assistant tab shows an offline banner instead of failing silently, and
-  reconnects automatically once the sidecar is back.
+- **Transactional DXF opening**: EnvCAD parses a DXF into an isolated document
+  before it replaces the active drawing. If a malformed or truncated DXF
+  cannot be parsed, one friendly error is shown and the currently open drawing,
+  including unsaved edits, remains available.
+- **Autosave and recovery**: while a drawing is open and dirty, EnvCAD saves a
+  browser-local snapshot every two minutes and again when the tab closes. At
+  startup, EnvCAD offers to restore an available unsaved drawing.
+- **Recent Files privacy**: the Recent Files list stores filenames only, not
+  drawing contents or local file paths.
+- **DXF saves**: Save DXF downloads the current drawing with a `.dxf` filename,
+  including when the source drawing used another supported extension.
+
+## Error handling and sidecar status
+
+DXF parsing, PDF export, agent protocol, and sidecar failures are surfaced with
+user-friendly notifications or status messages rather than raw application
+errors. The Claude agent runs through the local sidecar and the logged-in
+Claude Code subscription described in [Setup](#setup); EnvCAD has no API-key
+mode.
+
+If the sidecar is unavailable or disconnects during a session, the AI Assistant
+shows an offline banner and disables chat. CAD viewing and editing remain
+available, and the assistant reconnects automatically when the sidecar returns.
+
+## Keyboard shortcuts and appearance
+
+| Shortcut | Action |
+| --- | --- |
+| `Ctrl+O` | Open DXF |
+| `Ctrl+S` | Save DXF |
+| `Ctrl+Z` | Undo |
+| `Ctrl+Y` | Redo |
+| `Delete` | Delete the current selection |
+| `Escape` | Clear the current selection |
+| `F2` | Open Page Setup |
+
+CAD shortcuts are focus-aware: they do not fire while you are typing in chat or
+another text field. The toolbar's sun/moon control switches between light and
+dark themes, and the selected theme persists between sessions.
+
+## Install as a PWA
+
+EnvCAD can be installed as a standalone, desktop-style Progressive Web App in
+supported Chromium browsers:
+
+1. Open EnvCAD in Microsoft Edge or Google Chrome.
+2. Use the browser's **Install EnvCAD** option or installation icon.
+3. Launch EnvCAD from the installed-app shortcut.
+4. EnvCAD opens in a standalone window without ordinary browser tabs or an
+   address bar.
+
+Installation requires a supported browser and a secure origin, such as an HTTPS
+deployment or `localhost`.
 
 ## Testing
+
+Run the automated tests and production checks with:
+
+```powershell
+npm run test
+npm run test:e2e
+npm run typecheck
+npm run build
+```
 
 - [`TESTING.md`](TESTING.md) — how to run the Vitest unit/integration suite
   and the Playwright end-to-end suite (which runs against a scripted fake
