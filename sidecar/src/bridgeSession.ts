@@ -27,6 +27,7 @@ interface PendingCall {
 }
 
 export interface BridgeSessionOptions {
+  claudeExecutablePath: string
   queryFactory?: typeof query
   toolTimeoutMs?: number
   logger?: Pick<Console, 'log' | 'error'>
@@ -100,11 +101,13 @@ export class BridgeSession {
   private readonly toolTimeoutMs: number
   private readonly logger: Pick<Console, 'log' | 'error'>
   private readonly mcpServer: ReturnType<typeof createCadMcpServer>
+  private readonly claudeExecutablePath: string
 
   constructor(
     private ws: WebSocket,
-    options: BridgeSessionOptions = {}
+    options: BridgeSessionOptions
   ) {
+    this.claudeExecutablePath = options.claudeExecutablePath
     this.queryFactory = options.queryFactory ?? query
     this.toolTimeoutMs = options.toolTimeoutMs ?? TOOL_TIMEOUT_MS
     this.logger = options.logger ?? console
@@ -274,6 +277,7 @@ export class BridgeSession {
           // WebFetch) from Claude's context; only the CAD MCP tools remain.
           tools: [],
           permissionMode: 'dontAsk',
+          pathToClaudeCodeExecutable: this.claudeExecutablePath,
           ...(this.sessionId ? { resume: this.sessionId } : {})
         }
       })

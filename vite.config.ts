@@ -22,6 +22,7 @@ export default defineConfig({
     include: [
       'test/**/*.test.ts',
       'sidecar/src/**/*.test.ts',
+      'desktop/**/*.test.ts',
       'src/agent/**/*.test.ts',
       'src/geo/**/*.test.ts',
       'src/symbols/**/*.test.ts',
