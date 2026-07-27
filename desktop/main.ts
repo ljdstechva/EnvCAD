@@ -4,6 +4,7 @@ import path from 'node:path'
 import {
   app,
   BrowserWindow,
+  dialog,
   ipcMain,
   Menu,
   session,
@@ -187,6 +188,20 @@ async function createWindow(rendererUrl: string): Promise<BrowserWindow> {
       devTools: !app.isPackaged
     }
   })
+  let shown = false
+  const showWindow = (reason: 'ready' | 'fallback') => {
+    if (shown || window.isDestroyed()) return
+    shown = true
+    window.show()
+    const elapsed = Math.round(performance.now() - startupStartedAt)
+    if (reason === 'fallback') {
+      desktopLogger.warn(`Application window used the visibility fallback after ${elapsed} ms.`)
+    } else {
+      desktopLogger.info(`Application window ready in ${elapsed} ms.`)
+    }
+  }
+  const visibilityFallback = setTimeout(() => showWindow('fallback'), 5_000)
+  visibilityFallback.unref()
   window.webContents.setWindowOpenHandler(({ url }) => {
     openAllowedExternalUrl(url)
     return { action: 'deny' }
@@ -196,16 +211,34 @@ async function createWindow(rendererUrl: string): Promise<BrowserWindow> {
     event.preventDefault()
     openAllowedExternalUrl(url)
   })
-  window.once('ready-to-show', () => {
-    window.show()
-    desktopLogger.info(
-      `Application window ready in ${Math.round(performance.now() - startupStartedAt)} ms.`
+  window.webContents.on(
+    'did-fail-load',
+    (_event, errorCode, errorDescription, validatedUrl, isMainFrame) => {
+      if (!isMainFrame) return
+      desktopLogger.error(
+        `Renderer load failed (${errorCode}): ${errorDescription}; URL: ${validatedUrl}`
+      )
+    }
+  )
+  window.webContents.on('render-process-gone', (_event, details) => {
+    desktopLogger.error(
+      `Renderer process exited unexpectedly: ${details.reason} (code ${details.exitCode}).`
     )
   })
+  window.once('ready-to-show', () => {
+    clearTimeout(visibilityFallback)
+    showWindow('ready')
+  })
   window.on('closed', () => {
+    clearTimeout(visibilityFallback)
     if (mainWindow === window) mainWindow = null
   })
-  await window.loadURL(rendererUrl)
+  try {
+    await window.loadURL(rendererUrl)
+  } catch (error) {
+    clearTimeout(visibilityFallback)
+    throw error
+  }
   return window
 }
 
@@ -281,8 +314,11 @@ if (started) {
     })
   })
   void startDesktop().catch((error) => {
-    desktopLogger.error(
-      `Desktop startup failed: ${error instanceof Error ? error.message : String(error)}`
+    const startupError = sanitize(error instanceof Error ? error.message : String(error))
+    desktopLogger.error(`Desktop startup failed: ${startupError}`)
+    dialog.showErrorBox(
+      'EnvCAD could not start',
+      `EnvCAD encountered a startup error and must close.\n\n${startupError}\n\nDiagnostic log:\n${logDirectory}`
     )
     app.quit()
   })

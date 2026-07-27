@@ -8,10 +8,13 @@ const INSTALL_EVENTS = new Set(['--squirrel-install', '--squirrel-updated'])
 const UNINSTALL_EVENT = '--squirrel-uninstall'
 const OBSOLETE_EVENT = '--squirrel-obsolete'
 
-const CLEANUP_SCRIPT = String.raw`
+export const UNINSTALL_CLEANUP_SCRIPT = String.raw`
 param(
   [Parameter(Mandatory = $true)][string] $InstallRoot,
-  [Parameter(Mandatory = $true)][string] $CleanupDirectory
+  [Parameter(Mandatory = $true)][string] $CleanupDirectory,
+  [Parameter(Mandatory = $true)][string] $InstalledExecutable,
+  [int] $GraceMilliseconds = 30000,
+  [int] $DeadlineSeconds = 300
 )
 
 $ErrorActionPreference = 'SilentlyContinue'
@@ -19,8 +22,8 @@ $ErrorActionPreference = 'SilentlyContinue'
 # Squirrel may terminate the application before its child-process callback
 # runs. Start this helper early, but let shortcut removal and updater shutdown
 # settle before touching the installation root.
-[Threading.Thread]::Sleep(30000)
-$deadline = [DateTime]::UtcNow.AddMinutes(5)
+[Threading.Thread]::Sleep([Math]::Max(0, $GraceMilliseconds))
+$deadline = [DateTime]::UtcNow.AddSeconds([Math]::Max(1, $DeadlineSeconds))
 
 function Test-InstallProcess {
   $installPrefix = $InstallRoot.TrimEnd('\') + '\'
@@ -37,30 +40,42 @@ function Test-InstallProcess {
   return $false
 }
 
+function Test-ReplacementInstall {
+  $replacementMarkers = @(
+    $InstalledExecutable,
+    (Join-Path $InstallRoot 'EnvCAD.exe'),
+    (Join-Path $InstallRoot 'RELEASES'),
+    (Join-Path $InstallRoot 'packages')
+  )
+  foreach ($marker in $replacementMarkers) {
+    if (Test-Path -LiteralPath $marker) {
+      return $true
+    }
+  }
+  return $false
+}
+
+$cancelCleanup = $false
+
 do {
+  if (Test-ReplacementInstall) {
+    $cancelCleanup = $true
+    break
+  }
   if (-not (Test-InstallProcess)) {
     break
   }
   [Threading.Thread]::Sleep(1000)
 } while ([DateTime]::UtcNow -lt $deadline)
 
-$absentSince = $null
-
-do {
-  if (Test-Path -LiteralPath $InstallRoot) {
-    Remove-Item -LiteralPath $InstallRoot -Recurse -Force -ErrorAction SilentlyContinue
-  }
-  if (-not (Test-Path -LiteralPath $InstallRoot)) {
-    if ($null -eq $absentSince) {
-      $absentSince = [DateTime]::UtcNow
-    } elseif (([DateTime]::UtcNow - $absentSince).TotalSeconds -ge 5) {
-      break
-    }
-  } else {
-    $absentSince = $null
-  }
-  [Threading.Thread]::Sleep(500)
-} while ([DateTime]::UtcNow -lt $deadline)
+if (-not $cancelCleanup -and
+    -not (Test-InstallProcess) -and
+    -not (Test-ReplacementInstall) -and
+    (Test-Path -LiteralPath $InstallRoot)) {
+  # Delete the residual root at most once. Never poll for and delete a root
+  # that disappears and is later recreated by a replacement installation.
+  Remove-Item -LiteralPath $InstallRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
 
 [Threading.Thread]::Sleep(250)
 Remove-Item -LiteralPath $CleanupDirectory -Recurse -Force -ErrorAction SilentlyContinue
@@ -118,7 +133,7 @@ function launchUninstallCleanup(): void {
   try {
     const cleanupDirectory = mkdtempSync(path.join(os.tmpdir(), 'envcad-uninstall-'))
     const scriptPath = path.join(cleanupDirectory, 'cleanup.ps1')
-    writeFileSync(scriptPath, CLEANUP_SCRIPT, { encoding: 'utf8', mode: 0o600 })
+    writeFileSync(scriptPath, UNINSTALL_CLEANUP_SCRIPT, { encoding: 'utf8', mode: 0o600 })
     const quoteArgument = (value: string) => `"${value.replaceAll('"', '""')}"`
     const cleanupCommandLine = [
       quoteArgument(powershell),
@@ -132,7 +147,9 @@ function launchUninstallCleanup(): void {
       '-InstallRoot',
       quoteArgument(installRoot),
       '-CleanupDirectory',
-      quoteArgument(cleanupDirectory)
+      quoteArgument(cleanupDirectory),
+      '-InstalledExecutable',
+      quoteArgument(process.execPath)
     ].join(' ')
     const powershellLiteral = (value: string) => `'${value.replaceAll("'", "''")}'`
     const wmiLaunch = [

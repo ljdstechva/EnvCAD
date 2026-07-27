@@ -46,6 +46,47 @@ function rejectedWebSocket(
   })
 }
 
+function verifyAuthenticatedSidecarRoundTrip(
+  url: string,
+  origin: string,
+  protocols: string[]
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const socket = new WebSocket(url, protocols, { origin })
+    let settled = false
+    let timer: ReturnType<typeof setTimeout>
+    const finish = (error?: Error, message?: string) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      socket.close()
+      if (error) reject(error)
+      else resolve(message ?? '')
+    }
+    timer = setTimeout(
+      () => finish(new Error('Timed out waiting for the packaged sidecar response')),
+      10_000
+    )
+    socket.once('open', () => socket.send('not-json'))
+    socket.once('message', (data) => {
+      try {
+        const response = JSON.parse(String(data)) as { type?: unknown; message?: unknown }
+        if (response.type !== 'error' || typeof response.message !== 'string') {
+          finish(new Error(`Unexpected packaged sidecar response: ${String(data)}`))
+          return
+        }
+        finish(undefined, response.message)
+      } catch (error) {
+        finish(error instanceof Error ? error : new Error(String(error)))
+      }
+    })
+    socket.once('error', (error) => finish(error))
+    socket.once('close', () => {
+      finish(new Error('Packaged sidecar closed before responding'))
+    })
+  })
+}
+
 test('packaged EnvCAD opens, edits without a browser, authenticates its sidecar, and stays single-instance', async () => {
   const startedAt = performance.now()
   let closedSidecar: { url: string; origin: string } | undefined
@@ -86,6 +127,13 @@ test('packaged EnvCAD opens, edits without a browser, authenticates its sidecar,
         url: runtime.sidecar.connection.url,
         origin: runtime.rendererOrigin
       }
+      await expect(
+        verifyAuthenticatedSidecarRoundTrip(
+          runtime.sidecar.connection.url,
+          runtime.rendererOrigin,
+          [...runtime.sidecar.connection.protocols]
+        )
+      ).resolves.toContain('malformed JSON')
       const status = await rejectedWebSocket(runtime.sidecar.connection.url, runtime.rendererOrigin, [
         'envcad.v1',
         'envcad.session.invalid-token'
