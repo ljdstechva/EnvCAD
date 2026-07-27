@@ -5,6 +5,33 @@ import { inflateSync } from 'node:zlib'
 
 const FIXTURE = path.join(process.cwd(), 'test', 'fixtures', 'sample-site.dxf')
 const CONTROL_URL = 'http://127.0.0.1:8788'
+const TRUNCATED_DXF = [
+  '0',
+  'SECTION',
+  '2',
+  'HEADER',
+  '9',
+  '$LWDISPLAY',
+  '290',
+  '1',
+  '0',
+  'ENDSEC',
+  '0',
+  'SECTION',
+  '2',
+  'ENTITIES',
+  '0',
+  'LINE',
+  '8',
+  'BROKEN',
+  '10',
+  '0',
+  '20',
+  '0',
+  '11',
+  '100',
+  '21'
+].join('\n')
 
 interface TestEntity {
   id: string
@@ -24,7 +51,11 @@ async function loadFixture(page: Page): Promise<TestEntity[]> {
   await expect
     .poll(() => page.evaluate(() => window.__cadTest?.entities().length ?? 0))
     .toBeGreaterThan(0)
-  return page.evaluate(() => window.__cadTest?.entities() ?? [])
+  const entities = await page.evaluate(() => window.__cadTest?.entities() ?? [])
+  await expect
+    .poll(() => page.evaluate(() => window.__cadTest?.renderedEntityIds().length ?? 0))
+    .toBe(entities.length)
+  return entities
 }
 
 function pngPixelVariance(png: Buffer): { uniqueColors: number; brightnessRange: number } {
@@ -248,6 +279,130 @@ test.describe.serial('EnvCAD preview with scripted fake sidecar', () => {
 
     const stats = await (await request.get(`${CONTROL_URL}/stats`)).json()
     expect(stats).toMatchObject({ userMessageCount: 1, toolResultCount: 1 })
+  })
+
+  test('rejects a truncated DXF without changing the edited drawing', async ({ page }) => {
+    const originalEntities = await loadFixture(page)
+    const validDxf = await fs.readFile(FIXTURE, 'utf8')
+    const selectedIds = await page.evaluate(
+      () => window.__cadTest?.selectByLayer('BUILDINGS') ?? []
+    )
+    expect(selectedIds).toHaveLength(2)
+
+    const moveResult = await page.evaluate((entityIds) => {
+      return window.__cadTest?.callTool('move_entities', { entityIds, dx: 5, dy: 0 })
+    }, selectedIds)
+    expect(moveResult).toMatchObject({ data: { entityIds: selectedIds, dx: 5, dy: 0 } })
+
+    const editedEntities = await page.evaluate(() => window.__cadTest?.entities() ?? [])
+    const renderedIdsBefore = await page.evaluate(
+      () => window.__cadTest?.renderedEntityIds() ?? []
+    )
+    expect(editedEntities).not.toEqual(originalEntities)
+    expect(renderedIdsBefore).toHaveLength(editedEntities.length)
+    await expect.poll(() => page.evaluate(() => window.__cadTest?.isDirty())).toBe(true)
+
+    const stateBefore = await page.evaluate((dxf) => {
+      const snapshot = JSON.stringify({
+        fileName: 'sample-site.dxf',
+        dxf,
+        savedAt: 1_700_000_000_000
+      })
+      localStorage.setItem('envcad.autosaveSnapshot', snapshot)
+      return {
+        fileName: window.__cadTest?.fileName(),
+        isDirty: window.__cadTest?.isDirty(),
+        selection: window.__cadTest?.selection(),
+        canUndo: window.__cadTest?.canUndo(),
+        canRedo: window.__cadTest?.canRedo(),
+        recentFiles: localStorage.getItem('envcad.recentFiles'),
+        autosave: localStorage.getItem('envcad.autosaveSnapshot')
+      }
+    }, validDxf)
+    expect(stateBefore).toMatchObject({
+      fileName: 'sample-site.dxf',
+      isDirty: true,
+      selection: selectedIds,
+      canUndo: true,
+      canRedo: false
+    })
+    expect(JSON.parse(stateBefore.recentFiles ?? '[]')).toContain('sample-site.dxf')
+
+    const pageErrors: string[] = []
+    page.on('pageerror', (error) => pageErrors.push(error.message))
+    const opened = await page.evaluate(
+      ({ name, text }) => window.__cadTest?.openTextFile(name, text),
+      { name: 'truncated.dxf', text: TRUNCATED_DXF }
+    )
+
+    expect(opened).toBe(false)
+    const toasts = page.locator('.toast[role="alert"]')
+    await expect(toasts).toHaveCount(1)
+    await expect(toasts).toContainText(
+      "Couldn't open truncated.dxf. It may be corrupt or in an unsupported format."
+    )
+    await expect(toasts).not.toContainText(/Error:|at \w+|\.ts:\d+|\.js:\d+/)
+
+    expect(await page.evaluate(() => window.__cadTest?.entities() ?? [])).toEqual(
+      editedEntities
+    )
+    expect(await page.evaluate(() => window.__cadTest?.selection() ?? [])).toEqual(
+      selectedIds
+    )
+    expect(
+      await page.evaluate(() => window.__cadTest?.renderedEntityIds() ?? [])
+    ).toEqual(renderedIdsBefore)
+    expect(
+      await page.evaluate(() => ({
+        fileName: window.__cadTest?.fileName(),
+        isDirty: window.__cadTest?.isDirty(),
+        canUndo: window.__cadTest?.canUndo(),
+        canRedo: window.__cadTest?.canRedo(),
+        recentFiles: localStorage.getItem('envcad.recentFiles'),
+        autosave: localStorage.getItem('envcad.autosaveSnapshot')
+      }))
+    ).toEqual({
+      fileName: stateBefore.fileName,
+      isDirty: stateBefore.isDirty,
+      canUndo: stateBefore.canUndo,
+      canRedo: stateBefore.canRedo,
+      recentFiles: stateBefore.recentFiles,
+      autosave: stateBefore.autosave
+    })
+    expect(pageErrors).toEqual([])
+
+    await page.getByRole('button', { name: 'Undo' }).click()
+    await expect
+      .poll(() => page.evaluate(() => window.__cadTest?.entities() ?? []))
+      .toEqual(originalEntities)
+    await page.getByRole('button', { name: 'Redo' }).click()
+    await expect
+      .poll(() => page.evaluate(() => window.__cadTest?.entities() ?? []))
+      .toEqual(editedEntities)
+    await expect(page.locator('.canvas-host canvas:visible').first()).toBeVisible()
+
+    // The current dirty drawing is intentionally autosaved during beforeunload.
+    // Re-seed the original valid snapshot before the reloaded app mounts so
+    // this tail verifies the restore path independently of DXF export fidelity.
+    await page.addInitScript((autosave) => {
+      localStorage.setItem('envcad.autosaveSnapshot', autosave)
+    }, stateBefore.autosave!)
+    await page.reload()
+    await expect(page.locator('.restore-banner')).toContainText(
+      'Restore unsaved drawing "sample-site.dxf"'
+    )
+    await page.getByRole('button', { name: 'Restore', exact: true }).click()
+    await expect(page.locator('.restore-banner')).toBeHidden()
+    await expect
+      .poll(() => page.evaluate(() => window.__cadTest?.entities().length ?? 0))
+      .toBe(originalEntities.length)
+    await expect.poll(() => page.evaluate(() => window.__cadTest?.fileName())).toBe(
+      'sample-site.dxf'
+    )
+    await expect.poll(() => page.evaluate(() => window.__cadTest?.isDirty())).toBe(true)
+    expect(
+      await page.evaluate(() => localStorage.getItem('envcad.autosaveSnapshot'))
+    ).toBeNull()
   })
 
   test('shows offline disabled chat and reconnects when the fake sidecar starts', async ({

@@ -1,0 +1,267 @@
+diff --git a/node_modules/@mlightcad/cad-simple-viewer/dist/cad-simple-viewer.js b/node_modules/@mlightcad/cad-simple-viewer/dist/cad-simple-viewer.js
+index 296801d..6a2cb5e 100644
+--- a/node_modules/@mlightcad/cad-simple-viewer/dist/cad-simple-viewer.js
++++ b/node_modules/@mlightcad/cad-simple-viewer/dist/cad-simple-viewer.js
+@@ -72242,13 +72242,17 @@ class E {
+    * ```
+    */
+   async openDocument(e, t, n) {
+-    n = this.setOptions(n), this.onBeforeOpenDocument(n);
+-    const i = await this.context.doc.openDocument(
++    n = this.setOptions(n);
++    const i = new tP(), s = await ey(i.database, () => i.openDocument(
+       e,
+       t,
+       n
+-    );
+-    return this.onAfterOpenDocument(i, n), i;
++    ));
++    if (!s)
++      return i.destroy(), !1;
++    this.onBeforeOpenDocument(n);
++    const o = this.context.doc;
++    return this.context.replaceDocument(i), An().workingDatabase = i.database, Array.from(i.database.tables.layerTable.newIterator()).forEach((a) => this.curView.addLayer(a)), Array.from(i.database.objects.layout.newIterator()).forEach((a) => this.curView.addLayout(a)), o.destroy(), this.onAfterOpenDocument(!0, n), this.curView.loadLayoutEntitiesIfNeeded(this.curView.activeLayoutBtrId), !0;
+   }
+   /**
+    * Loads a DWG/DXF file as a read-only overlay (base drawing/reference)
+@@ -74934,42 +74938,56 @@ class NP {
+    * @param doc - The document containing the drawing database
+    */
+   constructor(e, t) {
+-    this._view = e, this._doc = t, t.database.events.entityAppended.addEventListener((n) => {
+-      const i = uf(n.entity).filter(
+-        (s) => !this.view.hasEntity(s.objectId)
+-      );
+-      i.length !== 0 && this.view.addEntity(i.length === 1 ? i[0] : i);
+-    }), t.database.events.entityModified.addEventListener((n) => {
+-      const i = n, s = this.view;
+-      s instanceof fy && RP(
+-        i,
+-        (o) => s.hasEntity(o),
+-        (o) => s.getEntityVisible(o)
+-      ) && s.updateEntityVisibility(i.entity) || this.view.updateEntity(i.entity);
+-    }), t.database.events.entityErased.addEventListener((n) => {
+-      const i = uf(n.entity).filter(
+-        (s) => this.view.hasEntity(s.objectId)
+-      );
+-      i.length !== 0 && this.view.removeEntity(i.length === 1 ? i[0] : i);
+-    }), t.database.events.layerAppended.addEventListener((n) => {
+-      this._view.addLayer(n.layer);
+-    }), t.database.events.layerModified.addEventListener((n) => {
+-      this._view.updateLayer(n.layer, n.changes);
+-    }), Ce.instance().events.sysVarChanged.addEventListener((n) => {
++    this._view = e, this.bindDocument(t), Ce.instance().events.sysVarChanged.addEventListener((n) => {
++      if (n.database !== this._doc.database)
++        return;
+       if (n.name == ce.PDMODE.toLowerCase())
+         this._view.rerenderPoints(n.database.pdmode);
+       else if (n.name == ce.LWDISPLAY.toLowerCase()) {
+         const i = this._view, s = !!n.database.lwdisplay;
+         i.renderer.showLineWeight !== s && (i.renderer.showLineWeight = s, i.clear(), n.database.regen());
+       }
+-    }), t.database.events.dictObjetSet.addEventListener((n) => {
+-      n.object instanceof bf && this._view.addLayout(n.object);
+     }), e.selectionSet.events.selectionAdded.addEventListener((n) => {
+       e.highlight(n.ids);
+     }), e.selectionSet.events.selectionRemoved.addEventListener((n) => {
+       e.unhighlight(n.ids);
+     });
+   }
++  /**
++   * Rebinds this context to a fully opened replacement document.
++   *
++   * The view and command context retain their identity while subsequent
++   * database notifications come from the replacement document.
++   */
++  replaceDocument(e) {
++    this.bindDocument(e);
++  }
++  bindDocument(e) {
++    this._doc = e, e.database.events.entityAppended.addEventListener((t) => {
++      const n = uf(t.entity).filter(
++        (i) => !this.view.hasEntity(i.objectId)
++      );
++      n.length !== 0 && this.view.addEntity(n.length === 1 ? n[0] : n);
++    }), e.database.events.entityModified.addEventListener((t) => {
++      const n = t, i = this.view;
++      i instanceof fy && RP(
++        n,
++        (s) => i.hasEntity(s),
++        (s) => i.getEntityVisible(s)
++      ) && i.updateEntityVisibility(n.entity) || this.view.updateEntity(n.entity);
++    }), e.database.events.entityErased.addEventListener((t) => {
++      const n = uf(t.entity).filter(
++        (i) => this.view.hasEntity(i.objectId)
++      );
++      n.length !== 0 && this.view.removeEntity(n.length === 1 ? n[0] : n);
++    }), e.database.events.layerAppended.addEventListener((t) => {
++      this._view.addLayer(t.layer);
++    }), e.database.events.layerModified.addEventListener((t) => {
++      this._view.updateLayer(t.layer, t.changes);
++    }), e.database.events.dictObjetSet.addEventListener((t) => {
++      t.object instanceof bf && this._view.addLayout(t.object);
++    });
++  }
+   /**
+    * Gets the view component that renders the CAD drawing.
+    *
+diff --git a/node_modules/@mlightcad/cad-simple-viewer/lib/app/AcApContext.d.ts b/node_modules/@mlightcad/cad-simple-viewer/lib/app/AcApContext.d.ts
+index a79f26a..8e30d68 100644
+--- a/node_modules/@mlightcad/cad-simple-viewer/lib/app/AcApContext.d.ts
++++ b/node_modules/@mlightcad/cad-simple-viewer/lib/app/AcApContext.d.ts
+@@ -41,6 +41,14 @@ export declare class AcApContext {
+      * @param doc - The document containing the drawing database
+      */
+     constructor(view: AcEdBaseView, doc: AcApDocument);
++    /**
++     * Rebinds this context to a fully opened replacement document.
++     *
++     * The view and command context retain their identity while subsequent
++     * database notifications come from the replacement document.
++     */
++    replaceDocument(doc: AcApDocument): void;
++    private bindDocument;
+     /**
+      * Gets the view component that renders the CAD drawing.
+      *
+diff --git a/node_modules/@mlightcad/cad-simple-viewer/lib/app/AcApContext.js b/node_modules/@mlightcad/cad-simple-viewer/lib/app/AcApContext.js
+index 1ceeab4..5a903a8 100644
+--- a/node_modules/@mlightcad/cad-simple-viewer/lib/app/AcApContext.js
++++ b/node_modules/@mlightcad/cad-simple-viewer/lib/app/AcApContext.js
+@@ -43,6 +43,50 @@ var AcApContext = /** @class */ (function () {
+     function AcApContext(view, doc) {
+         var _this = this;
+         this._view = view;
++        this.bindDocument(doc);
++        // Set point display mode
++        AcDbSysVarManager.instance().events.sysVarChanged.addEventListener(function (args) {
++            // Ignore sysvar notifications from detached databases (for example,
++            // a document being parsed transactionally before it becomes active).
++            if (args.database !== _this._doc.database) {
++                return;
++            }
++            if (args.name == AcDbSystemVariables.PDMODE.toLowerCase()) {
++                ;
++                _this._view.rerenderPoints(args.database.pdmode);
++            }
++            else if (args.name == AcDbSystemVariables.LWDISPLAY.toLowerCase()) {
++                var view_1 = _this._view;
++                var showLineWeight = !!args.database.lwdisplay;
++                if (view_1.renderer.showLineWeight !== showLineWeight) {
++                    view_1.renderer.showLineWeight = showLineWeight;
++                    // Existing line objects may need different geometry/material classes.
++                    // Regenerate to rebuild scene content using the new display mode.
++                    view_1.clear();
++                    args.database.regen();
++                }
++            }
++        });
++        // Show their grip points when entities are selected
++        view.selectionSet.events.selectionAdded.addEventListener(function (args) {
++            view.highlight(args.ids);
++        });
++        // Hide their grip points when entities are deselected
++        view.selectionSet.events.selectionRemoved.addEventListener(function (args) {
++            view.unhighlight(args.ids);
++        });
++    }
++    /**
++     * Rebinds this context to a fully opened replacement document.
++     *
++     * The view and command context retain their identity while subsequent
++     * database notifications come from the replacement document.
++     */
++    AcApContext.prototype.replaceDocument = function (doc) {
++        this.bindDocument(doc);
++    };
++    AcApContext.prototype.bindDocument = function (doc) {
++        var _this = this;
+         this._doc = doc;
+         // Add entity to scene
+         doc.database.events.entityAppended.addEventListener(function (args) {
+@@ -81,38 +125,12 @@ var AcApContext = /** @class */ (function () {
+         doc.database.events.layerModified.addEventListener(function (args) {
+             _this._view.updateLayer(args.layer, args.changes);
+         });
+-        // Set point display mode
+-        AcDbSysVarManager.instance().events.sysVarChanged.addEventListener(function (args) {
+-            if (args.name == AcDbSystemVariables.PDMODE.toLowerCase()) {
+-                ;
+-                _this._view.rerenderPoints(args.database.pdmode);
+-            }
+-            else if (args.name == AcDbSystemVariables.LWDISPLAY.toLowerCase()) {
+-                var view_1 = _this._view;
+-                var showLineWeight = !!args.database.lwdisplay;
+-                if (view_1.renderer.showLineWeight !== showLineWeight) {
+-                    view_1.renderer.showLineWeight = showLineWeight;
+-                    // Existing line objects may need different geometry/material classes.
+-                    // Regenerate to rebuild scene content using the new display mode.
+-                    view_1.clear();
+-                    args.database.regen();
+-                }
+-            }
+-        });
+         doc.database.events.dictObjetSet.addEventListener(function (args) {
+             if (args.object instanceof AcDbLayout) {
+                 _this._view.addLayout(args.object);
+             }
+         });
+-        // Show their grip points when entities are selected
+-        view.selectionSet.events.selectionAdded.addEventListener(function (args) {
+-            view.highlight(args.ids);
+-        });
+-        // Hide their grip points when entities are deselected
+-        view.selectionSet.events.selectionRemoved.addEventListener(function (args) {
+-            view.unhighlight(args.ids);
+-        });
+-    }
++    };
+     Object.defineProperty(AcApContext.prototype, "view", {
+         /**
+          * Gets the view component that renders the CAD drawing.
+diff --git a/node_modules/@mlightcad/cad-simple-viewer/lib/app/AcApDocManager.js b/node_modules/@mlightcad/cad-simple-viewer/lib/app/AcApDocManager.js
+index 48e9113..a59a58e 100644
+--- a/node_modules/@mlightcad/cad-simple-viewer/lib/app/AcApDocManager.js
++++ b/node_modules/@mlightcad/cad-simple-viewer/lib/app/AcApDocManager.js
+@@ -692,17 +692,36 @@ var AcApDocManager = /** @class */ (function () {
+      */
+     AcApDocManager.prototype.openDocument = function (fileName, content, options) {
+         return __awaiter(this, void 0, void 0, function () {
+-            var isSuccess;
++            var nextDocument, isSuccess, previousDocument, currentView;
+             return __generator(this, function (_a) {
+                 switch (_a.label) {
+                     case 0:
+                         options = this.setOptions(options);
+-                        this.onBeforeOpenDocument(options);
+-                        return [4 /*yield*/, this.context.doc.openDocument(fileName, content, options)];
++                        nextDocument = new AcApDocument();
++                        return [4 /*yield*/, acapWithSecondaryDatabase(nextDocument.database, function () {
++                                return nextDocument.openDocument(fileName, content, options);
++                            })];
+                     case 1:
+                         isSuccess = _a.sent();
+-                        this.onAfterOpenDocument(isSuccess, options);
+-                        return [2 /*return*/, isSuccess];
++                        if (!isSuccess) {
++                            nextDocument.destroy();
++                            return [2 /*return*/, false];
++                        }
++                        this.onBeforeOpenDocument(options);
++                        previousDocument = this.context.doc;
++                        this.context.replaceDocument(nextDocument);
++                        acdbHostApplicationServices().workingDatabase = nextDocument.database;
++                        currentView = this.curView;
++                        Array.from(nextDocument.database.tables.layerTable.newIterator()).forEach(function (layer) {
++                            return currentView.addLayer(layer);
++                        });
++                        Array.from(nextDocument.database.objects.layout.newIterator()).forEach(function (layout) {
++                            return currentView.addLayout(layout);
++                        });
++                        previousDocument.destroy();
++                        this.onAfterOpenDocument(true, options);
++                        this.curView.loadLayoutEntitiesIfNeeded(this.curView.activeLayoutBtrId);
++                        return [2 /*return*/, true];
+                 }
+             });
+         });

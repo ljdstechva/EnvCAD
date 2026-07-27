@@ -24,12 +24,17 @@ export interface CadTestEntity {
  */
 export interface CadTestApi {
   entities(): CadTestEntity[]
+  renderedEntityIds(): string[]
   select(ids: string[]): number
   selectByLayer(layer: string): string[]
   clearSelection(): void
   selection(): string[]
+  fileName(): string
+  isDirty(): boolean
   sheet(): unknown
   canUndo(): boolean
+  canRedo(): boolean
+  openTextFile(name: string, text: string): Promise<boolean>
   /** Painted canvas background as a 24-bit RGB number, for theme checks. */
   canvasBackground(): number
   callTool(name: CadToolName, input: unknown): Promise<ToolResult>
@@ -65,6 +70,12 @@ function installCadTestApi() {
 
   window.__cadTest = {
     entities: listEntities,
+    renderedEntityIds() {
+      const view = AcApDocManager.instance.curView
+      return listEntities()
+        .filter((entity) => view.hasEntity(entity.id))
+        .map((entity) => entity.id)
+    },
     select(ids) {
       const selectionSet = AcApDocManager.instance.curView.selectionSet
       selectionSet.clear()
@@ -84,11 +95,23 @@ function installCadTestApi() {
     selection() {
       return [...AcApDocManager.instance.curView.selectionSet.ids]
     },
+    fileName() {
+      throw new Error('CAD viewer state is not ready')
+    },
+    isDirty() {
+      throw new Error('CAD viewer state is not ready')
+    },
     sheet() {
       return JSON.parse(JSON.stringify(sheetStore.current))
     },
     canUndo() {
       return AcApDocManager.instance.curDocument.database.transactionManager.canUndo()
+    },
+    canRedo() {
+      return AcApDocManager.instance.curDocument.database.transactionManager.canRedo()
+    },
+    openTextFile() {
+      return Promise.reject(new Error('CAD viewer state is not ready'))
     },
     canvasBackground() {
       return AcApDocManager.instance.curView.backgroundColor

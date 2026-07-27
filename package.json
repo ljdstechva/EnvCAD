@@ -7,6 +7,7 @@
     "@mlightcad/*": "Pinned to exact versions on purpose — no ^ ranges. src/agent/polyline.ts reads vertex positions and bulges through public APIs, validates that both views align, and falls back to straight chord vertices when bulges cannot be verified. The pin keeps upgrades deliberate and testable. See docs/agent-test-plan.md."
   },
   "scripts": {
+    "postinstall": "patch-package",
     "dev": "concurrently --kill-others-on-fail -n vite,sidecar -c blue,green \"vite\" \"npm run sidecar\"",
     "sidecar": "tsx sidecar/src/index.ts",
     "typecheck": "vue-tsc -b --pretty false && tsc -p sidecar/tsconfig.json --pretty false",
@@ -39,6 +40,7 @@
     "@vitest/ui": "^2.1.0",
     "concurrently": "^9.0.0",
     "jsdom": "^29.1.1",
+    "patch-package": "^8.0.1",
     "tsx": "^4.19.0",
     "typescript": "^5.5.0",
     "vite": "^5.4.0",

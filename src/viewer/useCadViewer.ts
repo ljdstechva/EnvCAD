@@ -164,6 +164,15 @@ export function useCadViewer() {
       syncDirtyAfterUndoStackChange()
     })
 
+    if (window.__cadTest) {
+      window.__cadTest.fileName = () => fileName.value
+      window.__cadTest.isDirty = () => isDirty.value
+      window.__cadTest.canRedo = () =>
+        manager.curDocument.database.transactionManager.canRedo()
+      window.__cadTest.openTextFile = (name, text) =>
+        openFile(new File([text], name, { type: 'application/dxf' }))
+    }
+
     return manager
   }
 
