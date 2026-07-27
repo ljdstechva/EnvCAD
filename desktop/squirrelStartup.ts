@@ -15,14 +15,49 @@ param(
 )
 
 $ErrorActionPreference = 'SilentlyContinue'
-$deadline = [DateTime]::UtcNow.AddMinutes(2)
+
+# Squirrel may terminate the application before its child-process callback
+# runs. Start this helper early, but let shortcut removal and updater shutdown
+# settle before touching the installation root.
+[Threading.Thread]::Sleep(30000)
+$deadline = [DateTime]::UtcNow.AddMinutes(5)
+
+function Test-InstallProcess {
+  $installPrefix = $InstallRoot.TrimEnd('\') + '\'
+  $processes = Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue
+  foreach ($process in $processes) {
+    $executablePath = [string] $process.ExecutablePath
+    if ($executablePath.StartsWith(
+      $installPrefix,
+      [StringComparison]::OrdinalIgnoreCase
+    )) {
+      return $true
+    }
+  }
+  return $false
+}
+
+do {
+  if (-not (Test-InstallProcess)) {
+    break
+  }
+  [Threading.Thread]::Sleep(1000)
+} while ([DateTime]::UtcNow -lt $deadline)
+
+$absentSince = $null
 
 do {
   if (Test-Path -LiteralPath $InstallRoot) {
     Remove-Item -LiteralPath $InstallRoot -Recurse -Force -ErrorAction SilentlyContinue
   }
   if (-not (Test-Path -LiteralPath $InstallRoot)) {
-    break
+    if ($null -eq $absentSince) {
+      $absentSince = [DateTime]::UtcNow
+    } elseif (([DateTime]::UtcNow - $absentSince).TotalSeconds -ge 5) {
+      break
+    }
+  } else {
+    $absentSince = $null
   }
   [Threading.Thread]::Sleep(500)
 } while ([DateTime]::UtcNow -lt $deadline)
@@ -143,12 +178,11 @@ export function handleSquirrelStartup(): boolean {
     return true
   }
   if (command === UNINSTALL_EVENT) {
-    runUpdate([`--removeShortcut=${target}`], () => {
-      // Keep Update.exe available until Squirrel has finished removing shortcuts.
-      // The cleanup helper retries the install-root removal after this app exits.
-      launchUninstallCleanup()
-      app.quit()
-    })
+    // Squirrel can terminate this process before runUpdate's callback fires, so
+    // schedule deferred cleanup first. The helper has its own grace/process
+    // checks and cannot touch Update.exe while shortcut removal is active.
+    launchUninstallCleanup()
+    runUpdate([`--removeShortcut=${target}`], () => app.quit())
     return true
   }
   if (command === OBSOLETE_EVENT) {
