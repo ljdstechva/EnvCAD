@@ -55,8 +55,9 @@ The canonical workflow exercises most of the app:
    the AI Assistant chat panel. The assistant sees your selection, calls a
    CAD tool to make the edit, and the canvas updates live; `Ctrl+Z` undoes it
    like any other edit.
-4. **Add dimensions and annotations** — from the toolbar or by asking the
-   assistant to measure and label features.
+4. **Add dimensions and annotations** — ask the assistant to measure and label
+   features (e.g. *"Dimension the site frontage"*); it draws linear and radius
+   dimensions, leaders, and text on an annotation layer.
 5. **Set up a sheet** — `F2` or the Page Setup button to choose paper size,
    orientation, scale, margins, and a title block template.
 6. **Export a PDF** — the Sheet Preview tab renders the plotted sheet;

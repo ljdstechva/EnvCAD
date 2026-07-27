@@ -12,6 +12,7 @@ import dwgParserWorkerUrl from '../../node_modules/@mlightcad/cad-simple-viewer/
 import mtextRendererWorkerUrl from '../../node_modules/@mlightcad/cad-simple-viewer/dist/mtext-renderer-worker.js?url'
 import { pushToast } from '../toast/toastStore'
 import { clearAutosaveSnapshot, pushRecentFile } from '../autosave/autosave'
+import { drawingFileProblem, dxfFileName } from './drawingFile'
 
 export interface LayerInfo {
   name: string
@@ -39,6 +40,8 @@ export function useCadViewer() {
   let cleanWithEmptyUndoStack = true
   /** Set by edits that leave no undo record, so undoing can't clear them. */
   let dirtyOutsideUndoStack = false
+  /** Theme canvas colour, re-applied after each open (see applyCanvasBackground). */
+  let canvasBackground: number | undefined
 
   function hasUndoRecords(): boolean {
     return docManager.value?.curDocument?.database.transactionManager.canUndo() ?? false
@@ -175,6 +178,12 @@ export function useCadViewer() {
     if (!manager) return false
     try {
       const buffer = await file.arrayBuffer()
+      // Checked before openDocument, which clears the open drawing first.
+      const problem = drawingFileProblem(file.name, buffer)
+      if (problem) {
+        pushToast(`Couldn't open ${file.name}: ${problem}.`)
+        return false
+      }
       const opened = await manager.openDocument(file.name, buffer, {
         mode: AcEdOpenMode.Write,
         openViewMode: AcApOpenViewMode.Extents
@@ -185,6 +194,7 @@ export function useCadViewer() {
       }
       fileName.value = file.name
       pushRecentFile(file.name)
+      applyCanvasBackground()
       refreshLayers()
       refreshUndoRedo()
       return true
@@ -204,7 +214,10 @@ export function useCadViewer() {
     }
     try {
       const buffer = new TextEncoder().encode(dxfText).buffer
-      const opened = await manager.openDocument(name, buffer, {
+      // Snapshot bodies are always DXF text, but the library picks its parser
+      // from the extension — a drawing opened from site.dwg must not be handed
+      // back under that name or the DWG parser rejects it.
+      const opened = await manager.openDocument(dxfFileName(name), buffer, {
         mode: AcEdOpenMode.Write,
         openViewMode: AcApOpenViewMode.Extents
       })
@@ -213,6 +226,7 @@ export function useCadViewer() {
         return false
       }
       fileName.value = name
+      applyCanvasBackground()
       refreshLayers()
       refreshUndoRedo()
       // Restored content only exists in the browser, so it counts as unsaved
@@ -234,18 +248,6 @@ export function useCadViewer() {
     return typeof content === 'string' ? content : new TextDecoder().decode(content)
   }
 
-  /**
-   * The Open dialog also accepts `.dwg`, but this always writes DXF text, so
-   * the download always carries a `.dxf` extension — DXF content under a
-   * `.dwg` name is rejected by AutoCAD and by EnvCAD itself, which picks its
-   * parser from the extension.
-   */
-  function dxfDownloadName(name: string): string {
-    const trimmed = name.trim()
-    if (!trimmed) return 'drawing.dxf'
-    return `${trimmed.replace(/\.[^./\\]*$/, '')}.dxf`
-  }
-
   function saveDxf(name?: string) {
     const manager = docManager.value
     if (!manager) return
@@ -256,7 +258,7 @@ export function useCadViewer() {
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
-    a.download = dxfDownloadName(name ?? fileName.value)
+    a.download = dxfFileName(name ?? fileName.value)
     a.click()
     URL.revokeObjectURL(url)
     markClean()
@@ -283,9 +285,22 @@ export function useCadViewer() {
     docManager.value?.curView.zoomToFitDrawing()
   }
 
-  function setCanvasBackground(colorHex: number) {
+  /**
+   * Opening a drawing overwrites the canvas background: AcApDocManager
+   * dispatches documentActivated and only then calls
+   * AcTrView2d.syncDisplaySysVars, which re-reads the drawing's MODELBKCOLOR
+   * (black for most files). The requested theme colour is therefore kept here
+   * and re-applied after each open, once the library has had its say.
+   */
+  function applyCanvasBackground() {
+    if (canvasBackground === undefined) return
     const view = docManager.value?.curView
-    if (view) view.backgroundColor = colorHex
+    if (view) view.backgroundColor = canvasBackground
+  }
+
+  function setCanvasBackground(colorHex: number) {
+    canvasBackground = colorHex
+    applyCanvasBackground()
   }
 
   function toggleLayer(name: string) {

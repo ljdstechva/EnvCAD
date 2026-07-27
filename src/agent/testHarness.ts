@@ -30,6 +30,8 @@ export interface CadTestApi {
   selection(): string[]
   sheet(): unknown
   canUndo(): boolean
+  /** Painted canvas background as a 24-bit RGB number, for theme checks. */
+  canvasBackground(): number
   callTool(name: CadToolName, input: unknown): Promise<ToolResult>
 }
 
@@ -87,6 +89,9 @@ function installCadTestApi() {
     },
     canUndo() {
       return AcApDocManager.instance.curDocument.database.transactionManager.canUndo()
+    },
+    canvasBackground() {
+      return AcApDocManager.instance.curView.backgroundColor
     },
     callTool(name, input) {
       return executeCadTool(name, input)

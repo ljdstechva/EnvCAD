@@ -151,6 +151,21 @@ test.describe.serial('EnvCAD preview with scripted fake sidecar', () => {
     expect(variance.brightnessRange).toBeGreaterThan(20)
   })
 
+  test('paints the themed canvas background after opening and when the theme changes', async ({
+    page
+  }) => {
+    // Opening a drawing makes the viewer library re-read the file's own
+    // MODELBKCOLOR, so the theme colour has to be re-applied afterwards.
+    await loadFixture(page)
+    await expect.poll(() => page.evaluate(() => window.__cadTest?.canvasBackground())).toBe(0xf5f5f5)
+
+    await page.locator('.theme-toggle').click()
+    await expect.poll(() => page.evaluate(() => window.__cadTest?.canvasBackground())).toBe(0x1a1a1a)
+
+    await page.locator('.theme-toggle').click()
+    await expect.poll(() => page.evaluate(() => window.__cadTest?.canvasBackground())).toBe(0xf5f5f5)
+  })
+
   test('sets A4 portrait and renders a 210 by 297 sheet viewBox', async ({ page }) => {
     await loadFixture(page)
     await page.getByRole('button', { name: 'Page Setup', exact: true }).click()
