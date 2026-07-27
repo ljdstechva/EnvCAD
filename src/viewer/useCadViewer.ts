@@ -13,6 +13,7 @@ import mtextRendererWorkerUrl from '../../node_modules/@mlightcad/cad-simple-vie
 import { pushToast } from '../toast/toastStore'
 import { clearAutosaveSnapshot, pushRecentFile } from '../autosave/autosave'
 import { drawingFileProblem, dxfFileName } from './drawingFile'
+import { restoreDxfLayerTrueColors } from './dxfLayerColors'
 
 export interface LayerInfo {
   name: string
@@ -187,6 +188,9 @@ export function useCadViewer() {
     if (!manager) return false
     try {
       const buffer = await file.arrayBuffer()
+      const dxfText = /\.dxf$/i.test(file.name)
+        ? new TextDecoder().decode(buffer)
+        : undefined
       // Checked before openDocument, which clears the open drawing first.
       const problem = drawingFileProblem(file.name, buffer)
       if (problem) {
@@ -200,6 +204,12 @@ export function useCadViewer() {
       if (!opened) {
         pushToast(`Couldn't open ${file.name}. It may be corrupt or in an unsupported format.`)
         return false
+      }
+      if (
+        dxfText &&
+        restoreDxfLayerTrueColors(manager.curDocument.database, dxfText) > 0
+      ) {
+        manager.regen()
       }
       fileName.value = file.name
       pushRecentFile(file.name)
@@ -233,6 +243,11 @@ export function useCadViewer() {
       if (!opened) {
         pushToast(`Couldn't restore ${name}. The saved snapshot could not be read.`)
         return false
+      }
+      if (
+        restoreDxfLayerTrueColors(manager.curDocument.database, dxfText) > 0
+      ) {
+        manager.regen()
       }
       fileName.value = name
       applyCanvasBackground()
