@@ -1,18 +1,55 @@
 # EnvCAD
 
-EnvCAD is a browser-based CAD viewer and editor for environmental site
+EnvCAD is a Windows desktop CAD viewer and editor for environmental site
 drawings — DXF/DWG plans, site boundaries, monitoring points, and the sheet
 layouts used to plot them — with an AI drafting assistant built in. The
 assistant can inspect the drawing, select and edit entities, add annotations,
 and answer questions about the site, all through natural-language chat next
 to the canvas.
 
-The app is a Vue 3 + Vite single-page app. A small local sidecar process
-gives the browser access to the Claude Agent SDK over a WebSocket, so the
-assistant can call CAD tools (move, measure, annotate, import) against the
-drawing open in your browser.
+The installed application packages the Vue 3 + Vite interface in Electron. A
+separate utility process hosts the local Claude Agent SDK bridge, allowing the
+assistant to call CAD tools (move, measure, annotate, import) against the
+drawing open in EnvCAD without exposing Node.js or Electron APIs to the page.
+The browser/PWA workflow remains available for development and deployment.
 
-## Setup
+## Install EnvCAD on Windows
+
+EnvCAD currently supports 64-bit Windows. Before installing, install
+[Claude Code](https://claude.com/claude-code), update it to version `2.1.220`,
+and sign in with your Claude subscription:
+
+```powershell
+claude --version
+claude auth login
+```
+
+Then run **`EnvCAD Setup.exe`** from the release. A locally built installer is
+written to:
+
+```text
+out\make\squirrel.windows\x64\EnvCAD Setup.exe
+```
+
+The Squirrel installer is per-user, requires no administrator access, launches
+EnvCAD when installation finishes, and creates Desktop and Start menu
+shortcuts. Launching the shortcut starts the UI and AI bridge together; no
+terminal, Node.js installation, repository checkout, or separate sidecar
+command is required.
+
+EnvCAD uses the existing Claude Code subscription login. It does not accept an
+Anthropic API key and disables the AI Assistant if `ANTHROPIC_API_KEY` is set.
+If Claude Code is missing, incompatible, or signed out, EnvCAD displays a
+specific setup message while CAD opening, editing, saving, and PDF export stay
+available.
+
+The current installer is not code-signed, so Windows can show an unknown
+publisher or reputation warning. Obtain it only from a trusted EnvCAD release
+or build it from this repository. See
+[`docs/desktop.md`](docs/desktop.md) for architecture, security, logs,
+troubleshooting, packaging, and uninstall details.
+
+## Browser development setup
 
 1. Install dependencies:
 
@@ -132,7 +169,8 @@ Keep `npm run dev` available for me to use. If your execution environment cannot
 The installing AI agent needs terminal and filesystem access. You must complete
 any interactive Claude authentication yourself; installation does not grant the
 agent access to your Claude credentials. EnvCAD deliberately refuses API-key
-mode. If you prefer, follow the ordinary [manual setup](#setup) instead.
+mode. If you prefer, follow the ordinary
+[browser development setup](#browser-development-setup) instead.
 
 ## Feature tour
 
@@ -172,12 +210,15 @@ The canonical workflow exercises most of the app:
 DXF parsing, PDF export, agent protocol, and sidecar failures are surfaced with
 user-friendly notifications or status messages rather than raw application
 errors. The Claude agent runs through the local sidecar and the logged-in
-Claude Code subscription described in [Setup](#setup); EnvCAD has no API-key
+Claude Code subscription described in
+[Install EnvCAD on Windows](#install-envcad-on-windows); EnvCAD has no API-key
 mode.
 
 If the sidecar is unavailable or disconnects during a session, the AI Assistant
 shows an offline banner and disables chat. CAD viewing and editing remain
 available, and the assistant reconnects automatically when the sidecar returns.
+The installed app also writes a redacted lifecycle log to
+`%APPDATA%\EnvCAD\logs\main.log`; use **File > Open Log Folder** to open it.
 
 ## Keyboard shortcuts and appearance
 
@@ -216,8 +257,10 @@ Run the automated tests and production checks with:
 ```powershell
 npm run test
 npm run test:e2e
+npm run test:desktop
 npm run typecheck
 npm run build
+npm run desktop:make
 ```
 
 - [`TESTING.md`](TESTING.md) — how to run the Vitest unit/integration suite
@@ -229,3 +272,5 @@ npm run build
   session and aren't part of the automated suites.
 - [`docs/agent-protocol.md`](docs/agent-protocol.md) — the WebSocket protocol
   between the browser and the sidecar, if you're changing either side.
+- [`docs/desktop.md`](docs/desktop.md) — Electron architecture, installer
+  commands, security controls, logs, troubleshooting, and release limitations.

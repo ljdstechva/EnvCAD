@@ -12,11 +12,20 @@ and are imported by both sides (the browser bundle via Vite, the sidecar via
 
 ## Transport
 
-- A single `ws://127.0.0.1:8787` WebSocket server, hosted by the sidecar
-  (`sidecar/src/index.ts`).
-- The server accepts browser connections only from local HTTP(S) origins
-  (`localhost`, `127.0.0.1`, or `::1`). Other origins and clients without an
-  Origin header are rejected before a session is created.
+- In browser development, the sidecar listens on
+  `ws://127.0.0.1:8787` (`sidecar/src/index.ts`).
+- In the packaged desktop app, the utility-process sidecar binds
+  `127.0.0.1` on an operating-system-assigned port. The renderer receives that
+  per-launch endpoint only through the narrow preload API.
+- The server accepts only the exact configured renderer Origin. In browser
+  development that is `http://localhost:5173` unless explicitly overridden;
+  in the packaged app it is the random-port internal renderer origin. Missing
+  or different origins are rejected before a session is created.
+- Every connection must negotiate `envcad.v1` plus a token protocol. Browser
+  development uses the documented local development token; the packaged app
+  generates a cryptographically random token on every launch and keeps it in
+  memory. Missing or incorrect protocols/tokens are rejected before a session
+  is created.
 - The browser is the client. It connects on startup and reconnects with
   exponential backoff if the connection drops (e.g. the sidecar process was
   killed and later restarted).
@@ -280,8 +289,11 @@ value. For every query, the sidecar also verifies that the Agent SDK
 `system/init` message reports either `apiKeySource: 'oauth'` or the runtime
 `'none'` value used by Claude Code 2.1.220 when no API-key source exists.
 Actual key sources (`user`, `project`, `org`, or `temporary`) end the turn
-before CAD tools are accepted. The SDK's bundled Claude Code binary therefore
-uses the existing Claude Code OAuth subscription login on this machine.
+before CAD tools are accepted. The desktop launcher resolves an installed
+`claude.exe`, requires the exact Agent-SDK-compatible version, verifies
+`claude auth status --json`, and supplies that canonical executable path to
+the SDK. The existing Claude Code subscription login is therefore used instead
+of an API key or a separately shipped CLI.
 
 ## Development acceptance hook
 

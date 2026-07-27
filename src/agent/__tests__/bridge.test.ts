@@ -1,5 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { AgentBridge, type AgentBridgeEvent } from '../bridge'
+import {
+  AgentBridge,
+  DEFAULT_BROWSER_CONNECTION,
+  type AgentBridgeEvent
+} from '../bridge'
 
 type Listener = (event: { data?: string }) => void
 
@@ -14,7 +18,10 @@ class FakeBrowserWebSocket {
   sent: string[] = []
   private listeners = new Map<string, Listener[]>()
 
-  constructor(readonly url: string) {
+  constructor(
+    readonly url: string,
+    readonly protocols?: string | string[]
+  ) {
     FakeBrowserWebSocket.instances.push(this)
     queueMicrotask(() => {
       this.readyState = FakeBrowserWebSocket.OPEN
@@ -97,6 +104,56 @@ describe('AgentBridge', () => {
     ])
 
     bridge.disconnect()
+  })
+
+  it('uses the browser-development port and protocols by default', async () => {
+    const bridge = new AgentBridge()
+    bridge.connect()
+    await vi.waitFor(() => expect(bridge.state.connectionState).toBe('online'))
+
+    expect(FakeBrowserWebSocket.instances[0].url).toBe('ws://127.0.0.1:8787')
+    expect(FakeBrowserWebSocket.instances[0].protocols).toEqual(
+      DEFAULT_BROWSER_CONNECTION.protocols
+    )
+    bridge.disconnect()
+  })
+
+  it('uses desktop runtime configuration supplied before connect', async () => {
+    const bridge = new AgentBridge()
+    bridge.configureConnection({
+      url: 'ws://127.0.0.1:43123',
+      protocols: ['envcad.v1', 'envcad.session.test-token']
+    })
+    bridge.connect()
+    await vi.waitFor(() => expect(bridge.state.connectionState).toBe('online'))
+
+    expect(FakeBrowserWebSocket.instances[0].url).toBe('ws://127.0.0.1:43123')
+    expect(FakeBrowserWebSocket.instances[0].protocols).toEqual([
+      'envcad.v1',
+      'envcad.session.test-token'
+    ])
+    bridge.disconnect()
+  })
+
+  it('reconnects gracefully after an established socket closes', async () => {
+    vi.useFakeTimers()
+    try {
+      const bridge = new AgentBridge()
+      bridge.connect()
+      await Promise.resolve()
+      expect(bridge.state.connectionState).toBe('online')
+
+      FakeBrowserWebSocket.instances[0].close()
+      expect(bridge.state.connectionState).toBe('offline')
+      await vi.advanceTimersByTimeAsync(500)
+      await Promise.resolve()
+
+      expect(FakeBrowserWebSocket.instances).toHaveLength(2)
+      expect(bridge.state.connectionState).toBe('online')
+      bridge.disconnect()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('runs concurrent tool calls one at a time so each stays its own undo step', async () => {

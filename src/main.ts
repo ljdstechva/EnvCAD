@@ -1,12 +1,12 @@
 import { createApp } from 'vue'
 import App from './App.vue'
 import './style.css'
-import { agentBridge } from './agent/bridge'
+import { connectAgentBridge } from './agent/desktopRuntime'
 import { registerCadHandlers } from './agent/handlers'
 import { installAgentTestHarness } from './agent/testHarness'
 
 registerCadHandlers()
-agentBridge.connect()
+void connectAgentBridge()
 installAgentTestHarness()
 
 createApp(App).mount('#app')

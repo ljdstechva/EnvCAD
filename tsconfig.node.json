@@ -9,5 +9,13 @@
     "strict": true,
     "noEmit": true
   },
-  "include": ["vite.config.ts"]
+  "include": [
+    "vite.config.ts",
+    "vite.main.config.ts",
+    "vite.preload.config.ts",
+    "vite.sidecar.config.ts",
+    "vite.renderer.config.ts",
+    "forge.config.ts",
+    "playwright.desktop.config.ts"
+  ]
 }

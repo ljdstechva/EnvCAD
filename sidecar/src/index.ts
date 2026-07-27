@@ -1,92 +1,55 @@
-import { WebSocketServer } from 'ws'
-import { BridgeSession } from './bridgeSession'
+import { DEVELOPMENT_SESSION_TOKEN } from '../../desktop/runtimeProtocol'
+import {
+  discoverClaudeExecutable,
+  isClaudeAuthenticated
+} from '../../desktop/claudeExecutable'
+import { startSidecar } from './server'
 
 const HOST = '127.0.0.1'
 const PORT = 8787
 const API_KEY_ENV_NAME = 'ANTHROPIC_API_KEY'
-const ALLOWED_ORIGIN_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]'])
+const DEVELOPMENT_ORIGIN = process.env.ENVCAD_RENDERER_ORIGIN ?? 'http://localhost:5173'
 
-if (process.env[API_KEY_ENV_NAME]?.trim()) {
-  console.error(
-    `[sidecar] refusing to start because ${API_KEY_ENV_NAME} is set. ` +
-      'EnvCAD requires the existing Claude Code OAuth subscription login.'
-  )
-  process.exitCode = 1
-} else {
-  startSidecar()
-}
-
-function isAllowedBrowserOrigin(origin: string | undefined): boolean {
-  if (!origin) return false
-  try {
-    const url = new URL(origin)
-    return (
-      (url.protocol === 'http:' || url.protocol === 'https:') &&
-      ALLOWED_ORIGIN_HOSTS.has(url.hostname)
+async function main(): Promise<void> {
+  if (process.env[API_KEY_ENV_NAME]?.trim()) {
+    throw new Error(
+      `${API_KEY_ENV_NAME} is set. EnvCAD requires the existing Claude Code OAuth subscription login.`
     )
-  } catch {
-    return false
   }
-}
 
-function startSidecar() {
-  const wss = new WebSocketServer({
+  const discovery = await discoverClaudeExecutable()
+  if (discovery.status === 'missing') {
+    throw new Error('Claude Code was not found. Install Claude Code and run "claude auth login".')
+  }
+  if (discovery.status === 'incompatible') {
+    throw new Error(
+      `Claude Code ${discovery.version} is incompatible; version ${discovery.expectedVersion} is required.`
+    )
+  }
+  if (!(await isClaudeAuthenticated(discovery.executablePath))) {
+    throw new Error('Claude Code is installed but not signed in. Run "claude auth login".')
+  }
+
+  const sidecar = startSidecar({
     host: HOST,
     port: PORT,
-    verifyClient(info, done) {
-      if (isAllowedBrowserOrigin(info.origin)) {
-        done(true)
-        return
-      }
-      console.error('[sidecar] rejected WebSocket connection from a non-local browser origin')
-      done(false, 403, 'Local browser origin required')
-    }
+    permittedOrigin: DEVELOPMENT_ORIGIN,
+    sessionToken: DEVELOPMENT_SESSION_TOKEN,
+    claudeExecutablePath: discovery.executablePath
   })
+  const address = await sidecar.ready
   let shuttingDown = false
-
-  wss.on('listening', () => {
-    console.log(`[sidecar] listening on ws://${HOST}:${PORT}`)
-  })
-
-  wss.on('connection', (ws) => {
-    console.log('[sidecar] browser connected')
-    const session = new BridgeSession(ws)
-    ws.on('close', () => {
-      session.close('Browser disconnected')
-      console.log('[sidecar] browser disconnected')
-    })
-  })
-
-  wss.on('error', (error) => {
-    console.error('[sidecar] WebSocket server error:', error)
-    if (!shuttingDown) process.exitCode = 1
-  })
-
-  const shutdown = (signal: NodeJS.Signals) => {
+  const shutdown = async (signal: NodeJS.Signals) => {
     if (shuttingDown) return
     shuttingDown = true
-    console.log(`[sidecar] received ${signal}; shutting down`)
-
-    for (const client of wss.clients) {
-      client.close(1001, 'Sidecar shutting down')
-    }
-
-    const forceCloseTimer = setTimeout(() => {
-      for (const client of wss.clients) client.terminate()
-    }, 2_000)
-    forceCloseTimer.unref()
-
-    wss.close((error) => {
-      clearTimeout(forceCloseTimer)
-      if (error) {
-        console.error('[sidecar] shutdown error:', error)
-        process.exitCode = 1
-      } else {
-        console.log('[sidecar] stopped')
-      }
-    })
+    console.log(`[sidecar] received ${signal}; shutting down ${address.url}`)
+    await sidecar.close()
   }
-
-  process.once('SIGINT', () => shutdown('SIGINT'))
-  process.once('SIGTERM', () => shutdown('SIGTERM'))
+  process.once('SIGINT', () => void shutdown('SIGINT'))
+  process.once('SIGTERM', () => void shutdown('SIGTERM'))
 }
+
+void main().catch((error) => {
+  console.error(`[sidecar] ${error instanceof Error ? error.message : String(error)}`)
+  process.exitCode = 1
+})

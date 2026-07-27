@@ -12,9 +12,9 @@
     "resolveJsonModule": true
   },
   "include": [
-    "src/**/*.ts",
-    "../src/agent/protocol.ts",
-    "../desktop/runtimeProtocol.ts",
-    "../desktop/claudeExecutable.ts"
+    "desktop/**/*.ts",
+    "sidecar/src/**/*.ts",
+    "src/agent/protocol.ts",
+    "forge.env.d.ts"
   ]
 }

@@ -1,7 +1,7 @@
 # EnvCAD testing
 
-EnvCAD has two automated suites. Both are deterministic and can run without
-the real Claude Agent SDK sidecar.
+EnvCAD has browser/unit suites plus a production-ASAR desktop suite. All are
+deterministic and can run without sending a Claude model message.
 
 ## Prerequisites
 
@@ -84,12 +84,39 @@ The configuration fails immediately if any `ANTHROPIC_*` environment variable
 is present, and each browser test asserts that no request targets an Anthropic
 hostname.
 
+## Packaged desktop suite
+
+```powershell
+npm run test:desktop
+```
+
+Electron Forge first packages the x64 production application and writes the
+ASAR to `out\EnvCAD-win32-x64`. Playwright then drives that ASAR with
+Electron's test binary; the shipped executable itself keeps its security fuses
+and inspector disabled.
+
+The suite checks:
+
+1. production renderer startup, the narrow preload API, sample DXF loading,
+   non-blank canvas rendering, and the zoom, layers, and page-setup controls;
+2. live installed-Claude discovery/authentication and sidecar connection
+   without sending a model message;
+3. invalid WebSocket token rejection and second-instance focus behavior;
+4. graceful application exit and a closed sidecar loopback listener;
+5. fail-closed `ANTHROPIC_API_KEY` behavior without logging a test value;
+6. a clean profile with no Claude executable, where the AI-specific setup
+   message is shown and CAD remains usable.
+
+The resulting screenshot is written under `output/desktop`.
+
 ## Live-agent manual pass
 
-The automated suite deliberately does not start the real sidecar, consume an
-API key, use a Claude subscription, or evaluate model judgment. After changes
-to prompts, tool descriptions, authentication, or conversational behavior,
-run the applicable live-agent dialogues in
+The automated suites deliberately do not send a real Claude model message,
+consume an API key, or evaluate model judgment. The packaged desktop suite may
+start the installed-Claude sidecar for a non-billable discovery,
+authentication-status, and connection check; it sends no query. After changes
+to prompts, tool descriptions, authentication, or conversational behavior, run
+the applicable live-agent dialogues in
 [`docs/agent-test-plan.md`](docs/agent-test-plan.md). Those manual checks cover
 OAuth/session behavior, model tool choice, wording, and multi-turn reasoning;
 they are not prerequisites for deterministic unit or fake-sidecar E2E runs.

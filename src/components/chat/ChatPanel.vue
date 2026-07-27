@@ -17,6 +17,12 @@ onBeforeUnmount(dispose)
 const bridgeState = agentBridge.state
 const isOffline = computed(() => bridgeState.connectionState !== 'online')
 const isStreaming = computed(() => bridgeState.status === 'thinking')
+const offlineMessage = computed(
+  () =>
+    bridgeState.offlineReason ||
+    'Assistant offline — sidecar not running (npm run dev starts it)'
+)
+const canOpenLogs = Boolean(window.envcadDesktop)
 
 function onSend(text: string) {
   sendMessage(text)
@@ -28,17 +34,30 @@ function onNewChat() {
     resetChat()
   }
 }
+
+function openLogs() {
+  void window.envcadDesktop?.openLogFolder()
+}
 </script>
 
 <template>
   <div class="chat-panel">
     <div v-if="isOffline" class="offline-banner">
-      Assistant offline — sidecar not running (npm run dev starts it)
+      <span>{{ offlineMessage }}</span>
+      <button v-if="canOpenLogs" type="button" @click="openLogs">Open logs</button>
     </div>
 
     <div class="chat-toolbar">
       <span class="status-text">
-        {{ isOffline ? 'Offline' : isStreaming ? 'Thinking…' : 'Idle' }}
+        {{
+          bridgeState.connectionState === 'connecting'
+            ? 'Connecting…'
+            : isOffline
+              ? 'Offline'
+              : isStreaming
+                ? 'Thinking…'
+                : 'Idle'
+        }}
       </span>
       <span class="grow"></span>
       <button v-if="isStreaming" class="stop-btn" @click="interrupt">Stop</button>
@@ -72,6 +91,24 @@ function onNewChat() {
   padding: 6px 10px;
   font-size: 11px;
   line-height: 1.4;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.offline-banner span {
+  flex: 1;
+}
+
+.offline-banner button {
+  flex: none;
+  border: 1px solid var(--warn-border);
+  border-radius: 3px;
+  background: var(--bg-button);
+  color: var(--text-primary);
+  padding: 3px 7px;
+  font-size: 10px;
+  cursor: pointer;
 }
 
 .chat-toolbar {

@@ -1,4 +1,10 @@
 import { reactive } from 'vue'
+import {
+  DEVELOPMENT_SESSION_TOKEN,
+  ENVCAD_WEBSOCKET_PROTOCOL,
+  sessionTokenProtocol,
+  type SidecarConnectionConfig
+} from '../../desktop/runtimeProtocol'
 import { pushToast } from '../toast/toastStore'
 import {
   parseClientMessage,
@@ -26,6 +32,7 @@ export interface PendingToolCall {
 
 interface AgentBridgeState {
   connectionState: ConnectionState
+  offlineReason: string
   status: AgentStatus
   messages: AgentChatMessage[]
   /** Text accumulated for the assistant turn currently streaming in, if any. */
@@ -39,7 +46,13 @@ export type AgentBridgeEvent =
   | { type: 'tool_result'; callId: string; name: string; result: ToolResult }
 export type AgentBridgeListener = (message: AgentBridgeEvent) => void
 
-const WS_URL = 'ws://127.0.0.1:8787'
+export const DEFAULT_BROWSER_CONNECTION: SidecarConnectionConfig = {
+  url: 'ws://127.0.0.1:8787',
+  protocols: [
+    ENVCAD_WEBSOCKET_PROTOCOL,
+    sessionTokenProtocol(DEVELOPMENT_SESSION_TOKEN)
+  ]
+}
 const RECONNECT_MIN_MS = 500
 const RECONNECT_MAX_MS = 5000
 
@@ -52,6 +65,7 @@ const RECONNECT_MAX_MS = 5000
 export class AgentBridge {
   readonly state: AgentBridgeState = reactive({
     connectionState: 'connecting',
+    offlineReason: '',
     status: 'idle',
     messages: [],
     streamingText: '',
@@ -64,6 +78,7 @@ export class AgentBridge {
   private handlers = new Map<string, ToolHandler>()
   private listeners = new Set<AgentBridgeListener>()
   private stopped = true
+  private connection: SidecarConnectionConfig = DEFAULT_BROWSER_CONNECTION
   /**
    * Serializes tool execution. Claude can emit several tool calls in one
    * assistant turn, and every database-mutating handler wraps its work in a
@@ -82,18 +97,52 @@ export class AgentBridge {
     return () => this.listeners.delete(listener)
   }
 
+  configureConnection(connection: SidecarConnectionConfig) {
+    const unchanged =
+      this.connection.url === connection.url &&
+      this.connection.protocols.length === connection.protocols.length &&
+      this.connection.protocols.every((protocol, index) => protocol === connection.protocols[index])
+    if (unchanged) return
+
+    this.stopSocket()
+    this.connection = {
+      url: connection.url,
+      protocols: [...connection.protocols] as SidecarConnectionConfig['protocols']
+    }
+    this.reconnectDelayMs = RECONNECT_MIN_MS
+  }
+
+  waitForRuntime(reason: string) {
+    this.stopSocket()
+    this.state.connectionState = 'connecting'
+    this.state.offlineReason = reason
+  }
+
+  setUnavailable(reason: string) {
+    this.stopSocket()
+    this.state.connectionState = 'offline'
+    this.state.offlineReason = reason
+  }
+
   connect() {
     if (!this.stopped && this.ws?.readyState !== WebSocket.CLOSED) return
     this.stopped = false
+    this.state.offlineReason = ''
     this.openSocket()
   }
 
   disconnect() {
+    this.stopSocket()
+    this.state.connectionState = 'offline'
+  }
+
+  private stopSocket() {
     this.stopped = true
     clearTimeout(this.reconnectTimer)
     this.reconnectTimer = undefined
-    this.ws?.close()
-    this.state.connectionState = 'offline'
+    const previous = this.ws
+    this.ws = undefined
+    previous?.close()
   }
 
   sendUserMessage(text: string, selectionSnapshot: SelectionSnapshot, sheet: SheetSnapshot) {
@@ -123,7 +172,7 @@ export class AgentBridge {
     this.state.connectionState = 'connecting'
     let ws: WebSocket
     try {
-      ws = new WebSocket(WS_URL)
+      ws = new WebSocket(this.connection.url, this.connection.protocols)
     } catch (error) {
       this.reportBridgeError(
         `Failed to create the sidecar WebSocket: ${
@@ -139,6 +188,7 @@ export class AgentBridge {
     ws.addEventListener('open', () => {
       if (this.ws !== ws) return
       this.state.connectionState = 'online'
+      this.state.offlineReason = ''
       this.reconnectDelayMs = RECONNECT_MIN_MS
     })
     ws.addEventListener('message', (event) => {
@@ -149,6 +199,8 @@ export class AgentBridge {
       const wasOnline = this.state.connectionState === 'online'
       this.ws = undefined
       this.state.connectionState = 'offline'
+      this.state.offlineReason =
+        'AI Assistant disconnected. EnvCAD is reconnecting; CAD editing remains available.'
       if (wasOnline) {
         pushToast('Assistant sidecar disconnected — reconnecting…', 'info')
       }

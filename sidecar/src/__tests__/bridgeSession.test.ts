@@ -5,6 +5,8 @@ import { describe, expect, it, vi } from 'vitest'
 import type { ServerMessage } from '../../../src/agent/protocol'
 import { BridgeSession, buildTurnPrompt } from '../bridgeSession'
 
+const CLAUDE_EXECUTABLE = 'C:\\Program Files\\Claude\\claude.exe'
+
 class FakeWebSocket extends EventEmitter {
   readyState: number = WebSocket.OPEN
   sent: string[] = []
@@ -55,7 +57,10 @@ describe('BridgeSession', () => {
   it('rejects malformed and structurally invalid inbound messages', () => {
     const ws = new FakeWebSocket()
     const logger = testLogger()
-    new BridgeSession(ws as unknown as WebSocket, { logger })
+    new BridgeSession(ws as unknown as WebSocket, {
+      claudeExecutablePath: CLAUDE_EXECUTABLE,
+      logger
+    })
 
     ws.emit('message', '{')
     ws.emit('message', JSON.stringify({ type: 'user_message', text: '' }))
@@ -72,7 +77,10 @@ describe('BridgeSession', () => {
 
   it('correlates browser tool results and reports unknown call ids', async () => {
     const ws = new FakeWebSocket()
-    const session = new BridgeSession(ws as unknown as WebSocket, { logger: testLogger() })
+    const session = new BridgeSession(ws as unknown as WebSocket, {
+      claudeExecutablePath: CLAUDE_EXECUTABLE,
+      logger: testLogger()
+    })
 
     const resultPromise = session.callTool('draw_line', {
       start: { x: 0, y: 0 },
@@ -109,6 +117,7 @@ describe('BridgeSession', () => {
   it('times out tool calls and resolves them when the browser disconnects', async () => {
     const timeoutSocket = new FakeWebSocket()
     const timeoutSession = new BridgeSession(timeoutSocket as unknown as WebSocket, {
+      claudeExecutablePath: CLAUDE_EXECUTABLE,
       logger: testLogger(),
       toolTimeoutMs: 5
     })
@@ -118,6 +127,7 @@ describe('BridgeSession', () => {
 
     const disconnectSocket = new FakeWebSocket()
     const disconnectSession = new BridgeSession(disconnectSocket as unknown as WebSocket, {
+      claudeExecutablePath: CLAUDE_EXECUTABLE,
       logger: testLogger()
     })
     const pending = disconnectSession.callTool('draw_line', {})
@@ -150,6 +160,7 @@ describe('BridgeSession', () => {
       ])
     )
     new BridgeSession(ws as unknown as WebSocket, {
+      claudeExecutablePath: CLAUDE_EXECUTABLE,
       logger,
       queryFactory: queryFactory as never
     })
@@ -171,7 +182,8 @@ describe('BridgeSession', () => {
       model: 'sonnet',
       allowedTools: ['mcp__cad__*'],
       tools: [],
-      permissionMode: 'dontAsk'
+      permissionMode: 'dontAsk',
+      pathToClaudeCodeExecutable: CLAUDE_EXECUTABLE
     })
     expect(options).not.toHaveProperty('env')
     expect(logger.log).toHaveBeenCalledWith(
@@ -193,6 +205,7 @@ describe('BridgeSession', () => {
       ])
     )
     new BridgeSession(ws as unknown as WebSocket, {
+      claudeExecutablePath: CLAUDE_EXECUTABLE,
       logger,
       queryFactory: queryFactory as never
     })
@@ -229,6 +242,7 @@ describe('BridgeSession', () => {
       ])
     )
     new BridgeSession(ws as unknown as WebSocket, {
+      claudeExecutablePath: CLAUDE_EXECUTABLE,
       logger: testLogger(),
       queryFactory: queryFactory as never
     })
@@ -276,6 +290,7 @@ describe('BridgeSession', () => {
       ])
     )
     new BridgeSession(ws as unknown as WebSocket, {
+      claudeExecutablePath: CLAUDE_EXECUTABLE,
       logger: testLogger(),
       queryFactory: queryFactory as never
     })
