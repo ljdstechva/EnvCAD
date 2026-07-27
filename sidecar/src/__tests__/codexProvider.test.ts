@@ -168,7 +168,7 @@ function threadStarted(
         id: 'thread-1',
         cwd: runtimeDirectory,
         ephemeral: true,
-        source: 'appServer',
+        source: 'vscode',
         modelProvider: 'openai',
         parentThreadId: null,
         forkedFromId: null,
@@ -634,6 +634,58 @@ describe('CodexProvider', () => {
       expect(clients[1].closed).toBe(true)
     }
   )
+
+  it('accepts the Codex 0.145 Windows app-server thread source', async () => {
+    const { provider, clients } = await discoveredProvider()
+    const conversation = await provider.createConversation(
+      {
+        provider: 'openai-codex',
+        model: 'gpt-default',
+        effort: 'medium'
+      },
+      {
+        callTool: vi.fn(async () => ({ data: null })),
+        getSelectionSnapshot: () => undefined
+      }
+    )
+    clients[1].emit(threadStarted())
+    const run = collect(conversation.runTurn({ prompt: 'draw' }))
+    await vi.waitFor(() => {
+      expect(
+        clients[1].requests.some((request) => request.method === 'turn/start')
+      ).toBe(true)
+    })
+    clients[1].emit({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-1',
+        turn: { id: 'turn-1', status: 'completed' }
+      }
+    })
+
+    await expect(run).resolves.toEqual([])
+  })
+
+  it('rejects an unrelated Codex thread source', async () => {
+    const { provider, clients } = await discoveredProvider()
+    const conversation = await provider.createConversation(
+      {
+        provider: 'openai-codex',
+        model: 'gpt-default',
+        effort: 'medium'
+      },
+      {
+        callTool: vi.fn(async () => ({ data: null })),
+        getSelectionSnapshot: () => undefined
+      }
+    )
+    clients[1].emit(threadStarted({ source: 'cli' }))
+
+    await expect(
+      collect(conversation.runTurn({ prompt: 'draw' }))
+    ).rejects.toThrow('Codex emitted malformed thread/started metadata.')
+    expect(clients[1].closed).toBe(true)
+  })
 
   it('fails closed when streamed output references another turn', async () => {
     const { provider, clients } = await discoveredProvider()

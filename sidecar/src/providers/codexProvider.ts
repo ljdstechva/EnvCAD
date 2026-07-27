@@ -61,6 +61,11 @@ const CHATGPT_PLAN_TYPES = new Set([
 ])
 const MAX_CODEX_MODEL_PAGES = 50
 const MAX_CODEX_MODELS = 100
+// Codex CLI 0.145 reports `vscode` for fresh app-server threads on Windows,
+// while other app-server launch paths report `appServer`. The source is
+// provenance metadata rather than an execution-policy field; keep the accepted
+// set narrow and continue attesting every security-relevant field below.
+const ALLOWED_CODEX_THREAD_SOURCES = new Set(['appServer', 'vscode'])
 
 const DISALLOWED_ITEM_TYPES = new Set([
   'commandExecution',
@@ -772,7 +777,7 @@ class CodexConversation implements AgentConversation {
         !nonEmptyString(params.thread.id) ||
         params.thread.cwd !== this.runtimeDirectory ||
         params.thread.ephemeral !== true ||
-        params.thread.source !== 'appServer' ||
+        !ALLOWED_CODEX_THREAD_SOURCES.has(String(params.thread.source)) ||
         params.thread.modelProvider !== 'openai' ||
         (params.thread.parentThreadId !== undefined &&
           params.thread.parentThreadId !== null) ||
