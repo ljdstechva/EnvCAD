@@ -1,12 +1,17 @@
 import type { AddressInfo } from 'node:net'
+import { isAbsolute } from 'node:path'
 import { WebSocket, WebSocketServer, type VerifyClientCallbackAsync } from 'ws'
-import { BridgeSession, type BridgeSessionOptions } from './bridgeSession'
+import { BridgeSession } from './bridgeSession'
 import {
   ENVCAD_WEBSOCKET_PROTOCOL,
   sessionTokenProtocol
 } from '../../desktop/runtimeProtocol'
+import { ClaudeProvider } from './providers/claudeProvider'
+import { CodexProvider } from './providers/codexProvider'
+import { ProviderManager } from './providers/providerManager'
 
 const DEFAULT_CLOSE_TIMEOUT_MS = 2_000
+const MAX_WEBSOCKET_PAYLOAD_BYTES = 2 * 1024 * 1024
 
 export interface SidecarLogger {
   log(message: string): void
@@ -18,8 +23,9 @@ export interface StartSidecarOptions {
   port: number
   permittedOrigin: string
   sessionToken: string
-  claudeExecutablePath: string
-  queryFactory?: BridgeSessionOptions['queryFactory']
+  runtimeDirectory: string
+  environment?: NodeJS.ProcessEnv
+  providerManagerFactory?: () => ProviderManager
   logger?: SidecarLogger
   closeTimeoutMs?: number
 }
@@ -84,7 +90,9 @@ export function startSidecar(options: StartSidecarOptions): SidecarHandle {
     throw new Error('port must be an integer from 0 through 65535')
   }
   if (!options.sessionToken) throw new Error('sessionToken is required')
-  if (!options.claudeExecutablePath) throw new Error('claudeExecutablePath is required')
+  if (!isAbsolute(options.runtimeDirectory)) {
+    throw new Error('runtimeDirectory must be an absolute path')
+  }
 
   const permittedOrigin = validatedOrigin(options.permittedOrigin)
   const logger = options.logger ?? console
@@ -105,6 +113,7 @@ export function startSidecar(options: StartSidecarOptions): SidecarHandle {
   const wss = new WebSocketServer({
     host: options.host,
     port: options.port,
+    maxPayload: MAX_WEBSOCKET_PAYLOAD_BYTES,
     verifyClient: createVerifier({ permittedOrigin, expectedTokenProtocol, logger }),
     handleProtocols(protocols) {
       return protocols.has(ENVCAD_WEBSOCKET_PROTOCOL) ? ENVCAD_WEBSOCKET_PROTOCOL : false
@@ -129,15 +138,33 @@ export function startSidecar(options: StartSidecarOptions): SidecarHandle {
       return
     }
     logger.log('[sidecar] renderer connected')
+    const providerManager =
+      options.providerManagerFactory?.() ??
+      new ProviderManager(
+        [
+          new ClaudeProvider({
+            runtimeDirectory: options.runtimeDirectory,
+            environment: options.environment,
+            logger
+          }),
+          new CodexProvider({
+            runtimeDirectory: options.runtimeDirectory,
+            environment: options.environment,
+            logger
+          })
+        ],
+        logger
+      )
     const session = new BridgeSession(ws, {
-      claudeExecutablePath: options.claudeExecutablePath,
-      queryFactory: options.queryFactory,
+      providerManager,
       logger
     })
     sessions.add(session)
     ws.once('close', () => {
-      sessions.delete(session)
-      logger.log('[sidecar] renderer disconnected')
+      void session.close('Browser connection closed').finally(() => {
+        sessions.delete(session)
+        logger.log('[sidecar] renderer disconnected')
+      })
     })
   })
 
@@ -150,7 +177,9 @@ export function startSidecar(options: StartSidecarOptions): SidecarHandle {
     if (closePromise) return closePromise
     closing = true
     closePromise = (async () => {
-      for (const session of sessions) session.close('Sidecar shutting down')
+      await Promise.all(
+        [...sessions].map((session) => session.close('Sidecar shutting down'))
+      )
       sessions.clear()
       for (const client of wss.clients) client.close(1001, 'Sidecar shutting down')
 

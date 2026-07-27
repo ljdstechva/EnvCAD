@@ -3,8 +3,12 @@ export const DEVELOPMENT_SESSION_TOKEN = 'browser-development'
 export const DESKTOP_IPC = {
   getRuntimeConfig: 'envcad:get-runtime-config',
   sidecarStatus: 'envcad:sidecar-status',
-  openLogFolder: 'envcad:open-log-folder'
+  openLogFolder: 'envcad:open-log-folder',
+  getAiPreferences: 'envcad:get-ai-preferences',
+  saveAiPreferences: 'envcad:save-ai-preferences'
 } as const
+
+import type { AiPreferences } from './aiPreferences'
 
 export type SidecarStatusType =
   | 'starting'
@@ -39,7 +43,7 @@ export interface SidecarWorkerStartMessage {
   port: number
   permittedOrigin: string
   sessionToken: string
-  claudeExecutablePath: string
+  runtimeDirectory: string
 }
 
 export interface SidecarWorkerShutdownMessage {
@@ -61,6 +65,8 @@ export interface EnvCadDesktopApi {
   getRuntimeConfig(): Promise<DesktopRuntimeConfig>
   onSidecarStatus(callback: (status: SidecarStatus) => void): () => void
   openLogFolder(): Promise<{ ok: boolean; error?: string }>
+  getAiPreferences(): Promise<AiPreferences>
+  saveAiPreferences(preferences: AiPreferences): Promise<AiPreferences>
 }
 
 export function sessionTokenProtocol(token: string): string {
@@ -78,66 +84,112 @@ export function desktopConnectionConfig(
   }
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function hasOnlyKeys(
+  value: Record<string, unknown>,
+  keys: readonly string[]
+): boolean {
+  const allowed = new Set(keys)
+  return Object.keys(value).every((key) => allowed.has(key))
+}
+
 export function isSidecarWorkerCommand(value: unknown): value is SidecarWorkerCommand {
-  if (!value || typeof value !== 'object') return false
-  const type = (value as { type?: unknown }).type
-  if (type === 'shutdown') return true
+  if (!isRecord(value)) return false
+  const type = value.type
+  if (type === 'shutdown') return hasOnlyKeys(value, ['type'])
   if (type !== 'start') return false
-  const candidate = value as Partial<SidecarWorkerStartMessage>
   return (
-    typeof candidate.host === 'string' &&
-    Number.isInteger(candidate.port) &&
-    typeof candidate.permittedOrigin === 'string' &&
-    typeof candidate.sessionToken === 'string' &&
-    candidate.sessionToken.length >= 32 &&
-    typeof candidate.claudeExecutablePath === 'string' &&
-    candidate.claudeExecutablePath.length > 0
+    hasOnlyKeys(value, [
+      'type',
+      'host',
+      'port',
+      'permittedOrigin',
+      'sessionToken',
+      'runtimeDirectory'
+    ]) &&
+    value.host === '127.0.0.1' &&
+    value.port === 0 &&
+    typeof value.permittedOrigin === 'string' &&
+    value.permittedOrigin.length <= 500 &&
+    typeof value.sessionToken === 'string' &&
+    value.sessionToken.length >= 32 &&
+    value.sessionToken.length <= 200 &&
+    typeof value.runtimeDirectory === 'string' &&
+    value.runtimeDirectory.length > 0 &&
+    value.runtimeDirectory.length <= 1_000
   )
 }
 
 export function isSidecarWorkerEvent(value: unknown): value is SidecarWorkerEvent {
-  if (!value || typeof value !== 'object') return false
-  const candidate = value as { type?: unknown; message?: unknown }
-  if (typeof candidate.type !== 'string' || typeof candidate.message !== 'string') return false
-  if (candidate.type === 'ready') {
-    const ready = value as { host?: unknown; port?: unknown }
-    return typeof ready.host === 'string' && Number.isInteger(ready.port)
+  if (!isRecord(value)) return false
+  if (
+    typeof value.type !== 'string' ||
+    typeof value.message !== 'string' ||
+    value.message.length > 8_000
+  ) {
+    return false
   }
-  if (candidate.type === 'log') {
-    const log = value as { level?: unknown }
-    return log.level === 'info' || log.level === 'warn' || log.level === 'error'
+  if (value.type === 'ready') {
+    return (
+      hasOnlyKeys(value, ['type', 'host', 'port', 'message']) &&
+      value.host === '127.0.0.1' &&
+      Number.isInteger(value.port) &&
+      (value.port as number) >= 1 &&
+      (value.port as number) <= 65_535
+    )
+  }
+  if (value.type === 'log') {
+    return (
+      hasOnlyKeys(value, ['type', 'level', 'message']) &&
+      (value.level === 'info' ||
+        value.level === 'warn' ||
+        value.level === 'error')
+    )
   }
   return (
-    candidate.type === 'starting' ||
-    candidate.type === 'authentication-required' ||
-    candidate.type === 'unsafe-api-key-environment' ||
-    candidate.type === 'failed' ||
-    candidate.type === 'stopped'
+    hasOnlyKeys(value, ['type', 'message']) &&
+    (value.type === 'starting' ||
+      value.type === 'authentication-required' ||
+      value.type === 'unsafe-api-key-environment' ||
+      value.type === 'failed' ||
+      value.type === 'stopped')
   )
 }
 
 export function isSidecarStatus(value: unknown): value is SidecarStatus {
-  if (!value || typeof value !== 'object') return false
-  const candidate = value as { type?: unknown; message?: unknown; connection?: unknown }
-  if (typeof candidate.type !== 'string' || typeof candidate.message !== 'string') return false
-  if (candidate.type === 'ready') {
-    const connection = candidate.connection as
-      | { url?: unknown; protocols?: unknown }
-      | null
-      | undefined
+  if (
+    !isRecord(value) ||
+    typeof value.type !== 'string' ||
+    typeof value.message !== 'string' ||
+    value.message.length > 8_000
+  ) {
+    return false
+  }
+  if (value.type === 'ready') {
+    const connection = value.connection
     return (
-      Boolean(connection) &&
-      typeof connection?.url === 'string' &&
+      hasOnlyKeys(value, ['type', 'message', 'connection']) &&
+      isRecord(connection) &&
+      hasOnlyKeys(connection, ['url', 'protocols']) &&
+      typeof connection.url === 'string' &&
+      /^ws:\/\/127\.0\.0\.1:\d{1,5}$/.test(connection.url) &&
       Array.isArray(connection.protocols) &&
       connection.protocols.length === 2 &&
-      connection.protocols.every((protocol) => typeof protocol === 'string')
+      connection.protocols[0] === ENVCAD_WEBSOCKET_PROTOCOL &&
+      typeof connection.protocols[1] === 'string' &&
+      connection.protocols[1].startsWith('envcad.session.') &&
+      connection.protocols[1].length <= 300
     )
   }
   return (
-    candidate.type === 'starting' ||
-    candidate.type === 'authentication-required' ||
-    candidate.type === 'unsafe-api-key-environment' ||
-    candidate.type === 'failed' ||
-    candidate.type === 'stopped'
+    hasOnlyKeys(value, ['type', 'message']) &&
+    (value.type === 'starting' ||
+      value.type === 'authentication-required' ||
+      value.type === 'unsafe-api-key-environment' ||
+      value.type === 'failed' ||
+      value.type === 'stopped')
   )
 }

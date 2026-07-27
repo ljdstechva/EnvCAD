@@ -268,4 +268,41 @@ describe('CAD executor integration against an in-memory database', () => {
     expect(lengths.measurements).toHaveLength(4)
     expect(lengths.totalLength).toBeCloseTo(5 + 7 * Math.PI)
   })
+
+  it('places a radius dimension on the requested layer using the actual circle', async () => {
+    data(
+      await executeCadTool('create_layer', {
+        name: 'AI_BENCHMARK',
+        colorCss: '#00a86b'
+      })
+    )
+    const circle = data(
+      await executeCadTool('draw_circle', {
+        center: { x: 30, y: 10 },
+        radius: 5,
+        layer: 'AI_BENCHMARK'
+      })
+    )
+    const circleId = (circle.entityIds as string[])[0]
+    const dimension = data(
+      await executeCadTool('add_radius_dimension', {
+        circleEntityId: circleId,
+        angleDeg: 45,
+        layer: 'AI_BENCHMARK'
+      })
+    )
+
+    expect(dimension).toMatchObject({
+      circleEntityId: circleId,
+      center: { x: 30, y: 10 },
+      radius: 5,
+      measurement: 5,
+      displayText: 'R 5.00',
+      layer: 'AI_BENCHMARK'
+    })
+    const dimensionId = (dimension.entityIds as string[])[0]
+    expect(
+      database.tables.blockTable.getEntityById(dimensionId)?.layer
+    ).toBe('AI_BENCHMARK')
+  })
 })

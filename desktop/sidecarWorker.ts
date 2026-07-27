@@ -4,7 +4,9 @@ import { isSidecarWorkerCommand } from './runtimeProtocol'
 import { startSidecar, type SidecarHandle } from '../sidecar/src/server'
 
 const parentPort = process.parentPort
-if (!parentPort) throw new Error('EnvCAD sidecar worker requires an Electron utility-process parent')
+if (!parentPort) {
+  throw new Error('EnvCAD sidecar worker requires an Electron utility-process parent')
+}
 
 let handle: SidecarHandle | undefined
 let started = false
@@ -12,7 +14,9 @@ let stopping = false
 let sessionToken = ''
 
 function redact(message: string): string {
-  let redacted = message.replace(/sk-ant-[A-Za-z0-9_-]+/g, '[redacted]')
+  let redacted = message
+    .replace(/\bsk-(?:ant|proj|svcacct)-[A-Za-z0-9_-]+\b/g, '[redacted]')
+    .replace(/\b(?:Bearer\s+)?eyJ[A-Za-z0-9._-]+\b/gi, '[redacted]')
   if (sessionToken) redacted = redacted.split(sessionToken).join('[redacted]')
   return redacted
 }
@@ -26,8 +30,17 @@ const logger = {
     post({ type: 'log', level: 'info', message: redact(String(message)) })
   },
   error(message: string, error?: unknown) {
-    const detail = error instanceof Error ? `: ${error.message}` : error ? `: ${String(error)}` : ''
-    post({ type: 'log', level: 'error', message: redact(`${message}${detail}`) })
+    const detail =
+      error instanceof Error
+        ? `: ${error.message}`
+        : error
+          ? `: ${String(error)}`
+          : ''
+    post({
+      type: 'log',
+      level: 'error',
+      message: redact(`${message}${detail}`)
+    })
   }
 }
 
@@ -42,23 +55,19 @@ async function shutdown(): Promise<void> {
   }
 }
 
-async function start(command: Extract<SidecarWorkerCommand, { type: 'start' }>): Promise<void> {
+async function start(
+  command: Extract<SidecarWorkerCommand, { type: 'start' }>
+): Promise<void> {
   if (started) {
-    post({ type: 'failed', message: 'AI Assistant worker received a duplicate start request.' })
+    post({
+      type: 'failed',
+      message: 'AI Assistant worker received a duplicate start request.'
+    })
     return
   }
   started = true
   sessionToken = command.sessionToken
-  post({ type: 'starting', message: 'Starting AI Assistant…' })
-
-  if (process.env.ANTHROPIC_API_KEY?.trim()) {
-    post({
-      type: 'unsafe-api-key-environment',
-      message:
-        'AI Assistant is disabled because ANTHROPIC_API_KEY is set. Remove it and relaunch EnvCAD.'
-    })
-    return
-  }
+  post({ type: 'starting', message: 'Starting AI Assistant...' })
 
   try {
     handle = startSidecar({
@@ -66,7 +75,8 @@ async function start(command: Extract<SidecarWorkerCommand, { type: 'start' }>):
       port: command.port,
       permittedOrigin: command.permittedOrigin,
       sessionToken: command.sessionToken,
-      claudeExecutablePath: command.claudeExecutablePath,
+      runtimeDirectory: command.runtimeDirectory,
+      environment: process.env,
       logger
     })
     const address = await handle.ready
@@ -74,9 +84,17 @@ async function start(command: Extract<SidecarWorkerCommand, { type: 'start' }>):
       type: 'ready',
       host: address.host,
       port: address.port,
-      message: 'AI Assistant is connected through Claude Code.'
+      message:
+        'AI Assistant runtime is ready; checking Claude Code and OpenAI Codex.'
     })
   } catch (error) {
+    try {
+      await handle?.close()
+    } catch (cleanupError) {
+      logger.error('AI Assistant startup cleanup failed', cleanupError)
+    } finally {
+      handle = undefined
+    }
     post({
       type: 'failed',
       message: `AI Assistant failed to start: ${
@@ -89,7 +107,10 @@ async function start(command: Extract<SidecarWorkerCommand, { type: 'start' }>):
 parentPort.on('message', (event: MessageEvent) => {
   const command = event.data
   if (!isSidecarWorkerCommand(command)) {
-    post({ type: 'failed', message: 'AI Assistant worker received an invalid command.' })
+    post({
+      type: 'failed',
+      message: 'AI Assistant worker received an invalid command.'
+    })
     return
   }
   if (command.type === 'shutdown') void shutdown()

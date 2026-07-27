@@ -1,7 +1,7 @@
 {
   "compilerOptions": {
     "target": "ES2022",
-    "lib": ["ES2023"],
+    "lib": ["ES2023", "DOM"],
     "module": "ESNext",
     "skipLibCheck": true,
     "moduleResolution": "Bundler",
@@ -16,6 +16,8 @@
     "vite.sidecar.config.ts",
     "vite.renderer.config.ts",
     "forge.config.ts",
-    "playwright.desktop.config.ts"
+    "playwright.desktop.config.ts",
+    "scripts/**/*.ts",
+    "src/desktop-env.d.ts"
   ]
 }

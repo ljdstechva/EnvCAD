@@ -1,22 +1,19 @@
 import { randomUUID } from 'node:crypto'
 import { WebSocket } from 'ws'
-import {
-  query,
-  type Query,
-  type SDKRateLimitInfo,
-  type SDKResultError,
-  type SDKSystemMessage
-} from '@anthropic-ai/claude-agent-sdk'
-import { SYSTEM_PROMPT } from './systemPrompt'
-import { createCadMcpServer } from './cadTools'
 import type {
+  AgentConfiguration,
   ClientMessage,
+  ProviderCapability,
   SelectionSnapshot,
   ServerMessage,
   SheetSnapshot,
-  ToolResult
+  ToolResult,
+  TurnMetrics
 } from '../../src/agent/protocol'
 import { parseClientMessage } from '../../src/agent/protocol'
+import { getCadToolSpec, type CadToolBridge } from './cadToolSpecs'
+import { redactProviderDiagnostic } from './providers/environment'
+import { ProviderManager } from './providers/providerManager'
 
 const TOOL_TIMEOUT_MS = 30_000
 
@@ -26,9 +23,18 @@ interface PendingCall {
   timer: ReturnType<typeof setTimeout>
 }
 
+interface ActiveTurn {
+  startedAt: number
+  firstTextMs?: number
+  firstToolCallMs?: number
+  toolCalls: number
+  retries: number
+  inputTokens?: number
+  outputTokens?: number
+}
+
 export interface BridgeSessionOptions {
-  claudeExecutablePath: string
-  queryFactory?: typeof query
+  providerManager: ProviderManager
   toolTimeoutMs?: number
   logger?: Pick<Console, 'log' | 'error'>
 }
@@ -50,91 +56,73 @@ export function buildTurnPrompt(
   return `${text}\n\n<context>\n${contextLines}\n</context>`
 }
 
-function formatResultError(result: SDKResultError): string {
-  const details = result.errors.map((error) => error.trim()).filter(Boolean)
-  const detail = details.length > 0 ? `: ${details.join('; ')}` : ''
-  return `Claude agent error (${result.subtype})${detail}`
-}
-
-function formatRateLimitError(info: SDKRateLimitInfo): string {
-  const limitType = info.rateLimitType ?? 'subscription'
-  if (!info.resetsAt) return `Claude ${limitType} usage limit reached`
-
-  const resetMilliseconds = info.resetsAt < 1_000_000_000_000 ? info.resetsAt * 1000 : info.resetsAt
-  const resetDate = new Date(resetMilliseconds)
-  const resetDetail = Number.isNaN(resetDate.getTime())
-    ? ''
-    : `; resets at ${resetDate.toISOString()}`
-  return `Claude ${limitType} usage limit reached${resetDetail}`
-}
-
-function assertSubscriptionAuthentication(message: SDKSystemMessage): 'oauth' | 'none' {
-  // Claude Code 2.1.220 reports the subscription path as "none" when no API
-  // key source exists, although the Agent SDK declaration currently omits
-  // that runtime value from ApiKeySource.
-  const source = message.apiKeySource as string
-  if (source !== 'oauth' && source !== 'none') {
-    throw new Error(
-      `Claude authentication source must be the Claude Code subscription login, but the Agent SDK reported "${source}". ` +
-        'EnvCAD requires the existing Claude Code subscription login and does not permit API-key authentication.'
-    )
-  }
-  return source
-}
-
 /**
- * One BridgeSession per WebSocket connection. Owns a single Claude Agent SDK
- * conversation (by session id) and forwards its CAD tool calls to the
- * browser over the WebSocket, awaiting each tool_result. See
- * docs/agent-protocol.md for the full wire protocol this class implements.
+ * One provider-neutral conversation coordinator per authenticated renderer
+ * WebSocket. Provider discovery remains usable even when no provider is ready.
  */
 export class BridgeSession {
-  private sessionId: string | undefined
-  private currentQuery: Query | undefined
-  private pendingCalls = new Map<string, PendingCall>()
+  private readonly pendingCalls = new Map<string, PendingCall>()
   private lastSelectionSnapshot: SelectionSnapshot | undefined
   private lastSheet: SheetSnapshot | undefined
-  private resetGeneration = 0
+  private appliedConfiguration: AgentConfiguration | undefined
+  private appliedRevision: number | undefined
+  private latestRequestedRevision = 0
+  private configurationQueue = Promise.resolve()
+  private pendingConversationStartupMs: number | undefined
+  private activeTurn: ActiveTurn | undefined
   private turnRunning = false
+  private capabilityRefreshPending = false
+  private discoveryInFlight: Promise<void> | undefined
   private closed = false
-  private readonly queryFactory: typeof query
+  private closePromise: Promise<void> | undefined
+  private toolDispatchQueue = Promise.resolve()
   private readonly toolTimeoutMs: number
   private readonly logger: Pick<Console, 'log' | 'error'>
-  private readonly mcpServer: ReturnType<typeof createCadMcpServer>
-  private readonly claudeExecutablePath: string
+  private readonly manager: ProviderManager
+  readonly discoveryReady: Promise<void>
+
+  private readonly toolBridge: CadToolBridge = {
+    callTool: (name, input) => this.callTool(name, input),
+    getSelectionSnapshot: () => this.lastSelectionSnapshot
+  }
 
   constructor(
-    private ws: WebSocket,
+    private readonly ws: WebSocket,
     options: BridgeSessionOptions
   ) {
-    this.claudeExecutablePath = options.claudeExecutablePath
-    this.queryFactory = options.queryFactory ?? query
+    this.manager = options.providerManager
     this.toolTimeoutMs = options.toolTimeoutMs ?? TOOL_TIMEOUT_MS
     this.logger = options.logger ?? console
-    this.mcpServer = createCadMcpServer({
-      callTool: (name, input) => this.callTool(name, input),
-      getSelectionSnapshot: () => this.lastSelectionSnapshot
-    })
     ws.on('message', (raw) => this.handleRawMessage(raw))
-    ws.on('close', () => this.cleanup('Browser connection closed'))
+    ws.on('close', () => {
+      void this.cleanup('Browser connection closed')
+    })
     ws.on('error', (error) => {
       this.logger.error('[sidecar] browser WebSocket error:', error)
     })
+    this.discoveryReady = this.discoverCapabilities()
   }
 
-  private cleanup(reason: string) {
-    if (this.closed) return
+  async close(reason = 'Sidecar session closed'): Promise<void> {
+    await this.cleanup(reason)
+  }
+
+  private cleanup(reason: string): Promise<void> {
+    if (this.closePromise) return this.closePromise
     this.closed = true
-    for (const pending of this.pendingCalls.values()) {
-      clearTimeout(pending.timer)
-      pending.resolve({ error: `${reason} while waiting for ${pending.name}` })
-    }
-    this.pendingCalls.clear()
-    this.currentQuery?.close()
-  }
-
-  close(reason = 'Sidecar session closed') {
-    this.cleanup(reason)
+    this.closePromise = (async () => {
+      for (const pending of this.pendingCalls.values()) {
+        clearTimeout(pending.timer)
+        pending.resolve({ error: `${reason} while waiting for ${pending.name}` })
+      }
+      this.pendingCalls.clear()
+      try {
+        await this.manager.close()
+      } catch (error) {
+        this.logger.error('[sidecar] provider cleanup failed:', error)
+      }
+    })()
+    return this.closePromise
   }
 
   private send(message: ServerMessage): boolean {
@@ -145,24 +133,71 @@ export class BridgeSession {
       } catch (error) {
         this.logger.error(`[sidecar] failed to send ${message.type}:`, error)
       }
-    } else {
+    } else if (!this.closed) {
       this.logger.error(`[sidecar] cannot send ${message.type}: browser WebSocket is not open`)
     }
     return false
   }
 
-  private reportProtocolError(message: string) {
+  private reportProtocolError(message: string): void {
     this.logger.error(`[sidecar] rejected browser message: ${message}`)
     this.send({ type: 'error', message: `Invalid browser message: ${message}` })
   }
 
-  private reportAgentError(error: unknown) {
-    const message = error instanceof Error ? error.message : String(error)
+  private reportAgentError(error: unknown): void {
+    const message = redactProviderDiagnostic(
+      error instanceof Error ? error.message : error
+    )
     this.logger.error(`[sidecar] agent error: ${message}`)
-    this.send({ type: 'error', message })
+    this.send({
+      type: 'error',
+      message,
+      ...(this.appliedConfiguration
+        ? { provider: this.appliedConfiguration.provider }
+        : {})
+    })
   }
 
-  private handleRawMessage(raw: unknown) {
+  private discoverCapabilities(): Promise<void> {
+    if (this.discoveryInFlight) return this.discoveryInFlight
+    this.send({
+      type: 'ai_capabilities',
+      providers: this.manager.catalog,
+      refreshing: true
+    })
+    const discovery = (async () => {
+      try {
+        const providers = await this.manager.discover((provider) => {
+          this.send({ type: 'ai_provider_status', provider })
+        })
+        this.send({
+          type: 'ai_capabilities',
+          providers,
+          refreshing: false
+        })
+      } catch (error) {
+        this.reportAgentError(error)
+        this.send({
+          type: 'ai_capabilities',
+          providers: this.manager.catalog,
+          refreshing: false
+        })
+      }
+    })()
+    this.discoveryInFlight = discovery
+    void discovery.finally(() => {
+      if (this.discoveryInFlight === discovery) {
+        this.discoveryInFlight = undefined
+      }
+    })
+    return discovery
+  }
+
+  private get capabilitiesBusy(): boolean {
+    return this.capabilityRefreshPending || Boolean(this.discoveryInFlight)
+  }
+
+  private handleRawMessage(raw: unknown): void {
     let decoded: unknown
     try {
       decoded = JSON.parse(String(raw))
@@ -176,17 +211,36 @@ export class BridgeSession {
       this.reportProtocolError(parsed.error)
       return
     }
-
     this.handleMessage(parsed.value)
   }
 
-  private handleMessage(message: ClientMessage) {
+  private handleMessage(message: ClientMessage): void {
     switch (message.type) {
       case 'user_message':
+        if (this.capabilitiesBusy) {
+          this.send({
+            type: 'error',
+            message:
+              'AI capabilities are refreshing; wait for the final provider catalog before sending.'
+          })
+          return
+        }
         if (this.turnRunning) {
           this.send({
             type: 'error',
-            message: 'An agent turn is already in progress; wait for status "idle" before sending again.'
+            message: 'An AI turn is already in progress; wait for status "idle" before sending again.'
+          })
+          return
+        }
+        if (
+          !this.appliedConfiguration ||
+          this.appliedRevision === undefined ||
+          message.configurationRevision !== this.appliedRevision
+        ) {
+          this.send({
+            type: 'error',
+            message:
+              'The selected AI configuration has not been acknowledged. Wait for configuration confirmation before sending.'
           })
           return
         }
@@ -198,34 +252,176 @@ export class BridgeSession {
         this.resolveToolResult(message.callId, message.result)
         break
       case 'interrupt':
-        this.interruptCurrent('interrupt')
+        void this.manager.interrupt().catch((error) => this.reportAgentError(error))
         break
       case 'reset':
-        this.resetGeneration += 1
-        this.sessionId = undefined
-        this.interruptCurrent('reset')
+        if (this.capabilitiesBusy) {
+          this.send({
+            type: 'ai_configuration_rejected',
+            revision: message.revision,
+            message:
+              'Cannot start a new conversation while AI capabilities are refreshing.'
+          })
+          return
+        }
+        if (this.turnRunning) {
+          this.send({
+            type: 'ai_configuration_rejected',
+            revision: message.revision,
+            message: 'Cannot start a new conversation while an AI turn is running.'
+          })
+          return
+        }
+        if (message.revision <= this.latestRequestedRevision) {
+          this.send({
+            type: 'ai_configuration_rejected',
+            revision: message.revision,
+            message: `Configuration revision ${message.revision} is stale.`
+          })
+          return
+        }
+        this.latestRequestedRevision = message.revision
+        this.configurationQueue = this.configurationQueue
+          .then(() => this.resetConversation(message.revision))
+          .catch((error) => this.reportAgentError(error))
+        break
+      case 'refresh_ai_capabilities':
+        if (this.turnRunning) {
+          this.send({
+            type: 'error',
+            message: 'Cannot refresh AI capabilities while an AI turn is running.'
+          })
+          return
+        }
+        if (this.capabilitiesBusy) return
+        this.capabilityRefreshPending = true
+        this.configurationQueue = this.configurationQueue
+          .then(() => this.discoverCapabilities())
+          .catch((error) => this.reportAgentError(error))
+          .finally(() => {
+            this.capabilityRefreshPending = false
+          })
+        break
+      case 'set_ai_configuration':
+        this.queueConfigurationUpdate(message.revision, message.configuration)
         break
     }
   }
 
-  private interruptCurrent(action: 'interrupt' | 'reset') {
-    const currentQuery = this.currentQuery
-    if (!currentQuery) return
-    void currentQuery.interrupt().catch((error) => {
-      this.reportAgentError(
-        new Error(
-          `Failed to ${action} the current Claude agent turn: ${
-            error instanceof Error ? error.message : String(error)
-          }`
-        )
-      )
-    })
+  private queueConfigurationUpdate(
+    revision: number,
+    configuration: AgentConfiguration
+  ): void {
+    if (this.capabilitiesBusy) {
+      this.send({
+        type: 'ai_configuration_rejected',
+        revision,
+        message:
+          'Provider, model, and effort cannot change while AI capabilities are refreshing.'
+      })
+      return
+    }
+    if (this.turnRunning) {
+      this.send({
+        type: 'ai_configuration_rejected',
+        revision,
+        message: 'Provider, model, and effort cannot change while an AI turn is running.'
+      })
+      return
+    }
+    if (revision <= this.latestRequestedRevision) {
+      this.send({
+        type: 'ai_configuration_rejected',
+        revision,
+        message: `Configuration revision ${revision} is stale.`
+      })
+      return
+    }
+    this.latestRequestedRevision = revision
+    this.configurationQueue = this.configurationQueue
+      .then(() => this.applyConfiguration(revision, configuration))
+      .catch((error) => this.reportAgentError(error))
   }
 
-  /** Forwards a CAD tool call to the browser and awaits its tool_result (or timeout). */
+  private async applyConfiguration(
+    revision: number,
+    configuration: AgentConfiguration
+  ): Promise<void> {
+    if (this.closed) return
+    const startedAt = performance.now()
+    try {
+      const result = await this.manager.applyConfiguration(configuration, this.toolBridge)
+      this.pendingConversationStartupMs = performance.now() - startedAt
+      this.appliedConfiguration = result.configuration
+      this.appliedRevision = revision
+      this.send({
+        type: 'ai_configuration_applied',
+        revision,
+        configuration: result.configuration,
+        newConversation: result.newConversation
+      })
+    } catch (error) {
+      this.send({
+        type: 'ai_configuration_rejected',
+        revision,
+        message: error instanceof Error ? error.message : String(error)
+      })
+    }
+  }
+
+  private async resetConversation(revision: number): Promise<void> {
+    const configuration = this.appliedConfiguration
+    if (!configuration) {
+      this.send({
+        type: 'ai_configuration_rejected',
+        revision,
+        message: 'No acknowledged AI configuration is available to reset.'
+      })
+      return
+    }
+    const startedAt = performance.now()
+    try {
+      await this.manager.clearConversation()
+      const result = await this.manager.applyConfiguration(configuration, this.toolBridge)
+      this.pendingConversationStartupMs = performance.now() - startedAt
+      this.appliedConfiguration = result.configuration
+      this.appliedRevision = revision
+      this.send({
+        type: 'ai_configuration_applied',
+        revision,
+        configuration: result.configuration,
+        newConversation: true
+      })
+    } catch (error) {
+      this.appliedConfiguration = undefined
+      this.appliedRevision = undefined
+      this.send({
+        type: 'ai_configuration_rejected',
+        revision,
+        message: error instanceof Error ? error.message : String(error)
+      })
+    }
+  }
+
   callTool(name: string, input: unknown): Promise<ToolResult> {
+    const dispatch = this.toolDispatchQueue.then(() => this.dispatchTool(name, input))
+    this.toolDispatchQueue = dispatch.then(
+      () => undefined,
+      () => undefined
+    )
+    return dispatch
+  }
+
+  private dispatchTool(name: string, input: unknown): Promise<ToolResult> {
+    const spec = getCadToolSpec(name)
+    if (!spec) return Promise.resolve({ error: `Unknown CAD tool: ${name}` })
     if (this.closed || this.ws.readyState !== WebSocket.OPEN) {
       return Promise.resolve({ error: `Browser connection is not open; cannot run ${name}` })
+    }
+    const turn = this.activeTurn
+    if (turn) {
+      turn.toolCalls += 1
+      turn.firstToolCallMs ??= performance.now() - turn.startedAt
     }
 
     return new Promise((resolve) => {
@@ -236,9 +432,10 @@ export class BridgeSession {
           error: `Timed out waiting for the browser to respond to ${name} after ${this.toolTimeoutMs / 1000}s`
         })
       }, this.toolTimeoutMs)
+      timer.unref()
       this.pendingCalls.set(callId, { name, resolve, timer })
 
-      if (!this.send({ type: 'tool_call', callId, name, input })) {
+      if (!this.send({ type: 'tool_call', callId, name: spec.name, input })) {
         clearTimeout(timer)
         this.pendingCalls.delete(callId)
         resolve({ error: `Failed to send ${name} to the browser` })
@@ -246,7 +443,7 @@ export class BridgeSession {
     })
   }
 
-  private resolveToolResult(callId: string, result: ToolResult) {
+  private resolveToolResult(callId: string, result: ToolResult): void {
     const pending = this.pendingCalls.get(callId)
     if (!pending) {
       this.reportProtocolError(`tool_result references unknown callId "${callId}"`)
@@ -257,86 +454,78 @@ export class BridgeSession {
     pending.resolve(result)
   }
 
-  private async runTurn(text: string) {
-    const generation = this.resetGeneration
+  private providerCapability(configuration: AgentConfiguration): ProviderCapability | undefined {
+    return this.manager.catalog.find((provider) => provider.id === configuration.provider)
+  }
+
+  private async runTurn(text: string): Promise<void> {
+    const configuration = this.appliedConfiguration
+    const conversation = this.manager.conversation
+    if (!configuration || !conversation) {
+      this.reportAgentError(new Error('No acknowledged AI configuration is active.'))
+      return
+    }
+
+    const active: ActiveTurn = {
+      startedAt: performance.now(),
+      toolCalls: 0,
+      retries: 0
+    }
+    this.activeTurn = active
     this.turnRunning = true
     this.send({ type: 'status', state: 'thinking' })
 
-    let activeQuery: Query | undefined
-    let rateLimitError: string | undefined
+    let resolvedModel =
+      this.providerCapability(configuration)?.models.find(
+        (model) => model.invocationName === configuration.model
+      )?.resolvedModel
     try {
       const prompt = buildTurnPrompt(text, this.lastSelectionSnapshot, this.lastSheet)
-      activeQuery = this.queryFactory({
-        prompt,
-        options: {
-          model: 'sonnet',
-          systemPrompt: SYSTEM_PROMPT,
-          mcpServers: { cad: this.mcpServer },
-          allowedTools: ['mcp__cad__*'],
-          // Removes every built-in tool (Bash/Read/Write/Edit/Glob/Grep/WebSearch/
-          // WebFetch) from Claude's context; only the CAD MCP tools remain.
-          tools: [],
-          permissionMode: 'dontAsk',
-          pathToClaudeCodeExecutable: this.claudeExecutablePath,
-          ...(this.sessionId ? { resume: this.sessionId } : {})
-        }
-      })
-      this.currentQuery = activeQuery
-
-      for await (const message of activeQuery) {
-        if (message.type === 'system' && message.subtype === 'init') {
-          const authSource = assertSubscriptionAuthentication(message)
-          this.logger.log(
-            authSource === 'oauth'
-              ? '[sidecar] Claude authentication source: oauth (Claude Code login)'
-              : '[sidecar] Claude authentication source: none (Claude Code login; no API key)'
-          )
-          if (message.session_id && generation === this.resetGeneration) {
-            this.sessionId = message.session_id
-          }
-        } else if (message.type === 'assistant') {
-          if (message.error) {
-            const detail = message.message.content
-              .filter((block) => block.type === 'text')
-              .map((block) => block.text.trim())
-              .filter(Boolean)
-              .join('\n')
-            throw new Error(
-              detail
-                ? `Claude request failed (${message.error}): ${detail}`
-                : rateLimitError ?? `Claude request failed: ${message.error}`
-            )
-          }
-          for (const block of message.message.content) {
-            if (block.type === 'text' && block.text) {
-              this.send({ type: 'assistant_text_delta', text: block.text })
-            }
-          }
-        } else if (message.type === 'auth_status' && message.error) {
-          throw new Error(`Claude authentication failed: ${message.error}`)
-        } else if (
-          message.type === 'rate_limit_event' &&
-          message.rate_limit_info.status === 'rejected'
-        ) {
-          rateLimitError = formatRateLimitError(message.rate_limit_info)
-        } else if (message.type === 'result') {
-          if (message.session_id && generation === this.resetGeneration) {
-            this.sessionId = message.session_id
-          }
-          if (message.subtype !== 'success') {
-            const resultError = formatResultError(message)
-            throw new Error(rateLimitError ? `${rateLimitError}; ${resultError}` : resultError)
-          }
+      for await (const event of conversation.runTurn({ prompt })) {
+        if (event.type === 'text_delta') {
+          active.firstTextMs ??= performance.now() - active.startedAt
+          this.send({ type: 'assistant_text_delta', text: event.text })
+        } else if (event.type === 'retry') {
+          active.retries += 1
+        } else if (event.type === 'resolved_model') {
+          resolvedModel = event.model
+        } else if (event.type === 'token_usage') {
+          active.inputTokens = event.inputTokens
+          active.outputTokens = event.outputTokens
         }
       }
-      if (rateLimitError) throw new Error(rateLimitError)
     } catch (error) {
-      activeQuery?.close()
       this.reportAgentError(error)
     } finally {
-      this.send({ type: 'assistant_done' })
+      const capability = this.providerCapability(configuration)
+      const metrics: TurnMetrics = {
+        ...(capability?.discoveryMs !== undefined
+          ? { providerReadyMs: capability.discoveryMs }
+          : {}),
+        ...(this.pendingConversationStartupMs !== undefined
+          ? { conversationStartupMs: this.pendingConversationStartupMs }
+          : {}),
+        ...(active.firstTextMs !== undefined ? { firstTextMs: active.firstTextMs } : {}),
+        ...(active.firstToolCallMs !== undefined
+          ? { firstToolCallMs: active.firstToolCallMs }
+          : {}),
+        totalMs: performance.now() - active.startedAt,
+        toolCalls: active.toolCalls,
+        ...(active.retries > 0 ? { retries: active.retries } : {}),
+        ...(active.inputTokens !== undefined ? { inputTokens: active.inputTokens } : {}),
+        ...(active.outputTokens !== undefined ? { outputTokens: active.outputTokens } : {})
+      }
+      this.pendingConversationStartupMs = undefined
+      this.send({
+        type: 'assistant_done',
+        provider: configuration.provider,
+        model: configuration.model,
+        ...(resolvedModel ? { resolvedModel } : {}),
+        ...(configuration.effort ? { effort: configuration.effort } : {}),
+        metrics
+      })
       this.send({ type: 'status', state: 'idle' })
-      if (this.currentQuery === activeQuery) this.currentQuery = undefined
+      this.activeTurn = undefined
       this.turnRunning = false
     }
   }

@@ -6,9 +6,11 @@ import {
   sessionTokenProtocol
 } from '../../../desktop/runtimeProtocol'
 import { startSidecar, type SidecarHandle } from '../server'
+import { ProviderManager } from '../providers/providerManager'
+import { FakeProvider } from './fakeProviders'
 
 const ORIGIN = 'http://127.0.0.1:45678'
-const CLAUDE_EXECUTABLE = 'C:\\Program Files\\Claude\\claude.exe'
+const RUNTIME_DIRECTORY = 'C:\\Users\\test\\AppData\\Local\\EnvCAD\\ai-runtime\\test'
 const handles: SidecarHandle[] = []
 
 afterEach(async () => {
@@ -31,6 +33,12 @@ function connect(
 }
 
 describe('startSidecar', () => {
+  const managerFactory = () =>
+    new ProviderManager([
+      new FakeProvider('claude-code'),
+      new FakeProvider('openai-codex')
+    ])
+
   it('allocates a dynamic port, accepts the exact origin and token, and closes repeatedly', async () => {
     const token = randomBytes(32).toString('base64url')
     const logger = { log: vi.fn(), error: vi.fn() }
@@ -39,7 +47,8 @@ describe('startSidecar', () => {
       port: 0,
       permittedOrigin: ORIGIN,
       sessionToken: token,
-      claudeExecutablePath: CLAUDE_EXECUTABLE,
+      runtimeDirectory: RUNTIME_DIRECTORY,
+      providerManagerFactory: managerFactory,
       logger
     })
     handles.push(handle)
@@ -90,7 +99,8 @@ describe('startSidecar', () => {
       port: 0,
       permittedOrigin: ORIGIN,
       sessionToken: token,
-      claudeExecutablePath: CLAUDE_EXECUTABLE,
+      runtimeDirectory: RUNTIME_DIRECTORY,
+      providerManagerFactory: managerFactory,
       logger: { log: vi.fn(), error: vi.fn() }
     })
     handles.push(handle)

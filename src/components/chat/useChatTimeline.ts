@@ -1,7 +1,11 @@
 import { ref } from 'vue'
 import { agentBridge } from '../../agent/bridge'
 import { captureSelectionSnapshot, captureSheetSnapshot } from '../../agent/context'
-import type { ToolResult } from '../../agent/protocol'
+import type {
+  ProviderId,
+  ToolResult,
+  TurnMetrics
+} from '../../agent/protocol'
 
 export interface ChatUserEntry {
   id: number
@@ -17,6 +21,11 @@ export interface ChatAssistantEntry {
   text: string
   /** True while this entry is still receiving text deltas. */
   streaming?: boolean
+  provider?: ProviderId
+  model?: string
+  resolvedModel?: string
+  effort?: string
+  metrics?: TurnMetrics
 }
 
 export type ChatTextEntry = ChatUserEntry | ChatAssistantEntry
@@ -36,7 +45,17 @@ export interface ChatErrorEntry {
   message: string
 }
 
-export type ChatEntry = ChatTextEntry | ChatToolEntry | ChatErrorEntry
+export interface ChatBoundaryEntry {
+  id: number
+  kind: 'boundary'
+  label: string
+}
+
+export type ChatEntry =
+  | ChatTextEntry
+  | ChatToolEntry
+  | ChatErrorEntry
+  | ChatBoundaryEntry
 
 /**
  * Builds a UI-friendly timeline (text turns interleaved with tool-call
@@ -49,6 +68,7 @@ export function useChatTimeline() {
   const nextId = () => ++idCounter
 
   let streamingEntry: ChatAssistantEntry | null = null
+  let pendingResetRevision: number | undefined
 
   function findToolEntry(callId: string): ChatToolEntry | undefined {
     for (let i = entries.value.length - 1; i >= 0; i--) {
@@ -66,7 +86,20 @@ export function useChatTimeline() {
             id: nextId(),
             kind: 'assistant',
             text: '',
-            streaming: true
+            streaming: true,
+            ...(agentBridge.state.appliedConfiguration
+              ? {
+                  provider:
+                    agentBridge.state.appliedConfiguration.provider,
+                  model: agentBridge.state.appliedConfiguration.model,
+                  ...(agentBridge.state.appliedConfiguration.effort
+                    ? {
+                        effort:
+                          agentBridge.state.appliedConfiguration.effort
+                      }
+                    : {})
+                }
+              : {})
           }
           entries.value.push(entry)
           // Keep the reactive proxy from the ref array. Mutating the raw
@@ -77,14 +110,51 @@ export function useChatTimeline() {
         break
       }
       case 'assistant_done': {
-        if (streamingEntry) {
+        if (!streamingEntry) {
+          entries.value.push({
+            id: nextId(),
+            kind: 'assistant',
+            text: '',
+            streaming: false,
+            provider: message.provider,
+            model: message.model,
+            resolvedModel: message.resolvedModel,
+            effort: message.effort,
+            metrics: message.metrics
+          })
+        } else {
           streamingEntry.streaming = false
-          if (!streamingEntry.text) {
-            const finished = streamingEntry
-            entries.value = entries.value.filter((entry) => entry.id !== finished.id)
-          }
+          streamingEntry.provider = message.provider
+          streamingEntry.model = message.model
+          streamingEntry.resolvedModel = message.resolvedModel
+          streamingEntry.effort = message.effort
+          streamingEntry.metrics = message.metrics
         }
         streamingEntry = null
+        break
+      }
+      case 'ai_configuration_applied': {
+        if (message.revision === pendingResetRevision) {
+          entries.value = []
+          streamingEntry = null
+          pendingResetRevision = undefined
+        } else if (message.newConversation && entries.value.length > 0) {
+          entries.value.push({
+            id: nextId(),
+            kind: 'boundary',
+            label:
+              `${message.configuration.provider} / ${message.configuration.model}` +
+              (message.configuration.effort
+                ? ` / ${message.configuration.effort}`
+                : ' / Default')
+          })
+        }
+        break
+      }
+      case 'ai_configuration_rejected': {
+        if (message.revision === pendingResetRevision) {
+          pendingResetRevision = undefined
+        }
         break
       }
       case 'tool_call': {
@@ -109,6 +179,14 @@ export function useChatTimeline() {
         break
       }
       case 'error': {
+        entries.value.push({ id: nextId(), kind: 'error', message: message.message })
+        break
+      }
+      case 'connection_reset': {
+        if (streamingEntry) {
+          streamingEntry.streaming = false
+          streamingEntry = null
+        }
         entries.value.push({ id: nextId(), kind: 'error', message: message.message })
         break
       }
@@ -142,9 +220,8 @@ export function useChatTimeline() {
   }
 
   function resetChat() {
-    agentBridge.reset()
-    entries.value = []
-    streamingEntry = null
+    if (!agentBridge.reset()) return
+    pendingResetRevision = agentBridge.state.pendingRevision
   }
 
   function dispose() {

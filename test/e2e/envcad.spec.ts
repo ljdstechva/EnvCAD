@@ -2,6 +2,11 @@ import { expect, test, type Page } from '@playwright/test'
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { inflateSync } from 'node:zlib'
+import {
+  cleanBenchmarkDxf,
+  geometryFingerprint,
+  inspectDxf
+} from '../../scripts/aiBenchmark'
 
 const FIXTURE = path.join(process.cwd(), 'test', 'fixtures', 'sample-site.dxf')
 const CONTROL_URL = 'http://127.0.0.1:8788'
@@ -164,6 +169,8 @@ test.describe.serial('EnvCAD preview with scripted fake sidecar', () => {
       }
     })
     await request.post(`${CONTROL_URL}/start`)
+    await request.post(`${CONTROL_URL}/scenario?name=ready`)
+    await request.post(`${CONTROL_URL}/delay?ms=0`)
   })
 
   test.afterEach(() => {
@@ -232,6 +239,106 @@ test.describe.serial('EnvCAD preview with scripted fake sidecar', () => {
     expect(dxf).toContain('BOUNDARY')
   })
 
+  test('exports and reopens the deterministic AI benchmark geometry exactly', async ({
+    page
+  }, testInfo) => {
+    const cleanPath = testInfo.outputPath('clean-benchmark.dxf')
+    const savedPath = testInfo.outputPath('benchmark-saved.dxf')
+    const reopenedPath = testInfo.outputPath('benchmark-reopened.dxf')
+    await fs.writeFile(
+      cleanPath,
+      cleanBenchmarkDxf(await fs.readFile(FIXTURE, 'utf8')),
+      'utf8'
+    )
+    await page.goto('/')
+    await expect.poll(() => page.evaluate(() => Boolean(window.__cadTest))).toBe(true)
+    await page.locator('input[accept=".dxf,.dwg"]').setInputFiles(cleanPath)
+    await expect(page.getByRole('button', { name: 'Save DXF' })).toBeEnabled()
+    await expect
+      .poll(() => page.evaluate(() => window.__cadTest?.entities().length ?? -1))
+      .toBe(0)
+
+    const evidence = await page.evaluate(async () => {
+      const call = async (name: Parameters<NonNullable<typeof window.__cadTest>['callTool']>[0], input: unknown) => {
+        const result = await window.__cadTest!.callTool(name, input)
+        if (result.error || !result.data) {
+          throw new Error(`${name} failed: ${result.error ?? 'missing data'}`)
+        }
+        return result.data as Record<string, unknown>
+      }
+      await call('create_layer', {
+        name: 'AI_BENCHMARK',
+        colorCss: '#00a86b'
+      })
+      const rectangle = await call('draw_rectangle', {
+        corner1: { x: 0, y: 0 },
+        corner2: { x: 20, y: 10 },
+        layer: 'AI_BENCHMARK'
+      })
+      const rectangleId = (rectangle.entityIds as string[])[0]
+      const area = await call('calculate_area', { entityIds: [rectangleId] })
+      await call('zoom_extents', {})
+      const circle = await call('draw_circle', {
+        center: { x: 30, y: 10 },
+        radius: 5,
+        layer: 'AI_BENCHMARK'
+      })
+      const circleId = (circle.entityIds as string[])[0]
+      const dimension = await call('add_radius_dimension', {
+        circleEntityId: circleId,
+        layer: 'AI_BENCHMARK'
+      })
+      const text = await call('draw_text', {
+        position: { x: 30, y: 17 },
+        text: 'AI BENCHMARK',
+        height: 1,
+        layer: 'AI_BENCHMARK'
+      })
+      return {
+        ids: [
+          rectangleId,
+          circleId,
+          (dimension.entityIds as string[])[0],
+          (text.entityIds as string[])[0]
+        ],
+        area: area.totalArea,
+        areaUnits: area.units,
+        radius: dimension.measurement
+      }
+    })
+    expect(evidence.area).toBe(200)
+    expect(evidence.areaUnits).toBe('Meters²')
+    expect(evidence.radius).toBe(5)
+
+    let download = page.waitForEvent('download')
+    await page.getByRole('button', { name: 'Save DXF' }).click()
+    await (await download).saveAs(savedPath)
+    await page.locator('input[accept=".dxf,.dwg"]').setInputFiles(savedPath)
+    await expect
+      .poll(() => page.evaluate(() => window.__cadTest?.entities().length ?? 0))
+      .toBe(4)
+    download = page.waitForEvent('download')
+    await page.getByRole('button', { name: 'Save DXF' }).click()
+    await (await download).saveAs(reopenedPath)
+
+    const saved = inspectDxf(await fs.readFile(savedPath, 'utf8'))
+    const reopened = inspectDxf(await fs.readFile(reopenedPath, 'utf8'))
+    expect(saved.acadVersion).toBe('AC1018')
+    expect(saved.unitsCode).toBe(6)
+    expect(saved.entities).toHaveLength(4)
+    expect(saved.entities.every((entity) => entity.layer === 'AI_BENCHMARK')).toBe(true)
+    expect(
+      saved.entities.map((entity) => entity.handle).sort()
+    ).toEqual([...evidence.ids].sort())
+    expect(
+      saved.layers.find((layer) => layer.name === 'AI_BENCHMARK')?.trueColor
+    ).toBe(0x00a86b)
+    expect(
+      reopened.layers.find((layer) => layer.name === 'AI_BENCHMARK')?.trueColor
+    ).toBe(0x00a86b)
+    expect(geometryFingerprint(saved)).toBe(geometryFingerprint(reopened))
+  })
+
   test('moves attached entities by +5 through chat and Ctrl+Z restores them', async ({
     page,
     request
@@ -279,6 +386,159 @@ test.describe.serial('EnvCAD preview with scripted fake sidecar', () => {
 
     const stats = await (await request.get(`${CONTROL_URL}/stats`)).json()
     expect(stats).toMatchObject({ userMessageCount: 1, toolResultCount: 1 })
+  })
+
+  test('discovers provider-specific models and effort options with keyboard-safe layouts', async ({
+    page
+  }) => {
+    await page.goto('/')
+    const provider = page.getByLabel('AI provider', { exact: true })
+    const model = page.getByLabel('AI model')
+    const effort = page.getByLabel('Reasoning effort')
+
+    await expect(provider).toBeEnabled()
+    await expect(provider.locator('option')).toHaveText([
+      'Claude Code',
+      'OpenAI Codex'
+    ])
+    await expect(model.locator('option')).toHaveText(['Fake Claude'])
+    await expect(effort.locator('option')).toHaveText([
+      'Default',
+      'Low',
+      'High'
+    ])
+
+    await provider.focus()
+    await expect(provider).toBeFocused()
+    await page.keyboard.press('ArrowDown')
+    await expect(provider).toHaveValue('openai-codex')
+    await expect(page.locator('.next-provider')).toContainText(
+      'Next prompt: OpenAI Codex'
+    )
+    await expect(model.locator('option')).toHaveText([
+      'Fake Codex Balanced',
+      'Fake Codex Fast'
+    ])
+    await expect(effort.locator('option')).toHaveText([
+      'Default',
+      'Low',
+      'Medium'
+    ])
+    await model.selectOption('fake-codex-fast')
+    await expect(effort.locator('option')).toHaveText(['Default', 'Low'])
+    await expect(model).toHaveAttribute(
+      'title',
+      'Deterministic fast E2E model'
+    )
+
+    for (const width of [280, 420]) {
+      await page.addStyleTag({
+        content: `.side-dock { width: ${width}px !important; }`
+      })
+      await expect
+        .poll(() =>
+          page
+            .locator('.ai-selector')
+            .evaluate(
+              (element) => element.scrollWidth <= element.clientWidth
+            )
+        )
+        .toBe(true)
+      const dockBox = await page.locator('.side-dock').boundingBox()
+      expect(dockBox).not.toBeNull()
+      for (const control of [provider, model, effort]) {
+        const box = await control.boundingBox()
+        expect(box).not.toBeNull()
+        expect(box!.x).toBeGreaterThanOrEqual(dockBox!.x)
+        expect(box!.x + box!.width).toBeLessThanOrEqual(
+          dockBox!.x + dockBox!.width
+        )
+      }
+    }
+  })
+
+  test('locks configuration during a turn, labels responses, and starts a new conversation on switch', async ({
+    page,
+    request
+  }) => {
+    await loadFixture(page)
+    await request.post(`${CONTROL_URL}/delay?ms=750`)
+    const selectedIds = await page.evaluate(
+      () => window.__cadTest?.selectByLayer('BUILDINGS') ?? []
+    )
+    expect(selectedIds).toHaveLength(2)
+
+    const input = page.locator('.chat-textarea')
+    await input.fill('Move these buildings five units to the right.')
+    await page.getByRole('button', { name: 'Send' }).click()
+    await expect(page.locator('.status-text')).toHaveText('Thinking...')
+    await expect(
+      page.getByLabel('AI provider', { exact: true })
+    ).toBeDisabled()
+    await expect(page.getByLabel('AI model')).toBeDisabled()
+    await expect(page.getByLabel('Reasoning effort')).toBeDisabled()
+    await expect(
+      page.getByRole('button', { name: 'Refresh models and provider status' })
+    ).toBeDisabled()
+
+    await expect(page.locator('.status-text')).toHaveText('Idle')
+    await expect(
+      page.getByLabel('AI provider', { exact: true })
+    ).toBeEnabled()
+    const response = page.locator('.bubble.assistant').last()
+    await expect(response.locator('.response-meta')).toContainText(
+      'Claude Code'
+    )
+    await expect(response.locator('.response-meta')).toContainText(
+      'fake-claude'
+    )
+    await expect(response.locator('.response-meta')).toContainText('Default')
+
+    await page
+      .getByLabel('AI provider', { exact: true })
+      .selectOption('openai-codex')
+    await expect(page.locator('.conversation-boundary')).toContainText(
+      'New conversation'
+    )
+    await expect(page.locator('.conversation-boundary')).toContainText(
+      'openai-codex / fake-codex-balanced / Default'
+    )
+    await expect(input).toBeEnabled()
+  })
+
+  test('shows actionable provider failure states without disabling CAD editing', async ({
+    page,
+    request
+  }) => {
+    await page.goto('/')
+    await request.post(`${CONTROL_URL}/scenario?name=codex-missing`)
+    await page
+      .getByLabel('AI provider', { exact: true })
+      .selectOption('openai-codex')
+    await expect(page.locator('.readiness-badge')).toHaveText('missing')
+    await expect(page.locator('.provider-message')).toContainText(
+      'Install Codex CLI, run "codex login", then refresh.'
+    )
+    await expect(page.locator('.chat-textarea')).toBeDisabled()
+    await expect(
+      page.getByRole('button', { name: 'Open', exact: true })
+    ).toBeEnabled()
+
+    await request.post(`${CONTROL_URL}/scenario?name=ready`)
+    await expect(page.locator('.readiness-badge')).toHaveText('ready')
+    await expect(page.locator('.chat-textarea')).toBeEnabled()
+
+    await request.post(`${CONTROL_URL}/scenario?name=both-unavailable`)
+    await expect(page.locator('.readiness-badge')).toHaveText(
+      'authentication-required'
+    )
+    await expect(page.locator('.provider-message')).toContainText(
+      'Run "codex login", then refresh.'
+    )
+    await expect(page.locator('.chat-textarea')).toBeDisabled()
+    await expect(
+      page.getByRole('button', { name: 'Open', exact: true })
+    ).toBeEnabled()
   })
 
   test('rejects a truncated DXF without changing the edited drawing', async ({ page }) => {

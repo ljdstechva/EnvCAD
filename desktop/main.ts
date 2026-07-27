@@ -1,5 +1,6 @@
 import { randomBytes } from 'node:crypto'
 import { mkdirSync } from 'node:fs'
+import { rm } from 'node:fs/promises'
 import path from 'node:path'
 import {
   app,
@@ -20,6 +21,7 @@ import {
   type SidecarStatus
 } from './runtimeProtocol'
 import { SidecarProcess, type UtilityProcessLike } from './sidecarProcess'
+import { AiPreferencesStore } from './aiPreferences'
 import { handleSquirrelStartup } from './squirrelStartup'
 import { focusExistingWindow } from './windowLifecycle'
 
@@ -32,6 +34,8 @@ const sessionToken = randomBytes(32).toString('base64url')
 let mainWindow: BrowserWindow | null = null
 let frontendServer: FrontendServerHandle | undefined
 let sidecarProcess: SidecarProcess | undefined
+let aiPreferencesStore: AiPreferencesStore | undefined
+let aiRuntimeDirectory = ''
 let rendererOrigin = ''
 let shuttingDown = false
 let readyToQuit = false
@@ -42,7 +46,8 @@ let sidecarStatus: SidecarStatus = {
 
 function sanitize(message: unknown): string {
   return String(message)
-    .replace(/sk-ant-[A-Za-z0-9_-]+/g, '[redacted]')
+    .replace(/\bsk-(?:ant|proj|svcacct)-[A-Za-z0-9_-]+\b/g, '[redacted]')
+    .replace(/\b(?:Bearer\s+)?eyJ[A-Za-z0-9._-]+\b/gi, '[redacted]')
     .split(sessionToken)
     .join('[redacted]')
 }
@@ -97,6 +102,16 @@ function installIpcHandlers(): void {
     if (!trustedSender(event)) throw new Error('Untrusted renderer IPC request')
     const error = await shell.openPath(logDirectory)
     return error ? { ok: false, error: 'Windows could not open the EnvCAD log folder.' } : { ok: true }
+  })
+  ipcMain.handle(DESKTOP_IPC.getAiPreferences, async (event) => {
+    if (!trustedSender(event)) throw new Error('Untrusted renderer IPC request')
+    if (!aiPreferencesStore) throw new Error('AI preferences are not initialized')
+    return aiPreferencesStore.load()
+  })
+  ipcMain.handle(DESKTOP_IPC.saveAiPreferences, async (event, preferences: unknown) => {
+    if (!trustedSender(event)) throw new Error('Untrusted renderer IPC request')
+    if (!aiPreferencesStore) throw new Error('AI preferences are not initialized')
+    return aiPreferencesStore.save(preferences)
   })
 }
 
@@ -160,6 +175,10 @@ function createApplicationMenu(): void {
         {
           label: 'Claude Code Setup',
           click: () => openAllowedExternalUrl('https://docs.anthropic.com/en/docs/claude-code/setup')
+        },
+        {
+          label: 'OpenAI Codex Setup',
+          click: () => openAllowedExternalUrl('https://developers.openai.com/codex/cli')
         }
       ]
     }
@@ -233,10 +252,16 @@ async function createWindow(rendererUrl: string): Promise<BrowserWindow> {
     clearTimeout(visibilityFallback)
     if (mainWindow === window) mainWindow = null
   })
+  // Register the window before loading the renderer. The renderer requests its
+  // persisted AI preferences during startup, and trustedSender intentionally
+  // rejects IPC from any window other than this one.
+  mainWindow = window
   try {
     await window.loadURL(rendererUrl)
   } catch (error) {
     clearTimeout(visibilityFallback)
+    if (mainWindow === window) mainWindow = null
+    if (!window.isDestroyed()) window.destroy()
     throw error
   }
   return window
@@ -246,6 +271,21 @@ async function startDesktop(): Promise<void> {
   await app.whenReady()
   app.setAppUserModelId(APP_ID)
   configureSessionSecurity()
+  aiPreferencesStore = new AiPreferencesStore(
+    path.join(app.getPath('userData'), 'ai-preferences.json'),
+    desktopLogger
+  )
+  const localAppData = process.env.LOCALAPPDATA
+  if (!localAppData) {
+    throw new Error('LOCALAPPDATA is unavailable; cannot create the isolated AI runtime.')
+  }
+  aiRuntimeDirectory = path.join(
+    path.resolve(localAppData),
+    'EnvCAD',
+    'ai-runtime',
+    `session-${process.pid}-${randomBytes(12).toString('hex')}`
+  )
+  mkdirSync(aiRuntimeDirectory, { recursive: true })
 
   const developmentUrl =
     typeof MAIN_WINDOW_VITE_DEV_SERVER_URL === 'string'
@@ -265,12 +305,13 @@ async function startDesktop(): Promise<void> {
 
   installIpcHandlers()
   createApplicationMenu()
-  mainWindow = await createWindow(rendererUrl)
+  await createWindow(rendererUrl)
 
   sidecarProcess = new SidecarProcess({
     workerPath: path.join(__dirname, 'sidecarWorker.cjs'),
     permittedOrigin: rendererOrigin,
     sessionToken,
+    runtimeDirectory: aiRuntimeDirectory,
     fork(modulePath, options): UtilityProcessLike {
       return utilityProcess.fork(modulePath, [], {
         env: options.env,
@@ -288,8 +329,35 @@ async function shutdown(): Promise<void> {
   if (shuttingDown) return
   shuttingDown = true
   desktopLogger.info('Application shutdown started.')
-  await sidecarProcess?.close()
-  await frontendServer?.close()
+  try {
+    await sidecarProcess?.close()
+  } catch (error) {
+    desktopLogger.error(
+      `AI Assistant shutdown failed: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    )
+  }
+  try {
+    await frontendServer?.close()
+  } catch (error) {
+    desktopLogger.error(
+      `Renderer server shutdown failed: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    )
+  }
+  if (aiRuntimeDirectory) {
+    try {
+      await rm(aiRuntimeDirectory, { recursive: true, force: true })
+    } catch (error) {
+      desktopLogger.error(
+        `Isolated AI runtime cleanup failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      )
+    }
+  }
   desktopLogger.info('Application shutdown complete.')
 }
 

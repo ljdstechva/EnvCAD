@@ -890,7 +890,7 @@ function addRadiusDimension(rawInput: unknown): ToolResult {
 
   const result = runEdit('Agent: add_radius_dimension', () => {
     const liveDb = currentDatabase()
-    const layer = annotationLayer({}, liveDb)
+    const layer = annotationLayer(input, liveDb)
     const block = new AcDbBlockTableRecord()
     block.name = nextAnnotationBlockName(liveDb)
     block.appendEntity([

@@ -1,21 +1,23 @@
 import { EventEmitter } from 'node:events'
-import type { Query } from '@anthropic-ai/claude-agent-sdk'
 import { WebSocket } from 'ws'
 import { describe, expect, it, vi } from 'vitest'
-import type { ServerMessage } from '../../../src/agent/protocol'
+import type {
+  AgentConfiguration,
+  ServerMessage
+} from '../../../src/agent/protocol'
 import { BridgeSession, buildTurnPrompt } from '../bridgeSession'
-
-const CLAUDE_EXECUTABLE = 'C:\\Program Files\\Claude\\claude.exe'
+import { ProviderManager } from '../providers/providerManager'
+import { FakeProvider } from './fakeProviders'
 
 class FakeWebSocket extends EventEmitter {
   readyState: number = WebSocket.OPEN
   sent: string[] = []
 
-  send(data: string) {
+  send(data: string): void {
     this.sent.push(String(data))
   }
 
-  disconnect() {
+  disconnect(): void {
     this.readyState = WebSocket.CLOSED
     this.emit('close')
   }
@@ -25,21 +27,40 @@ function decodedMessages(ws: FakeWebSocket): ServerMessage[] {
   return ws.sent.map((message) => JSON.parse(message) as ServerMessage)
 }
 
-function fakeQuery(messages: unknown[]): Query {
-  return {
-    async *[Symbol.asyncIterator]() {
-      for (const message of messages) yield message
-    },
-    interrupt: vi.fn(async () => undefined),
-    close: vi.fn()
-  } as unknown as Query
+function logger() {
+  return { log: vi.fn(), error: vi.fn() }
 }
 
-function validUserMessage(text = 'draw a line') {
+function sessionFixture() {
+  const ws = new FakeWebSocket()
+  const claude = new FakeProvider('claude-code')
+  const codex = new FakeProvider('openai-codex')
+  const manager = new ProviderManager([claude, codex], logger())
+  const session = new BridgeSession(ws as unknown as WebSocket, {
+    providerManager: manager,
+    logger: logger()
+  })
+  return { ws, claude, codex, manager, session }
+}
+
+function send(ws: FakeWebSocket, value: unknown): void {
+  ws.emit('message', JSON.stringify(value))
+}
+
+function configuration(
+  provider: 'claude-code' | 'openai-codex' = 'claude-code'
+): AgentConfiguration {
+  return provider === 'claude-code'
+    ? { provider, model: 'claude-default', effort: 'high' }
+    : { provider, model: 'codex-default', effort: 'low' }
+}
+
+function userMessage(revision = 1) {
   return {
     type: 'user_message',
-    text,
-    selectionSnapshot: { ids: [], count: 0, units: 'Millimeters' },
+    text: 'draw a line',
+    configurationRevision: revision,
+    selectionSnapshot: { ids: [], count: 0, units: 'Meters' },
     sheet: {
       paper: 'A3',
       orientation: 'landscape',
@@ -49,262 +70,331 @@ function validUserMessage(text = 'draw a line') {
   }
 }
 
-function testLogger() {
-  return { log: vi.fn(), error: vi.fn() }
-}
-
 describe('BridgeSession', () => {
-  it('rejects malformed and structurally invalid inbound messages', () => {
-    const ws = new FakeWebSocket()
-    const logger = testLogger()
-    new BridgeSession(ws as unknown as WebSocket, {
-      claudeExecutablePath: CLAUDE_EXECUTABLE,
-      logger
+  it('discovers both providers without requiring an active configuration', async () => {
+    const { ws, session } = sessionFixture()
+    await session.discoveryReady
+
+    const catalogs = decodedMessages(ws).filter(
+      (message) => message.type === 'ai_capabilities'
+    )
+    expect(catalogs).toHaveLength(2)
+    expect(
+      catalogs.map((message) =>
+        message.type === 'ai_capabilities' ? message.refreshing : undefined
+      )
+    ).toEqual([true, false])
+    expect(catalogs.at(-1)).toMatchObject({
+      providers: [
+        { id: 'claude-code', status: 'ready' },
+        { id: 'openai-codex', status: 'ready' }
+      ]
+    })
+  })
+
+  it('coalesces refreshes and blocks turns until the final catalog arrives', async () => {
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const { ws, claude, codex, session } = sessionFixture()
+    await session.discoveryReady
+    send(ws, {
+      type: 'set_ai_configuration',
+      revision: 1,
+      configuration: configuration()
+    })
+    await vi.waitFor(() => {
+      expect(decodedMessages(ws)).toContainEqual({
+        type: 'ai_configuration_applied',
+        revision: 1,
+        configuration: configuration(),
+        newConversation: true
+      })
     })
 
+    claude.discoveryGate = gate
+    ws.sent = []
+    send(ws, { type: 'refresh_ai_capabilities' })
+    send(ws, { type: 'refresh_ai_capabilities' })
+    send(ws, userMessage())
+
+    await vi.waitFor(() => {
+      expect(claude.discoverCount).toBe(2)
+    })
+    expect(codex.discoverCount).toBe(2)
+    expect(decodedMessages(ws)).toContainEqual({
+      type: 'error',
+      message:
+        'AI capabilities are refreshing; wait for the final provider catalog before sending.'
+    })
+    expect(
+      decodedMessages(ws).filter(
+        (message) =>
+          message.type === 'ai_capabilities' && message.refreshing
+      )
+    ).toHaveLength(1)
+
+    release()
+    await vi.waitFor(() => {
+      expect(
+        decodedMessages(ws).some(
+          (message) =>
+            message.type === 'ai_capabilities' && !message.refreshing
+        )
+      ).toBe(true)
+    })
+    await Promise.resolve()
+    send(ws, userMessage())
+    await vi.waitFor(() => {
+      expect(
+        decodedMessages(ws).some(
+          (message) => message.type === 'assistant_done'
+        )
+      ).toBe(true)
+    })
+  })
+
+  it('rejects malformed messages and turns with no acknowledged configuration', async () => {
+    const { ws, session } = sessionFixture()
+    await session.discoveryReady
+    ws.sent = []
+
     ws.emit('message', '{')
-    ws.emit('message', JSON.stringify({ type: 'user_message', text: '' }))
+    send(ws, userMessage())
 
     expect(decodedMessages(ws)).toEqual([
       { type: 'error', message: 'Invalid browser message: malformed JSON' },
       {
         type: 'error',
-        message: 'Invalid browser message: user_message.text must be a non-empty string'
+        message:
+          'The selected AI configuration has not been acknowledged. Wait for configuration confirmation before sending.'
       }
     ])
-    expect(logger.error).toHaveBeenCalledTimes(2)
   })
 
-  it('correlates browser tool results and reports unknown call ids', async () => {
-    const ws = new FakeWebSocket()
-    const session = new BridgeSession(ws as unknown as WebSocket, {
-      claudeExecutablePath: CLAUDE_EXECUTABLE,
-      logger: testLogger()
-    })
+  it('applies a revisioned configuration and reports provider metadata and metrics', async () => {
+    const { ws, claude, session } = sessionFixture()
+    await session.discoveryReady
+    ws.sent = []
 
-    const resultPromise = session.callTool('draw_line', {
-      start: { x: 0, y: 0 },
-      end: { x: 20, y: 0 }
+    send(ws, {
+      type: 'set_ai_configuration',
+      revision: 1,
+      configuration: configuration()
     })
-    const call = decodedMessages(ws)[0]
-    expect(call.type).toBe('tool_call')
-    if (call.type !== 'tool_call') throw new Error('Expected a tool_call')
-
-    ws.emit(
-      'message',
-      JSON.stringify({
-        type: 'tool_result',
-        callId: call.callId,
-        result: { data: { entityId: 'line-1' } }
-      })
-    )
-    await expect(resultPromise).resolves.toEqual({ data: { entityId: 'line-1' } })
-
-    ws.emit(
-      'message',
-      JSON.stringify({
-        type: 'tool_result',
-        callId: 'unknown-call',
-        result: { data: null }
-      })
-    )
-    expect(decodedMessages(ws).at(-1)).toEqual({
-      type: 'error',
-      message: 'Invalid browser message: tool_result references unknown callId "unknown-call"'
-    })
-  })
-
-  it('times out tool calls and resolves them when the browser disconnects', async () => {
-    const timeoutSocket = new FakeWebSocket()
-    const timeoutSession = new BridgeSession(timeoutSocket as unknown as WebSocket, {
-      claudeExecutablePath: CLAUDE_EXECUTABLE,
-      logger: testLogger(),
-      toolTimeoutMs: 5
-    })
-    await expect(timeoutSession.callTool('zoom_extents', {})).resolves.toEqual({
-      error: 'Timed out waiting for the browser to respond to zoom_extents after 0.005s'
-    })
-
-    const disconnectSocket = new FakeWebSocket()
-    const disconnectSession = new BridgeSession(disconnectSocket as unknown as WebSocket, {
-      claudeExecutablePath: CLAUDE_EXECUTABLE,
-      logger: testLogger()
-    })
-    const pending = disconnectSession.callTool('draw_line', {})
-    disconnectSocket.disconnect()
-    await expect(pending).resolves.toEqual({
-      error: 'Browser connection closed while waiting for draw_line'
-    })
-  })
-
-  it('uses the no-API-key subscription path and restricted CAD tools for a successful turn', async () => {
-    const ws = new FakeWebSocket()
-    const logger = testLogger()
-    const queryFactory = vi.fn((_params: unknown) =>
-      fakeQuery([
-        {
-          type: 'system',
-          subtype: 'init',
-          apiKeySource: 'none',
-          session_id: 'session-1'
-        },
-        {
-          type: 'assistant',
-          message: { content: [{ type: 'text', text: 'Line drawn.' }] }
-        },
-        {
-          type: 'result',
-          subtype: 'success',
-          session_id: 'session-1'
-        }
-      ])
-    )
-    new BridgeSession(ws as unknown as WebSocket, {
-      claudeExecutablePath: CLAUDE_EXECUTABLE,
-      logger,
-      queryFactory: queryFactory as never
-    })
-
-    ws.emit('message', JSON.stringify(validUserMessage()))
-
     await vi.waitFor(() => {
-      expect(decodedMessages(ws).at(-1)).toEqual({ type: 'status', state: 'idle' })
+      expect(decodedMessages(ws)).toContainEqual({
+        type: 'ai_configuration_applied',
+        revision: 1,
+        configuration: configuration(),
+        newConversation: true
+      })
     })
-    expect(decodedMessages(ws)).toEqual([
-      { type: 'status', state: 'thinking' },
-      { type: 'assistant_text_delta', text: 'Line drawn.' },
-      { type: 'assistant_done' },
-      { type: 'status', state: 'idle' }
-    ])
 
-    const options = (queryFactory.mock.calls[0][0] as { options: Record<string, unknown> }).options
-    expect(options).toMatchObject({
-      model: 'sonnet',
-      allowedTools: ['mcp__cad__*'],
-      tools: [],
-      permissionMode: 'dontAsk',
-      pathToClaudeCodeExecutable: CLAUDE_EXECUTABLE
+    send(ws, userMessage())
+    await vi.waitFor(() => {
+      expect(
+        decodedMessages(ws).some((message) => message.type === 'assistant_done')
+      ).toBe(true)
     })
-    expect(options).not.toHaveProperty('env')
-    expect(logger.log).toHaveBeenCalledWith(
-      '[sidecar] Claude authentication source: none (Claude Code login; no API key)'
+
+    expect(claude.configurations).toEqual([configuration()])
+    const done = decodedMessages(ws).find(
+      (message) => message.type === 'assistant_done'
     )
+    expect(done).toMatchObject({
+      provider: 'claude-code',
+      model: 'claude-default',
+      effort: 'high',
+      metrics: { toolCalls: 0 }
+    })
+    if (done?.type !== 'assistant_done') throw new Error('missing completion')
+    expect(done.metrics.totalMs).toBeGreaterThanOrEqual(0)
+    expect(done.metrics.conversationStartupMs).toBeGreaterThanOrEqual(0)
   })
 
-  it('fails closed when the SDK reports a non-OAuth credential source', async () => {
-    const ws = new FakeWebSocket()
-    const logger = testLogger()
-    const queryFactory = vi.fn((_params: unknown) =>
-      fakeQuery([
-        {
-          type: 'system',
-          subtype: 'init',
-          apiKeySource: 'user',
-          session_id: 'session-1'
-        }
-      ])
-    )
-    new BridgeSession(ws as unknown as WebSocket, {
-      claudeExecutablePath: CLAUDE_EXECUTABLE,
-      logger,
-      queryFactory: queryFactory as never
+  it('rejects stale revisions and provider changes during a running turn', async () => {
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const { ws, claude, session } = sessionFixture()
+    claude.nextGate = gate
+    await session.discoveryReady
+    send(ws, {
+      type: 'set_ai_configuration',
+      revision: 1,
+      configuration: configuration()
+    })
+    await vi.waitFor(() => {
+      expect(
+        decodedMessages(ws).some(
+          (message) => message.type === 'ai_configuration_applied'
+        )
+      ).toBe(true)
     })
 
-    ws.emit('message', JSON.stringify(validUserMessage()))
-
+    send(ws, userMessage())
     await vi.waitFor(() => {
-      expect(decodedMessages(ws).some((message) => message.type === 'error')).toBe(true)
+      expect(decodedMessages(ws)).toContainEqual({
+        type: 'status',
+        state: 'thinking'
+      })
+    })
+    send(ws, {
+      type: 'set_ai_configuration',
+      revision: 2,
+      configuration: configuration('openai-codex')
     })
     expect(decodedMessages(ws)).toContainEqual({
-      type: 'error',
+      type: 'ai_configuration_rejected',
+      revision: 2,
       message:
-        'Claude authentication source must be the Claude Code subscription login, but the Agent SDK reported "user". ' +
-        'EnvCAD requires the existing Claude Code subscription login and does not permit API-key authentication.'
+        'Provider, model, and effort cannot change while an AI turn is running.'
+    })
+
+    release()
+    await vi.waitFor(() => {
+      expect(decodedMessages(ws)).toContainEqual({
+        type: 'status',
+        state: 'idle'
+      })
+    })
+    send(ws, {
+      type: 'set_ai_configuration',
+      revision: 1,
+      configuration: configuration()
+    })
+    expect(decodedMessages(ws)).toContainEqual({
+      type: 'ai_configuration_rejected',
+      revision: 1,
+      message: 'Configuration revision 1 is stale.'
     })
   })
 
-  it('surfaces detailed Agent SDK errors without making a paid request', async () => {
-    const ws = new FakeWebSocket()
-    const queryFactory = vi.fn((_params: unknown) =>
-      fakeQuery([
-        {
-          type: 'system',
-          subtype: 'init',
-          apiKeySource: 'oauth',
-          session_id: 'session-1'
-        },
-        {
-          type: 'result',
-          subtype: 'error_during_execution',
-          errors: ['Claude usage limit reached'],
-          session_id: 'session-1'
-        }
-      ])
-    )
-    new BridgeSession(ws as unknown as WebSocket, {
-      claudeExecutablePath: CLAUDE_EXECUTABLE,
-      logger: testLogger(),
-      queryFactory: queryFactory as never
+  it('recreates the provider conversation and acknowledges a reset revision', async () => {
+    const { ws, claude, session } = sessionFixture()
+    await session.discoveryReady
+    send(ws, {
+      type: 'set_ai_configuration',
+      revision: 1,
+      configuration: configuration()
     })
-
-    ws.emit('message', JSON.stringify(validUserMessage()))
-
     await vi.waitFor(() => {
       expect(decodedMessages(ws)).toContainEqual({
-        type: 'error',
-        message: 'Claude agent error (error_during_execution): Claude usage limit reached'
+        type: 'ai_configuration_applied',
+        revision: 1,
+        configuration: configuration(),
+        newConversation: true
       })
+    })
+    const firstConversation = claude.conversations[0]
+
+    send(ws, { type: 'reset', revision: 2 })
+    await vi.waitFor(() => {
+      expect(decodedMessages(ws)).toContainEqual({
+        type: 'ai_configuration_applied',
+        revision: 2,
+        configuration: configuration(),
+        newConversation: true
+      })
+    })
+    expect(firstConversation.closed).toBe(true)
+    expect(claude.conversations).toHaveLength(2)
+  })
+
+  it('serializes browser tool calls and correlates their results', async () => {
+    const { ws, session } = sessionFixture()
+    await session.discoveryReady
+    ws.sent = []
+
+    const first = session.callTool('draw_line', {
+      start: { x: 0, y: 0 },
+      end: { x: 1, y: 0 }
+    })
+    const second = session.callTool('zoom_extents', {})
+    await vi.waitFor(() => {
+      expect(
+        decodedMessages(ws).filter((message) => message.type === 'tool_call')
+      ).toHaveLength(1)
+    })
+    const firstCall = decodedMessages(ws).find(
+      (message) => message.type === 'tool_call'
+    )
+    if (firstCall?.type !== 'tool_call') throw new Error('missing first call')
+    send(ws, {
+      type: 'tool_result',
+      callId: firstCall.callId,
+      result: { data: { entityId: 'line-1' } }
+    })
+    await expect(first).resolves.toEqual({ data: { entityId: 'line-1' } })
+
+    await vi.waitFor(() => {
+      expect(
+        decodedMessages(ws).filter((message) => message.type === 'tool_call')
+      ).toHaveLength(2)
+    })
+    const secondCall = decodedMessages(ws).filter(
+      (message) => message.type === 'tool_call'
+    )[1]
+    if (secondCall.type !== 'tool_call') throw new Error('missing second call')
+    send(ws, {
+      type: 'tool_result',
+      callId: secondCall.callId,
+      result: { data: null }
+    })
+    await expect(second).resolves.toEqual({ data: null })
+  })
+
+  it('rejects unknown tools and times out an unanswered browser call', async () => {
+    const { session } = sessionFixture()
+    await session.discoveryReady
+    await expect(session.callTool('shell', {})).resolves.toEqual({
+      error: 'Unknown CAD tool: shell'
+    })
+
+    const ws = new FakeWebSocket()
+    const manager = new ProviderManager(
+      [new FakeProvider('claude-code'), new FakeProvider('openai-codex')],
+      logger()
+    )
+    const shortSession = new BridgeSession(ws as unknown as WebSocket, {
+      providerManager: manager,
+      logger: logger(),
+      toolTimeoutMs: 5
+    })
+    await shortSession.discoveryReady
+    await expect(shortSession.callTool('zoom_extents', {})).resolves.toEqual({
+      error:
+        'Timed out waiting for the browser to respond to zoom_extents after 0.005s'
     })
   })
 
-  it('preserves the SDK quota message and reset time for the browser', async () => {
-    const ws = new FakeWebSocket()
-    const queryFactory = vi.fn((_params: unknown) =>
-      fakeQuery([
-        {
-          type: 'system',
-          subtype: 'init',
-          apiKeySource: 'none',
-          session_id: 'session-1'
-        },
-        {
-          type: 'rate_limit_event',
-          rate_limit_info: {
-            status: 'rejected',
-            rateLimitType: 'five_hour',
-            resetsAt: 1_785_044_400
-          }
-        },
-        {
-          type: 'assistant',
-          error: 'rate_limit',
-          message: {
-            content: [
-              {
-                type: 'text',
-                text: "You've hit your session limit · resets 1:40pm (Asia/Singapore)"
-              }
-            ]
-          }
-        }
-      ])
-    )
-    new BridgeSession(ws as unknown as WebSocket, {
-      claudeExecutablePath: CLAUDE_EXECUTABLE,
-      logger: testLogger(),
-      queryFactory: queryFactory as never
+  it('keeps concurrent disconnect and shutdown callers waiting on one provider cleanup', async () => {
+    const { ws, manager, session } = sessionFixture()
+    await session.discoveryReady
+    let releaseCleanup!: () => void
+    const cleanupGate = new Promise<void>((resolve) => {
+      releaseCleanup = resolve
     })
+    const close = vi
+      .spyOn(manager, 'close')
+      .mockImplementation(async () => cleanupGate)
 
-    ws.emit('message', JSON.stringify(validUserMessage()))
-
-    await vi.waitFor(() => {
-      expect(decodedMessages(ws)).toContainEqual({
-        type: 'error',
-        message:
-          "Claude request failed (rate_limit): You've hit your session limit · " +
-          'resets 1:40pm (Asia/Singapore)'
-      })
+    ws.disconnect()
+    let shutdownFinished = false
+    const shutdown = session.close().then(() => {
+      shutdownFinished = true
     })
+    await Promise.resolve()
+    expect(shutdownFinished).toBe(false)
+    expect(close).toHaveBeenCalledOnce()
+
+    releaseCleanup()
+    await shutdown
+    expect(shutdownFinished).toBe(true)
+    expect(close).toHaveBeenCalledOnce()
   })
 })
 

@@ -2,7 +2,9 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { WebSocket, WebSocketServer } from 'ws'
 import {
   parseClientMessage,
+  type AgentConfiguration,
   type ClientMessage,
+  type ProviderCapability,
   type ServerMessage,
   type ToolResult
 } from '../src/agent/protocol'
@@ -15,6 +17,132 @@ let webSocketServer: WebSocketServer | undefined
 let nextCallId = 1
 let userMessageCount = 0
 let toolResultCount = 0
+let completionDelayMs = 0
+const readyProviders: ProviderCapability[] = [
+  {
+    id: 'claude-code' as const,
+    displayName: 'Claude Code',
+    status: 'ready' as const,
+    statusMessage: 'Fake Claude Code is ready.',
+    executableVersion: 'test',
+    models: [
+      {
+        id: 'fake-claude',
+        invocationName: 'fake-claude',
+        displayName: 'Fake Claude',
+        description: 'Deterministic E2E model',
+        supportedEfforts: [
+          {
+            value: 'low',
+            displayName: 'Low',
+            description: 'Fast fake Claude effort',
+            isDefault: false
+          },
+          {
+            value: 'high',
+            displayName: 'High',
+            description: 'Quality fake Claude effort',
+            isDefault: true
+          }
+        ],
+        defaultEffort: 'high',
+        isDefault: true
+      }
+    ]
+  },
+  {
+    id: 'openai-codex' as const,
+    displayName: 'OpenAI Codex',
+    status: 'ready' as const,
+    statusMessage: 'Fake Codex is ready using ChatGPT login.',
+    executableVersion: '0.145.0-test',
+    models: [
+      {
+        id: 'fake-codex-balanced',
+        invocationName: 'fake-codex-balanced',
+        displayName: 'Fake Codex Balanced',
+        description: 'Deterministic balanced E2E model',
+        supportedEfforts: [
+          {
+            value: 'low',
+            displayName: 'Low',
+            description: 'Fast fake Codex effort',
+            isDefault: false
+          },
+          {
+            value: 'medium',
+            displayName: 'Medium',
+            description: 'Balanced fake Codex effort',
+            isDefault: true
+          }
+        ],
+        defaultEffort: 'medium',
+        isDefault: true
+      },
+      {
+        id: 'fake-codex-fast',
+        invocationName: 'fake-codex-fast',
+        displayName: 'Fake Codex Fast',
+        description: 'Deterministic fast E2E model',
+        supportedEfforts: [
+          {
+            value: 'low',
+            displayName: 'Low',
+            description: 'Only supported fake Codex effort',
+            isDefault: true
+          }
+        ],
+        defaultEffort: 'low',
+        isDefault: false
+      }
+    ]
+  }
+]
+let providers = readyProviders
+
+function clonedCatalog(catalog: readonly ProviderCapability[]): ProviderCapability[] {
+  return structuredClone([...catalog])
+}
+
+function setScenario(name: string): boolean {
+  if (name === 'ready') {
+    providers = clonedCatalog(readyProviders)
+  } else if (name === 'codex-missing') {
+    providers = clonedCatalog(readyProviders).map((provider) =>
+      provider.id === 'openai-codex'
+        ? {
+            ...provider,
+            status: 'missing',
+            statusMessage:
+              'Codex CLI was not found. Install Codex CLI, run "codex login", then refresh.',
+            models: []
+          }
+        : provider
+    )
+  } else if (name === 'both-unavailable') {
+    providers = clonedCatalog(readyProviders).map((provider) => ({
+      ...provider,
+      status: 'authentication-required',
+      statusMessage:
+        provider.id === 'claude-code'
+          ? 'Claude Code is signed out. Run "claude auth login", then refresh.'
+          : 'Codex CLI is signed out. Run "codex login", then refresh.',
+      models: []
+    }))
+  } else {
+    return false
+  }
+  if (webSocketServer) {
+    for (const client of webSocketServer.clients) {
+      send(client, {
+        type: 'ai_capabilities',
+        providers,
+        refreshing: false
+      })
+    }
+  }
+  return true
+}
 
 function send(socket: WebSocket, message: ServerMessage): void {
   if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message))
@@ -60,7 +188,8 @@ function waitForToolResult(socket: WebSocket, callId: string): Promise<ToolResul
 
 async function runScriptedExchange(
   socket: WebSocket,
-  message: Extract<ClientMessage, { type: 'user_message' }>
+  message: Extract<ClientMessage, { type: 'user_message' }>,
+  configuration: AgentConfiguration
 ): Promise<void> {
   userMessageCount += 1
   const callId = `fake-call-${nextCallId++}`
@@ -81,16 +210,34 @@ async function runScriptedExchange(
   })
 
   const result = await waitForToolResult(socket, callId)
+  if (completionDelayMs > 0) {
+    await new Promise((resolve) => setTimeout(resolve, completionDelayMs))
+  }
   send(socket, {
     type: 'assistant_text_delta',
     text: result.error ? `The move failed: ${result.error}` : 'The scripted move completed.'
   })
-  send(socket, { type: 'assistant_done' })
+  send(socket, {
+    type: 'assistant_done',
+    provider: configuration.provider,
+    model: configuration.model,
+    ...(configuration.effort ? { effort: configuration.effort } : {}),
+    metrics: { totalMs: 1, toolCalls: 1 }
+  })
   send(socket, { type: 'status', state: 'idle' })
 }
 
 function handleSocket(socket: WebSocket): void {
   let busy = false
+  let configuration: AgentConfiguration = {
+    provider: 'claude-code',
+    model: 'fake-claude'
+  }
+  send(socket, {
+    type: 'ai_capabilities',
+    providers,
+    refreshing: false
+  })
   socket.on('message', (raw) => {
     let decoded: unknown
     try {
@@ -105,13 +252,31 @@ function handleSocket(socket: WebSocket): void {
       return
     }
 
-    if (parsed.value.type === 'user_message') {
+    if (parsed.value.type === 'set_ai_configuration') {
+      const newConversation =
+        configuration.provider !== parsed.value.configuration.provider ||
+        configuration.model !== parsed.value.configuration.model ||
+        configuration.effort !== parsed.value.configuration.effort
+      configuration = { ...parsed.value.configuration }
+      send(socket, {
+        type: 'ai_configuration_applied',
+        revision: parsed.value.revision,
+        configuration,
+        newConversation
+      })
+    } else if (parsed.value.type === 'refresh_ai_capabilities') {
+      send(socket, {
+        type: 'ai_capabilities',
+        providers,
+        refreshing: false
+      })
+    } else if (parsed.value.type === 'user_message') {
       if (busy) {
         send(socket, { type: 'error', message: 'A scripted turn is already running' })
         return
       }
       busy = true
-      void runScriptedExchange(socket, parsed.value)
+      void runScriptedExchange(socket, parsed.value, configuration)
         .catch((error) => {
           send(socket, {
             type: 'error',
@@ -122,8 +287,15 @@ function handleSocket(socket: WebSocket): void {
         .finally(() => {
           busy = false
         })
-    } else if (parsed.value.type === 'interrupt' || parsed.value.type === 'reset') {
+    } else if (parsed.value.type === 'interrupt') {
       send(socket, { type: 'status', state: 'idle' })
+    } else if (parsed.value.type === 'reset') {
+      send(socket, {
+        type: 'ai_configuration_applied',
+        revision: parsed.value.revision,
+        configuration,
+        newConversation: true
+      })
     }
   })
 }
@@ -160,32 +332,61 @@ async function handleControl(
   request: IncomingMessage,
   response: ServerResponse
 ): Promise<void> {
-  if (request.method === 'GET' && request.url === '/health') {
+  const requestUrl = new URL(request.url ?? '/', `http://${HOST}:${CONTROL_PORT}`)
+  if (request.method === 'GET' && requestUrl.pathname === '/health') {
     json(response, 200, { ok: true, wsRunning: Boolean(webSocketServer) })
     return
   }
-  if (request.method === 'GET' && request.url === '/stats') {
+  if (request.method === 'GET' && requestUrl.pathname === '/stats') {
     json(response, 200, {
       wsRunning: Boolean(webSocketServer),
       userMessageCount,
-      toolResultCount
+      toolResultCount,
+      scenario:
+        providers[0]?.status === 'ready' && providers[1]?.status === 'ready'
+          ? 'ready'
+          : providers.every(
+                (provider) => provider.status === 'authentication-required'
+              )
+            ? 'both-unavailable'
+            : 'codex-missing',
+      completionDelayMs
     })
     return
   }
-  if (request.method === 'POST' && request.url === '/start') {
+  if (request.method === 'POST' && requestUrl.pathname === '/start') {
     await startWebSocketServer()
     json(response, 200, { wsRunning: true })
     return
   }
-  if (request.method === 'POST' && request.url === '/stop') {
+  if (request.method === 'POST' && requestUrl.pathname === '/stop') {
     await stopWebSocketServer()
     json(response, 200, { wsRunning: false })
     return
   }
-  if (request.method === 'POST' && request.url === '/reset-stats') {
+  if (request.method === 'POST' && requestUrl.pathname === '/reset-stats') {
     userMessageCount = 0
     toolResultCount = 0
     json(response, 200, { ok: true })
+    return
+  }
+  if (request.method === 'POST' && requestUrl.pathname === '/scenario') {
+    const name = requestUrl.searchParams.get('name') ?? ''
+    if (!setScenario(name)) {
+      json(response, 400, { error: `Unknown scenario ${name}` })
+      return
+    }
+    json(response, 200, { ok: true, name })
+    return
+  }
+  if (request.method === 'POST' && requestUrl.pathname === '/delay') {
+    const value = Number(requestUrl.searchParams.get('ms'))
+    if (!Number.isSafeInteger(value) || value < 0 || value > 5_000) {
+      json(response, 400, { error: 'Delay must be an integer from 0 to 5000 ms' })
+      return
+    }
+    completionDelayMs = value
+    json(response, 200, { ok: true, completionDelayMs })
     return
   }
   json(response, 404, { error: 'Not found' })

@@ -44,6 +44,32 @@ onMounted(() => nextTick(() => scrollToBottom()))
 
 const showJumpButton = computed(() => !isAtBottom.value)
 
+function providerName(provider: string | undefined): string {
+  if (provider === 'claude-code') return 'Claude Code'
+  if (provider === 'openai-codex') return 'OpenAI Codex'
+  return provider ?? 'AI'
+}
+
+function roundedMetric(value: number | undefined): string {
+  return value === undefined ? 'n/a' : `${Math.round(value)} ms`
+}
+
+function metricsTitle(entry: Extract<ChatEntry, { kind: 'assistant' }>): string {
+  const metrics = entry.metrics
+  if (!metrics) return ''
+  return [
+    `Provider ready: ${roundedMetric(metrics.providerReadyMs)}`,
+    `Conversation startup: ${roundedMetric(metrics.conversationStartupMs)}`,
+    `First text: ${roundedMetric(metrics.firstTextMs)}`,
+    `First tool call: ${roundedMetric(metrics.firstToolCallMs)}`,
+    `Total: ${roundedMetric(metrics.totalMs)}`,
+    `Tool calls: ${metrics.toolCalls}`,
+    `Retries: ${metrics.retries ?? 0}`,
+    `Input tokens: ${metrics.inputTokens ?? 'not reported'}`,
+    `Output tokens: ${metrics.outputTokens ?? 'not reported'}`
+  ].join('\n')
+}
+
 defineExpose({ scrollToBottom })
 </script>
 
@@ -65,11 +91,49 @@ defineExpose({ scrollToBottom })
         </div>
         <div v-else-if="entry.kind === 'assistant'" class="bubble-row assistant">
           <div class="bubble assistant">
+            <div v-if="entry.provider && entry.model" class="response-meta">
+              <span>{{ providerName(entry.provider) }}</span>
+              <span
+                :title="
+                  entry.resolvedModel
+                    ? `Resolved model: ${entry.resolvedModel}`
+                    : 'Provider-reported model'
+                "
+              >
+                {{ entry.model }}
+              </span>
+              <span>{{ entry.effort || 'Default' }}</span>
+              <span
+                v-if="entry.metrics"
+                class="turn-metrics"
+                :title="metricsTitle(entry)"
+                :data-provider-ready-ms="entry.metrics.providerReadyMs"
+                :data-conversation-startup-ms="
+                  entry.metrics.conversationStartupMs
+                "
+                :data-first-text-ms="entry.metrics.firstTextMs"
+                :data-first-tool-call-ms="entry.metrics.firstToolCallMs"
+                :data-total-ms="entry.metrics.totalMs"
+                :data-tool-calls="entry.metrics.toolCalls"
+                :data-retries="entry.metrics.retries || 0"
+                :data-input-tokens="entry.metrics.inputTokens"
+                :data-output-tokens="entry.metrics.outputTokens"
+              >
+                {{ Math.round(entry.metrics.totalMs) }} ms ·
+                {{ entry.metrics.toolCalls }} tool{{
+                  entry.metrics.toolCalls === 1 ? '' : 's'
+                }}
+              </span>
+            </div>
             <div class="bubble-text">{{ entry.text }}<span v-if="entry.streaming" class="caret"></span></div>
           </div>
         </div>
         <div v-else-if="entry.kind === 'tool'" class="bubble-row assistant">
           <ToolCallChip :entry="entry" />
+        </div>
+        <div v-else-if="entry.kind === 'boundary'" class="conversation-boundary">
+          <span>New conversation</span>
+          <small>{{ entry.label }}</small>
         </div>
         <div v-else class="bubble-row assistant">
           <div class="bubble error">{{ entry.message }}</div>
@@ -142,6 +206,49 @@ defineExpose({ scrollToBottom })
   background: var(--bg-button);
   color: var(--text-primary);
   border-bottom-left-radius: 2px;
+}
+
+.response-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: 5px;
+}
+
+.response-meta span {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 1px 5px;
+  color: var(--text-muted);
+  font-size: 9px;
+  line-height: 1.3;
+}
+
+.conversation-boundary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.conversation-boundary::before,
+.conversation-boundary::after {
+  content: '';
+  flex: 1;
+  border-top: 1px solid var(--border-color);
+}
+
+.conversation-boundary small {
+  max-width: 48%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 9px;
 }
 
 .bubble.error {

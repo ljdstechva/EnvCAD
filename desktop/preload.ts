@@ -5,6 +5,7 @@ import {
   type DesktopRuntimeConfig,
   type EnvCadDesktopApi
 } from './runtimeProtocol'
+import type { AiPreferences } from './aiPreferences'
 
 const api: EnvCadDesktopApi = {
   getRuntimeConfig: () =>
@@ -17,7 +18,14 @@ const api: EnvCadDesktopApi = {
     return () => ipcRenderer.removeListener(DESKTOP_IPC.sidecarStatus, listener)
   },
   openLogFolder: () =>
-    ipcRenderer.invoke(DESKTOP_IPC.openLogFolder) as Promise<{ ok: boolean; error?: string }>
+    ipcRenderer.invoke(DESKTOP_IPC.openLogFolder) as Promise<{ ok: boolean; error?: string }>,
+  getAiPreferences: () =>
+    ipcRenderer.invoke(DESKTOP_IPC.getAiPreferences) as Promise<AiPreferences>,
+  saveAiPreferences: (preferences) =>
+    ipcRenderer.invoke(
+      DESKTOP_IPC.saveAiPreferences,
+      preferences
+    ) as Promise<AiPreferences>
 }
 
 contextBridge.exposeInMainWorld('envcadDesktop', Object.freeze(api))

@@ -1,41 +1,37 @@
+import { randomUUID } from 'node:crypto'
+import { mkdir, rm } from 'node:fs/promises'
+import path from 'node:path'
 import { DEVELOPMENT_SESSION_TOKEN } from '../../desktop/runtimeProtocol'
-import {
-  discoverClaudeExecutable,
-  isClaudeAuthenticated
-} from '../../desktop/claudeExecutable'
 import { startSidecar } from './server'
 
 const HOST = '127.0.0.1'
 const PORT = 8787
-const API_KEY_ENV_NAME = 'ANTHROPIC_API_KEY'
-const DEVELOPMENT_ORIGIN = process.env.ENVCAD_RENDERER_ORIGIN ?? 'http://localhost:5173'
+const DEVELOPMENT_ORIGIN =
+  process.env.ENVCAD_RENDERER_ORIGIN ?? 'http://localhost:5173'
+
+function localRuntimeDirectory(): string {
+  const localAppData = process.env.LOCALAPPDATA
+  if (!localAppData) {
+    throw new Error('LOCALAPPDATA is required for the isolated AI runtime directory.')
+  }
+  return path.join(
+    path.resolve(localAppData),
+    'EnvCAD',
+    'ai-runtime',
+    `development-${process.pid}-${randomUUID()}`
+  )
+}
 
 async function main(): Promise<void> {
-  if (process.env[API_KEY_ENV_NAME]?.trim()) {
-    throw new Error(
-      `${API_KEY_ENV_NAME} is set. EnvCAD requires the existing Claude Code OAuth subscription login.`
-    )
-  }
-
-  const discovery = await discoverClaudeExecutable()
-  if (discovery.status === 'missing') {
-    throw new Error('Claude Code was not found. Install Claude Code and run "claude auth login".')
-  }
-  if (discovery.status === 'incompatible') {
-    throw new Error(
-      `Claude Code ${discovery.version} is incompatible; version ${discovery.expectedVersion} is required.`
-    )
-  }
-  if (!(await isClaudeAuthenticated(discovery.executablePath))) {
-    throw new Error('Claude Code is installed but not signed in. Run "claude auth login".')
-  }
-
+  const runtimeDirectory = localRuntimeDirectory()
+  await mkdir(runtimeDirectory, { recursive: true })
   const sidecar = startSidecar({
     host: HOST,
     port: PORT,
     permittedOrigin: DEVELOPMENT_ORIGIN,
     sessionToken: DEVELOPMENT_SESSION_TOKEN,
-    claudeExecutablePath: discovery.executablePath
+    runtimeDirectory,
+    environment: process.env
   })
   const address = await sidecar.ready
   let shuttingDown = false
@@ -44,6 +40,7 @@ async function main(): Promise<void> {
     shuttingDown = true
     console.log(`[sidecar] received ${signal}; shutting down ${address.url}`)
     await sidecar.close()
+    await rm(runtimeDirectory, { recursive: true, force: true })
   }
   process.once('SIGINT', () => void shutdown('SIGINT'))
   process.once('SIGTERM', () => void shutdown('SIGTERM'))

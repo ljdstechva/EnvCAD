@@ -23,9 +23,20 @@ const FIXTURE = path.join(process.cwd(), 'test', 'fixtures', 'sample-site.dxf')
 const SCREENSHOT = path.join(process.cwd(), 'output', 'desktop', 'packaged-envcad.png')
 
 function cleanEnvironment(): Record<string, string> {
+  const blocked = new Set([
+    'anthropic_api_key',
+    'anthropic_auth_token',
+    'claude_code_oauth_token',
+    'openai_api_key',
+    'codex_api_key',
+    'codex_access_token'
+  ])
   return Object.fromEntries(
     Object.entries(process.env)
-      .filter(([name, value]) => value !== undefined && !name.startsWith('ANTHROPIC_'))
+      .filter(
+        ([name, value]) =>
+          value !== undefined && !blocked.has(name.toLowerCase())
+      )
       .map(([name, value]) => [name, value!])
   )
 }
@@ -68,9 +79,10 @@ function verifyAuthenticatedSidecarRoundTrip(
       10_000
     )
     socket.once('open', () => socket.send('not-json'))
-    socket.once('message', (data) => {
+    socket.on('message', (data) => {
       try {
         const response = JSON.parse(String(data)) as { type?: unknown; message?: unknown }
+        if (response.type === 'ai_capabilities') return
         if (response.type !== 'error' || typeof response.message !== 'string') {
           finish(new Error(`Unexpected packaged sidecar response: ${String(data)}`))
           return
@@ -109,6 +121,27 @@ test('packaged EnvCAD opens, edits without a browser, authenticates its sidecar,
 
     await page.locator('input[accept=".dxf,.dwg"]').setInputFiles(FIXTURE)
     await expect(page.getByRole('button', { name: 'Save DXF' })).toBeEnabled()
+    await expect(page.locator('.canvas-host canvas:visible').first()).toBeVisible()
+    const savedDxf = test.info().outputPath('packaged-save-reopen.dxf')
+    await application.evaluate(
+      ({ session }, filePath) => {
+        session.defaultSession.once('will-download', (_event, item) => {
+          item.setSavePath(filePath)
+        })
+      },
+      savedDxf
+    )
+    await page.getByRole('button', { name: 'Save DXF' }).click()
+    await expect
+      .poll(async () => {
+        try {
+          return (await readFile(savedDxf)).byteLength
+        } catch {
+          return 0
+        }
+      })
+      .toBeGreaterThan(100)
+    await page.locator('input[accept=".dxf,.dwg"]').setInputFiles(savedDxf)
     await expect(page.locator('.canvas-host canvas:visible').first()).toBeVisible()
     await page.getByRole('button', { name: 'Zoom Extents' }).click()
     await page.getByRole('button', { name: 'Layers', exact: true }).click()
@@ -184,7 +217,8 @@ test('packaged EnvCAD keeps CAD available when API-key authentication is present
   try {
     const page = await application.firstWindow()
     await expect(page.getByRole('button', { name: 'Open', exact: true })).toBeVisible()
-    await expect(page.locator('.offline-banner')).toContainText('ANTHROPIC_API_KEY')
+    await expect(page.locator('.provider-message')).toContainText('ANTHROPIC_API_KEY')
+    await expect(page.locator('.readiness-badge')).toHaveText('failed')
     await page.locator('input[accept=".dxf,.dwg"]').setInputFiles(FIXTURE)
     await expect(page.getByRole('button', { name: 'Save DXF' })).toBeEnabled()
   } finally {
@@ -198,7 +232,7 @@ test('packaged EnvCAD keeps CAD available when API-key authentication is present
   await rm(profile, { recursive: true })
 })
 
-test('packaged EnvCAD keeps CAD available without Claude Code or Node on PATH', async () => {
+test('packaged EnvCAD keeps CAD available when both provider CLIs are missing', async () => {
   const profile = await mkdtemp(path.join(tmpdir(), 'envcad-clean-profile-'))
   const environment = cleanEnvironment()
   environment.PATH = path.join(environment.SystemRoot ?? 'C:\\Windows', 'System32')
@@ -217,10 +251,73 @@ test('packaged EnvCAD keeps CAD available without Claude Code or Node on PATH', 
   try {
     const page = await application.firstWindow()
     await expect(page.getByRole('button', { name: 'Open', exact: true })).toBeVisible()
-    await expect(page.locator('.offline-banner')).toContainText('Claude Code was not found')
+    await expect(page.locator('.provider-message')).toContainText('Claude Code was not found')
+    await expect(page.locator('.readiness-badge')).toHaveText('missing')
+    await page
+      .getByLabel('AI provider', { exact: true })
+      .selectOption('openai-codex')
+    await expect(page.locator('.provider-message')).toContainText('Codex CLI was not found')
+    await expect(page.locator('.readiness-badge')).toHaveText('missing')
     await page.locator('input[accept=".dxf,.dwg"]').setInputFiles(FIXTURE)
     await expect(page.getByRole('button', { name: 'Save DXF' })).toBeEnabled()
     await expect(page.locator('.canvas-host canvas:visible').first()).toBeVisible()
+  } finally {
+    await application.close()
+    await rm(profile, { recursive: true })
+  }
+})
+
+test('packaged EnvCAD persists non-secret AI preferences across restarts', async () => {
+  const profile = await mkdtemp(path.join(tmpdir(), 'envcad-preferences-profile-'))
+  const environment = cleanEnvironment()
+  environment.PATH = path.join(environment.SystemRoot ?? 'C:\\Windows', 'System32')
+  environment.APPDATA = path.join(profile, 'AppData', 'Roaming')
+  environment.LOCALAPPDATA = path.join(profile, 'AppData', 'Local')
+  environment.USERPROFILE = profile
+  await Promise.all([
+    mkdir(environment.APPDATA, { recursive: true }),
+    mkdir(environment.LOCALAPPDATA, { recursive: true })
+  ])
+
+  let application = await electron.launch({
+    executablePath: ELECTRON_DRIVER,
+    args: [PRODUCTION_ASAR],
+    env: environment
+  })
+  try {
+    const page = await application.firstWindow()
+    await expect(page.getByRole('button', { name: 'Open', exact: true })).toBeVisible()
+    const provider = page.getByLabel('AI provider', { exact: true })
+    await expect(provider.locator('option')).toHaveCount(2)
+    await provider.selectOption('openai-codex')
+    await expect(provider).toHaveValue('openai-codex')
+    await expect
+      .poll(async () => {
+        const saved = await page.evaluate(() =>
+          window.envcadDesktop!.getAiPreferences()
+        )
+        return saved.selectedProvider
+      })
+      .toBe('openai-codex')
+  } finally {
+    await application.close()
+  }
+
+  application = await electron.launch({
+    executablePath: ELECTRON_DRIVER,
+    args: [PRODUCTION_ASAR],
+    env: environment
+  })
+  try {
+    const page = await application.firstWindow()
+    await expect(page.getByRole('button', { name: 'Open', exact: true })).toBeVisible()
+    const provider = page.getByLabel('AI provider', { exact: true })
+    await expect(provider.locator('option')).toHaveCount(2)
+    await expect(provider).toHaveValue('openai-codex')
+    expect(
+      (await page.evaluate(() => window.envcadDesktop!.getAiPreferences()))
+        .selectedProvider
+    ).toBe('openai-codex')
   } finally {
     await application.close()
     await rm(profile, { recursive: true })

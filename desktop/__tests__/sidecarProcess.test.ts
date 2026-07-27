@@ -1,6 +1,10 @@
 import { EventEmitter } from 'node:events'
 import { describe, expect, it, vi } from 'vitest'
-import { SidecarProcess, type UtilityProcessLike } from '../sidecarProcess'
+import {
+  SidecarProcess,
+  sanitizedWorkerEnvironment,
+  type UtilityProcessLike
+} from '../sidecarProcess'
 import { sessionTokenProtocol } from '../runtimeProtocol'
 
 class FakeUtilityProcess extends EventEmitter implements UtilityProcessLike {
@@ -16,36 +20,38 @@ function logger() {
   return { info: vi.fn(), warn: vi.fn(), error: vi.fn() }
 }
 
-function readyDiscovery() {
-  return vi.fn(async () => ({
-    status: 'ready' as const,
-    executablePath: 'C:\\Claude\\claude.exe',
-    version: '2.1.220'
-  }))
+function options(child: FakeUtilityProcess, token = 'a'.repeat(43)) {
+  return {
+    workerPath: 'C:\\EnvCAD\\sidecarWorker.cjs',
+    permittedOrigin: 'http://127.0.0.1:41234',
+    sessionToken: token,
+    runtimeDirectory:
+      'C:\\Users\\test\\AppData\\Local\\EnvCAD\\ai-runtime\\session-test',
+    fork: () => child,
+    onStatus: vi.fn(),
+    logger: logger()
+  }
 }
 
 describe('SidecarProcess', () => {
-  it('publishes runtime configuration and turns a worker crash into an AI-only failure', async () => {
+  it('starts the neutral worker immediately and publishes runtime configuration', async () => {
     const child = new FakeUtilityProcess()
-    const statuses: string[] = []
     const token = 'a'.repeat(43)
+    const statuses: string[] = []
     const processController = new SidecarProcess({
-      workerPath: 'C:\\EnvCAD\\sidecarWorker.cjs',
-      permittedOrigin: 'http://127.0.0.1:41234',
-      sessionToken: token,
-      fork: () => child,
-      discover: readyDiscovery(),
-      authenticate: vi.fn(async () => true),
-      onStatus: (status) => statuses.push(status.type),
-      logger: logger()
+      ...options(child, token),
+      onStatus: (status) => statuses.push(status.type)
     })
 
     await processController.start()
-    expect(child.messages[0]).toMatchObject({
+    expect(child.messages[0]).toEqual({
       type: 'start',
       host: '127.0.0.1',
       port: 0,
-      claudeExecutablePath: 'C:\\Claude\\claude.exe'
+      permittedOrigin: 'http://127.0.0.1:41234',
+      sessionToken: token,
+      runtimeDirectory:
+        'C:\\Users\\test\\AppData\\Local\\EnvCAD\\ai-runtime\\session-test'
     })
     child.emit('message', {
       type: 'ready',
@@ -67,59 +73,34 @@ describe('SidecarProcess', () => {
     expect(statuses.at(-1)).toBe('failed')
   })
 
-  it('disables AI for ANTHROPIC_API_KEY without starting or logging its value', async () => {
-    const fork = vi.fn()
-    const testLogger = logger()
+  it('passes only an allowlisted environment and replaces secret values with sentinels', () => {
     const secret = 'sk-ant-do-not-log-this'
-    const processController = new SidecarProcess({
-      workerPath: 'worker.cjs',
-      permittedOrigin: 'http://127.0.0.1:41234',
-      sessionToken: 'b'.repeat(43),
-      environment: { ANTHROPIC_API_KEY: secret },
-      fork,
-      onStatus: vi.fn(),
-      logger: testLogger
+    const environment = sanitizedWorkerEnvironment({
+      PATH: 'C:\\Windows',
+      USERPROFILE: 'C:\\Users\\test',
+      ANTHROPIC_API_KEY: secret,
+      OPENAI_API_KEY: 'sk-proj-also-secret',
+      UNRELATED_SECRET: 'do-not-forward'
     })
 
-    await processController.start()
-    expect(processController.status.type).toBe('unsafe-api-key-environment')
-    expect(fork).not.toHaveBeenCalled()
-    expect(JSON.stringify(testLogger.warn.mock.calls)).not.toContain(secret)
+    expect(environment).toMatchObject({
+      PATH: 'C:\\Windows',
+      USERPROFILE: 'C:\\Users\\test',
+      ANTHROPIC_API_KEY: '[blocked-by-envcad]',
+      OPENAI_API_KEY: '[blocked-by-envcad]'
+    })
+    expect(environment).not.toHaveProperty('UNRELATED_SECRET')
+    expect(JSON.stringify(environment)).not.toContain(secret)
+    expect(JSON.stringify(environment)).not.toContain('sk-proj-also-secret')
   })
 
-  it('keeps CAD available when Claude Code is installed but signed out', async () => {
-    const fork = vi.fn()
+  it('turns synchronous startup failures into an AI-only failure state', async () => {
+    const child = new FakeUtilityProcess()
     const processController = new SidecarProcess({
-      workerPath: 'worker.cjs',
-      permittedOrigin: 'http://127.0.0.1:41234',
-      sessionToken: 'd'.repeat(43),
-      fork,
-      discover: readyDiscovery(),
-      authenticate: vi.fn(async () => false),
-      onStatus: vi.fn(),
-      logger: logger()
-    })
-
-    await processController.start()
-    expect(processController.status).toMatchObject({
-      type: 'authentication-required',
-      message: expect.stringContaining('not signed in')
-    })
-    expect(fork).not.toHaveBeenCalled()
-  })
-
-  it('turns synchronous utility-process startup failures into an AI-only failure state', async () => {
-    const processController = new SidecarProcess({
-      workerPath: 'missing-worker.cjs',
-      permittedOrigin: 'http://127.0.0.1:41234',
-      sessionToken: 'e'.repeat(43),
+      ...options(child),
       fork: () => {
         throw new Error('worker entry point is unavailable')
-      },
-      discover: readyDiscovery(),
-      authenticate: vi.fn(async () => true),
-      onStatus: vi.fn(),
-      logger: logger()
+      }
     })
 
     await expect(processController.start()).resolves.toBeUndefined()
@@ -134,16 +115,7 @@ describe('SidecarProcess', () => {
     child.postMessage = () => {
       throw new Error('message channel closed')
     }
-    const processController = new SidecarProcess({
-      workerPath: 'worker.cjs',
-      permittedOrigin: 'http://127.0.0.1:41234',
-      sessionToken: 'f'.repeat(43),
-      fork: () => child,
-      discover: readyDiscovery(),
-      authenticate: vi.fn(async () => true),
-      onStatus: vi.fn(),
-      logger: logger()
-    })
+    const processController = new SidecarProcess(options(child))
 
     await processController.start()
     expect(processController.status.type).toBe('failed')
@@ -152,16 +124,7 @@ describe('SidecarProcess', () => {
 
   it('performs graceful shutdown once across repeated close calls', async () => {
     const child = new FakeUtilityProcess()
-    const processController = new SidecarProcess({
-      workerPath: 'worker.cjs',
-      permittedOrigin: 'http://127.0.0.1:41234',
-      sessionToken: 'c'.repeat(43),
-      fork: () => child,
-      discover: readyDiscovery(),
-      authenticate: vi.fn(async () => true),
-      onStatus: vi.fn(),
-      logger: logger()
-    })
+    const processController = new SidecarProcess(options(child))
     await processController.start()
 
     const firstClose = processController.close()
@@ -170,5 +133,18 @@ describe('SidecarProcess', () => {
     child.emit('message', { type: 'stopped', message: 'stopped' })
     await firstClose
     expect(child.kill).not.toHaveBeenCalled()
+  })
+
+  it('terminates the utility process if the shutdown message channel has closed', async () => {
+    const child = new FakeUtilityProcess()
+    const processController = new SidecarProcess(options(child))
+    await processController.start()
+    child.postMessage = () => {
+      throw new Error('message channel closed')
+    }
+
+    await expect(processController.close()).resolves.toBeUndefined()
+    expect(child.kill).toHaveBeenCalledOnce()
+    expect(processController.status).toMatchObject({ type: 'stopped' })
   })
 })
