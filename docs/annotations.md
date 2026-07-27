@@ -2,8 +2,9 @@
 
 EnvCAD uses native `AcDbMText` and `AcDbLeader` entities for multiline notes
 and leaders, and a block-insert fallback for linear and radius dimensions.
-Every annotation defaults to the `DIMENSIONS` layer; the browser creates that
-layer inside the same undoable edit as the annotation when it does not exist.
+Every annotation defaults to the `DIMENSIONS` layer. `add_radius_dimension`
+and `add_mtext` may instead receive an explicit destination layer; the browser
+creates the selected layer inside the same undoable edit when it does not exist.
 
 ## Why dimensions use the block fallback
 
@@ -31,10 +32,11 @@ an ordinary named block definition containing:
 - centered `MTEXT` whose value is computed in code and displayed to exactly two
   decimals.
 
-The tool then adds one `AcDbBlockReference` on `DIMENSIONS`. The insert is the
-only model-space entity returned by the tool, so selection, move, delete, and
-undo treat the annotation as one object. The block definition and insert are
-both standard DXF records and survive Save DXF followed by reopen.
+The tool then adds one `AcDbBlockReference` on the selected annotation layer
+(`DIMENSIONS` by default). The insert is the only model-space entity returned
+by the tool, so selection, move, delete, and undo treat the annotation as one
+object. The block definition and insert are standard DXF records and survive
+Save DXF followed by reopen.
 
 This is a deliberate compatibility fallback, not an approximation of the
 measurement. Horizontal dimensions use the exact X-coordinate difference,

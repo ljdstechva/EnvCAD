@@ -1,88 +1,73 @@
 # EnvCAD testing
 
-EnvCAD has browser/unit suites plus a production-ASAR desktop suite. All are
-deterministic and can run without sending a Claude model message.
+Normal automated suites are deterministic and never send a real Claude or Codex
+model request. Live provider calls require the separate `--live` benchmark flag.
 
 ## Prerequisites
 
-Install the locked npm dependencies, then install Playwright's Chromium binary:
-
 ```powershell
 npm ci
-npx playwright install chromium
 ```
 
-The browser binary is installed in Playwright's user cache and is not committed
-to the repository.
+Browser E2E requires the Playwright Chromium runtime. Desktop tests use the
+Electron binary installed in `node_modules`.
 
-## Unit and headless integration suite
+## Unit and integration suite
 
 ```powershell
 npm run test
+npm run typecheck
 ```
 
-This runs Vitest once and exits. The suite covers:
+Coverage includes:
 
-- sheet layout math for all nine paper sizes, portrait and landscape, meter
-  and millimeter drawing units, and scales 1:50, 1:100, 1:200, 1:500, and
-  1:1000;
-- scale-bar label output for every built-in template, including explicit
-  absence checks for templates without a scale bar;
-- sheet rendering, fixture integrity, protocol validation, browser bridge
-  queuing, and sidecar bridge sessions;
-- autosave snapshot round-trips, recent-file bookkeeping, and the
-  storage-quota path (a rejected write is reported once, keeps the previous
-  snapshot, and warns again after a recovery);
-- pure agent and predicate geometry, public polyline/bulge extraction,
-  import parsing, and environmental symbol footprints;
-- real executor dispatch against a headless `AcDbDatabase`, including CSV and
-  GeoJSON imports, containment extraction for points/lines/polylines/circles/
-  symbols, overlap, exact clearance and annotation undo, monitoring-point
-  undo, and every `calculate_area`/`calculate_length` entity branch.
+- CAD geometry, measurements, annotations, import, sheets, autosave, and file
+  safety;
+- the canonical CAD tool catalog and equivalent Claude/Codex schemas;
+- argument validation before browser dispatch, serialization, timeouts, tool
+  failure propagation, and one-call/one-undo behavior;
+- concurrent independent provider discovery, single-flight refresh, cached/final
+  catalog state, and turn/configuration exclusion during refresh;
+- Claude model/effort mapping, subscription auth enforcement, API-key
+  rejection, rate limits, lifecycle, and authoritative close when interrupt
+  acknowledgement is wedged;
+- Codex executable/version/auth discovery, paginated live catalog mapping,
+  JSONL app-server requests, dynamic tools, runtime-settings attestation,
+  passive-event schema/identity checks, ChatGPT auth-change rejection,
+  forbidden-event rejection, redaction, timeout, and process shutdown;
+- strict protocol catalogs, revisions, metrics, malformed messages, and reset
+  acknowledgement;
+- atomic/corrupt preference behavior and the Claude existing-user default;
+- renderer fallback, persistence projection, no cross-provider fallback,
+  turn-time configuration locking, stale acknowledgement handling, and
+  socket-generation isolation after an interrupted turn.
 
-`@mlightcad/data-model` can create and mutate an in-memory database in Node, so
-the integration suite uses the actual database and transaction manager. The
-small `setCadToolTestDatabase` seam bypasses only the viewer/WebGL document
-manager; it does not replace executor logic.
+Provider tests use deterministic fake adapters. They do not invoke installed
+provider executables.
 
-No numeric coverage package is installed because the only permitted new
-package is Playwright. Executor coverage is maintained as an explicit
-entity-branch matrix in `src/agent/handlers.integration.test.ts`.
-
-## Browser E2E suite
+## Browser E2E
 
 ```powershell
 npm run test:e2e
 ```
 
-Playwright builds EnvCAD in an explicit E2E mode, starts `vite preview`, starts
-`test/fakeSidecar.ts`, runs Chromium with one worker, and cleans up both
-servers. The E2E-only build exposes `window.__cadTest` for deterministic
-selection and geometry inspection; ordinary production builds do not expose
-it.
+Playwright builds the renderer with `.env.e2e` and starts
+`test/fakeSidecar.ts`. The fake sidecar advertises provider-specific Claude and
+Codex model catalogs and performs a deterministic CAD move.
 
-The fake sidecar implements the documented WebSocket protocol but never
-imports or starts the Claude Agent SDK. It emits assistant text, calls
-`move_entities` using the IDs attached to the real chat message, waits for the
-matching browser `tool_result`, and completes the turn. A localhost-only
-control endpoint pauses and restarts its WebSocket listener for offline and
-reconnect testing.
+The suite verifies:
 
-The five browser checks cover:
+- real DXF open/render pixels, theme, page setup, DXF/PDF download, and
+  undo/redo;
+- provider/model/effort dropdown population and model-dependent efforts;
+- keyboard selection and 280/420 px chat-panel layout without overflow;
+- turn-time control locking, response provider/model/effort/metrics labels, and
+  new-conversation boundaries;
+- provider missing/auth-required recovery while CAD stays usable;
+- strict one-message/one-browser-tool behavior;
+- malformed DXF recovery and sidecar reconnect.
 
-1. opening `test/fixtures/sample-site.dxf`, model entity presence, and actual
-   non-blank canvas pixel variance;
-2. A4 portrait Page Setup and the outer Sheet Preview SVG viewBox
-   `0 0 210 297`;
-3. non-empty PDF and DXF downloads, with `BOUNDARY` present in the DXF text;
-4. the real chat UI, tool chip, exact +5 movement of two attached BUILDINGS
-   entities, correlated fake-sidecar result, and exact Ctrl+Z restoration;
-5. offline banner/disabled input followed by automatic reconnect when the fake
-   sidecar listener starts.
-
-The configuration fails immediately if any `ANTHROPIC_*` environment variable
-is present, and each browser test asserts that no request targets an Anthropic
-hostname.
+No Anthropic or OpenAI endpoint is contacted.
 
 ## Packaged desktop suite
 
@@ -90,33 +75,110 @@ hostname.
 npm run test:desktop
 ```
 
-Electron Forge first packages the x64 production application and writes the
-ASAR to `out\EnvCAD-win32-x64`. Playwright then drives that ASAR with
-Electron's test binary; the shipped executable itself keeps its security fuses
-and inspector disabled.
+This first packages the production application, then launches the ASAR with
+Playwright Electron. It checks:
 
-The suite checks:
+- a visible production window without Vite;
+- sandboxed preload and absence of renderer `require`;
+- sample DXF rendering and normal CAD operations;
+- authenticated WebSocket round-trip and invalid-token rejection;
+- single-instance behavior;
+- strict persisted AI preferences;
+- CAD availability with blocked key variables;
+- Claude/Codex missing and signed-out/incompatible-style failure states through
+  isolated environments;
+- secret redaction, shutdown, and dynamic-port cleanup.
 
-1. production renderer startup, the narrow preload API, sample DXF loading,
-   non-blank canvas rendering, and the zoom, layers, and page-setup controls;
-2. live installed-Claude discovery/authentication and sidecar connection
-   without sending a model message;
-3. invalid WebSocket token rejection and second-instance focus behavior;
-4. graceful application exit and a closed sidecar loopback listener;
-5. fail-closed `ANTHROPIC_API_KEY` behavior without logging a test value;
-6. a clean profile with no Claude executable, where the AI-specific setup
-   message is shown and CAD remains usable.
+Desktop screenshots and traces are written only to ignored `output/` and
+`test-results/`.
 
-The resulting screenshot is written under `output/desktop`.
+## Build, package, and dependency gates
 
-## Live-agent manual pass
+```powershell
+npm run build
+npm run desktop:make
+npm audit --omit=dev
+git diff --check
+```
 
-The automated suites deliberately do not send a real Claude model message,
-consume an API key, or evaluate model judgment. The packaged desktop suite may
-start the installed-Claude sidecar for a non-billable discovery,
-authentication-status, and connection check; it sends no query. After changes
-to prompts, tool descriptions, authentication, or conversational behavior, run
-the applicable live-agent dialogues in
-[`docs/agent-test-plan.md`](docs/agent-test-plan.md). Those manual checks cover
-OAuth/session behavior, model tool choice, wording, and multi-turn reasoning;
-they are not prerequisites for deterministic unit or fake-sidecar E2E runs.
+Release acceptance also inspects the complete diff, staged files, installer
+signature/hash/size, and the final installed version.
+
+### Dependency-audit findings
+
+As of 2026-07-28, `npm audit --omit=dev` reports one high and two moderate
+findings from the same `lodash-es` package already present in the v0.1.1
+dependency graph:
+
+- `lodash-es` is pinned transitively by `@mlightcad/cad-simple-viewer`; npm
+  offers no fixed version. The viewer imports only `defaults` and `debounce`,
+  not the advisory-affected `template`, `unset`, or `omit` APIs.
+
+The lockfile also advances the Claude SDK's compatible peer dependencies from
+`@modelcontextprotocol/sdk` 1.29.0 to 1.30.0 and `@hono/node-server` 1.19.15 to
+2.0.12. That non-breaking update removes the former Windows `serve-static`
+advisory; EnvCAD's reviewed in-process MCP use remains unchanged. The mlightcad
+chain has no available audit fix, so its unused-code-path findings remain a
+documented upstream risk rather than being hidden by a breaking replacement.
+
+## Live provider benchmark
+
+```powershell
+npm run benchmark:ai -- --live
+```
+
+Resume an interrupted run only from its checkpoint directory:
+
+```powershell
+npm run benchmark:ai -- --live --resume 'D:\path\to\output\desktop\ai-benchmark\<run>'
+```
+
+The command refuses to run without `--live`. It resolves the Squirrel stub to
+the exact installed, versioned `app.asar` and launches that artifact through the
+matching development Electron binary so Playwright can attach despite the
+production inspector fuses. It then uses a generated empty metre-unit DXF,
+captures the live catalogs, runs one excluded warm-up per provider,
+representative smoke checks, and the two deterministic benchmark tasks. The
+harness enforces at most 16 additional turns so earlier protocol probes plus
+the benchmark remain within the authorized 20-turn ceiling.
+
+`benchmark-progress.json` is replaced atomically before every provider prompt
+and after every completed stage. Resume skips completed warm-ups, smoke checks,
+Task A stages, full configurations, and retained failed turns. It never retries
+a turn merely because later screenshot or file capture failed. Provider/tool
+failures are captured as scored evidence so the remaining matrix can continue.
+DXF downloads are assigned and checked through Electron's main-session
+`will-download` event because Playwright Electron does not reliably expose them
+as renderer `download` events.
+
+For each full configuration it captures:
+
+- provider discovery and conversation startup;
+- first text/tool and total monotonic timing;
+- tool count, retries, and reported safe token counts;
+- assistant IDs and canonical tool inputs/results;
+- exact model-space geometry and layer true color from saved DXF;
+- save/reopen geometry fingerprints and metre units;
+- screenshots and provider/model/effort actually used.
+
+Raw evidence stays under ignored `output/desktop/ai-benchmark/`. Only the
+sanitized comparative table and recommendations belong in
+`docs/ai-benchmark.md`.
+
+The benchmark uses installed Claude Code subscription and Codex ChatGPT logins.
+It never uses API keys and never uploads a client drawing.
+
+## Installed release acceptance
+
+After making and installing v0.2.0:
+
+1. launch the Desktop shortcut five consecutive times;
+2. inspect provider/model/effort controls at normal and narrow width;
+3. confirm preferences and benchmark recommendations after relaunch;
+4. verify Task A for both providers from saved/reopened DXF evidence;
+5. repeat sample DXF open, selection, pan/zoom, layers, page setup, save/reopen,
+   and searchable vector PDF;
+6. verify single-instance behavior and provider failure states;
+7. close the app and confirm no EnvCAD-owned utility, Claude, Codex app-server,
+   updater, port, or runtime directory remains;
+8. leave v0.2.0 installed with no related process running.

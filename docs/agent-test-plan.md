@@ -1,20 +1,21 @@
-# AI drafting agent — scripted acceptance dialogues
+# AI Assistant scripted acceptance dialogues
 
-Twelve scripted dialogues that exercise the CAD agent end to end: real chat
-UI → `src/agent/bridge.ts` → sidecar → Claude → CAD tool → browser executor →
-drawing database. Each one names the tool calls it must produce and the
-behaviour it must show, so a regression shows up as a diff against this file
-rather than as "the agent felt worse".
+These dialogues exercise CAD behavior end to end:
+real chat UI → provider-neutral sidecar → selected Claude/Codex adapter →
+canonical CAD tool → browser executor → drawing database. Each case names the
+tool calls and observable result, so a regression is concrete.
 
-Every dialogue below was run against the live application. Results are
-recorded in the **Result** column and in [Run log](#run-log).
+The run log below is the historical Claude Code pass from 2026-07-26. EnvCAD
+v0.2.0 applies the same catalog and schemas to both providers; the installed
+cross-provider deterministic creation/annotation evidence is recorded in
+`docs/ai-benchmark.md`.
 
 ## Environment
 
 | | |
 |---|---|
-| App | `npm run dev` — Vite on `http://localhost:5173`, sidecar on `ws://127.0.0.1:8787` |
-| Auth | The sidecar's Claude Code OAuth subscription login. The sidecar refuses to start if `ANTHROPIC_API_KEY` is set, and aborts a turn unless the SDK reports `apiKeySource` `oauth`/`none`. Running this plan consumes subscription quota. |
+| App | `npm run dev` — Vite plus the provider-neutral sidecar; packaged builds use random loopback ports. |
+| Auth | Claude uses the installed subscription login; Codex uses the installed ChatGPT login. API-key/token variables are rejected. Live dialogue runs consume the selected provider's usage allowance. |
 | Drawing | `test/fixtures/sample-site.dxf` — `$INSUNITS = 6` (Meters); layers `BOUNDARY`, `BUILDINGS`, `ANNOTATION`, `FACILITIES`; 7 entities |
 | Fixture geometry | BOUNDARY: closed polyline 100 m × 60 m (area 6 000 m²). BUILDINGS: closed polylines 20 × 15 m at (10,10) and 25 × 12 m at (45,10). ANNOTATION: three MTEXT labels. FACILITIES: circle r = 8 m at (85,45). |
 | Sheet defaults | A3 landscape, 1:200, drawing unit m, no title-block template |
@@ -28,8 +29,9 @@ Each dialogue is a fresh start:
 
 1. Reload `sample-site.dxf` through the toolbar's file input, so geometry,
    layers, and undo history are identical every time.
-2. Click **New chat** so the sidecar starts a new Agent SDK session and the
-   turn cannot inherit context from the previous dialogue.
+2. Click **New chat** and wait for its revision acknowledgement so the sidecar
+   starts a new selected-provider conversation and the turn cannot inherit
+   context from the previous dialogue.
 3. Set the selection with the dev-only `window.__cadTest` helper
    (`src/agent/testHarness.ts`) — `selectByLayer('BUILDINGS')`, `select(ids)`,
    or `clearSelection()`. This replaces canvas-pixel clicking so the selection
@@ -245,9 +247,10 @@ descriptions and system prompt both say so, and D8's reply repeated it.
 
 ## Run log
 
-All dialogues run on 2026-07-26 against the live app, against
+These historical dialogue results ran on 2026-07-26 against the live app, against
 `@mlightcad/data-model` 1.12.0 / `@mlightcad/cad-simple-viewer` 1.5.8, with the
-sidecar on the Claude Code subscription login.
+sidecar on the Claude Code subscription login. They are not presented as a
+v0.2.0 Codex benchmark.
 
 | Dialogue | Expected tool calls | Result |
 |---|---|---|

@@ -1,318 +1,307 @@
-# EnvCAD Agent Protocol
+# EnvCAD AI Assistant protocol
 
-This document is the exact wire protocol between the browser (the CAD app,
-which owns the drawing database and executes all tools) and the local Node
-sidecar (which owns the Claude Agent SDK loop). It is authoritative — later
-work should build against this document, not against a guess at the code.
+This document describes the v0.2.0 renderer-to-sidecar contract. The protocol is
+provider-neutral: Claude Code and OpenAI Codex share configuration, lifecycle,
+streaming, metrics, and CAD tool messages.
 
-Canonical TypeScript types live in [`src/agent/protocol.ts`](../src/agent/protocol.ts)
-and are imported by both sides (the browser bundle via Vite, the sidecar via
-`tsx`, using a relative import). This document explains the semantics; the
-`.ts` file is the source of truth for shapes.
+## Transport and authentication
 
-## Transport
+The packaged renderer connects to a random loopback WebSocket port created by
+the Electron utility process. The HTTP upgrade must satisfy all three checks:
 
-- In browser development, the sidecar listens on
-  `ws://127.0.0.1:8787` (`sidecar/src/index.ts`).
-- In the packaged desktop app, the utility-process sidecar binds
-  `127.0.0.1` on an operating-system-assigned port. The renderer receives that
-  per-launch endpoint only through the narrow preload API.
-- The server accepts only the exact configured renderer Origin. In browser
-  development that is `http://localhost:5173` unless explicitly overridden;
-  in the packaged app it is the random-port internal renderer origin. Missing
-  or different origins are rejected before a session is created.
-- Every connection must negotiate `envcad.v1` plus a token protocol. Browser
-  development uses the documented local development token; the packaged app
-  generates a cryptographically random token on every launch and keeps it in
-  memory. Missing or incorrect protocols/tokens are rejected before a session
-  is created.
-- The browser is the client. It connects on startup and reconnects with
-  exponential backoff if the connection drops (e.g. the sidecar process was
-  killed and later restarted).
-- Every message is a single JSON object with a `type` field used as a
-  discriminant. There is no batching or partial-frame handling — one WS
-  message is one complete JSON object.
-- Both peers validate decoded messages before processing them. Malformed JSON,
-  unsupported message types, invalid fields, mismatched selection counts, and
-  unknown CAD tool names are rejected with a visible protocol error.
-- The sidecar holds one `BridgeSession` per WebSocket connection. Each
-  session owns its own Claude Agent SDK session id, so two browser tabs
-  connecting at once get independent agent conversations. Only one browser
-  tab is expected to be open during this phase of the project.
+1. exact renderer `Origin`;
+2. subprotocol `envcad.v1`;
+3. a per-launch `envcad.session.<token>` subprotocol.
 
-## Client → Server messages
+The 256-bit token exists only in Electron main/preload/utility-process memory.
+Payloads are limited to 2 MiB. The app-server used by Codex is stdio-only and
+never exposes a network port.
 
-Sent by the browser (`src/agent/bridge.ts`).
+Every decoded object is strict: unknown fields, unknown message types, invalid
+provider IDs, non-canonical tool names, unsupported effort values, and
+unbounded strings/arrays are rejected.
 
-### `user_message`
+## Capability and configuration lifecycle
 
-Sent when the user submits a new message to the agent.
+The utility process starts even when neither provider is installed. It sends an
+initial catalog with `checking` statuses, discovers both providers concurrently,
+then sends provider-specific updates.
 
-```ts
+Client:
+
+```json
+{ "type": "refresh_ai_capabilities" }
+```
+
+Server:
+
+```json
 {
-  type: 'user_message'
-  text: string
-  selectionSnapshot: {
-    /** Entity object ids selected in the viewer at SEND time. */
-    ids: string[]
-    count: number
-    /** Human-readable drawing unit name, e.g. "Millimeters". */
-    units: string
-  }
-  sheet: {
-    paper: string
-    orientation: 'portrait' | 'landscape'
-    scaleDenominator: number
-    drawingUnit: string
-    templateId?: string
-    fields?: Record<string, string>
+  "type": "ai_capabilities",
+  "refreshing": false,
+  "providers": [
+    {
+      "id": "claude-code",
+      "displayName": "Claude Code",
+      "status": "ready",
+      "statusMessage": "Claude Code is ready.",
+      "executableVersion": "2.1.220",
+      "discoveryMs": 820,
+      "models": [
+        {
+          "id": "default",
+          "invocationName": "default",
+          "resolvedModel": "claude-opus-5",
+          "displayName": "Default",
+          "description": "Provider description",
+          "supportedEfforts": [
+            {
+              "value": "high",
+              "displayName": "High",
+              "isDefault": true
+            }
+          ],
+          "defaultEffort": "high",
+          "isDefault": true
+        }
+      ]
+    }
+  ]
+}
+```
+
+The cached catalog uses `"refreshing": true`; the final catalog always uses
+`"refreshing": false`. Discovery is single-flight. While either the initial
+discovery or a manual refresh is pending, the renderer and sidecar both reject
+turns and configuration changes so an in-flight catalog cannot invalidate a
+conversation silently.
+
+An individual discovery completion is:
+
+```json
+{ "type": "ai_provider_status", "provider": { "...": "ProviderCapability" } }
+```
+
+Statuses are `checking`, `ready`, `missing`, `authentication-required`,
+`incompatible`, or `failed`. Unavailable providers remain visible. One provider
+failure does not disable the other provider or CAD editing.
+
+Configuration is revisioned:
+
+```json
+{
+  "type": "set_ai_configuration",
+  "revision": 7,
+  "configuration": {
+    "provider": "openai-codex",
+    "model": "gpt-5.6-sol",
+    "effort": "high"
   }
 }
 ```
 
-`selectionSnapshot` is captured from `view.selectionSet.ids` at the moment the
-browser sends the message — **not** whatever happens to be selected later,
-while the agent is still working. See [Selection snapshot semantics](#selection-snapshot-semantics)
-below for how the sidecar uses it. `sheet` is the current
-`sheetStore.current` value, given so the agent has drafting context (paper
-size, scale, active title-block template) without a tool round trip.
+The sidecar validates the provider, live model invocation name, and advertised
+effort before closing the old conversation and creating the new one. It replies:
 
-### `tool_result`
-
-Sent in reply to a `tool_call` from the server, once the browser has run the
-corresponding handler.
-
-```ts
+```json
 {
-  type: 'tool_result'
-  callId: string   // echoes the tool_call's callId
-  result: {
-    data?: unknown   // present on success
-    error?: string   // present on failure; data is omitted
+  "type": "ai_configuration_applied",
+  "revision": 7,
+  "configuration": {
+    "provider": "openai-codex",
+    "model": "gpt-5.6-sol",
+    "effort": "high"
+  },
+  "newConversation": true
+}
+```
+
+or:
+
+```json
+{
+  "type": "ai_configuration_rejected",
+  "revision": 7,
+  "message": "OpenAI Codex does not support effort \"max\" for this model."
+}
+```
+
+The renderer ignores stale acknowledgements and cannot send a prompt until its
+latest revision is applied. Provider/model/effort changes are rejected while a
+turn is running.
+
+If the authenticated sidecar socket drops during a turn, the renderer ends the
+partial response, resets its local turn state, and starts a replacement
+conversation after reconnecting. Late messages and CAD-tool results remain
+bound to the old socket and are never forwarded into the replacement session.
+
+Starting a new chat also uses a revision, so input stays disabled while the old
+provider conversation is closed and a replacement is created:
+
+```json
+{ "type": "reset", "revision": 8 }
+```
+
+Completion is the same `ai_configuration_applied` message with revision 8 and
+`newConversation: true`.
+
+## Turns
+
+The renderer sends the exact applied revision:
+
+```json
+{
+  "type": "user_message",
+  "text": "Move these five metres east.",
+  "configurationRevision": 8,
+  "selectionSnapshot": {
+    "ids": ["3A", "3B"],
+    "count": 2,
+    "units": "Meters"
+  },
+  "sheet": {
+    "paper": "A3",
+    "orientation": "landscape",
+    "scaleDenominator": 500,
+    "drawingUnit": "m"
   }
 }
 ```
 
-`result` is intentionally *not* shaped like an MCP `CallToolResult` — the
-browser only ever thinks in plain `{ data }` / `{ error }` terms. The sidecar
-translates this into the MCP content-block shape the Agent SDK expects (see
-[Tool forwarding](#tool-forwarding)).
+Selection is frozen when the message is sent. `get_selected_entities` substitutes
+those IDs in the sidecar; a model cannot change them.
 
-### `interrupt`
+Streaming messages:
 
-```ts
-{ type: 'interrupt' }
+```json
+{ "type": "status", "state": "thinking" }
+{ "type": "assistant_text_delta", "text": "I’ll move the two entities. " }
 ```
 
-Stops the agent mid-turn. The sidecar calls the Agent SDK's
-`Query.interrupt()` on whichever `query()` call is currently running for this
-connection. No-op if the agent is idle.
+Completion includes the actual provider configuration and monotonic metrics:
 
-### `reset`
-
-```ts
-{ type: 'reset' }
+```json
+{
+  "type": "assistant_done",
+  "provider": "openai-codex",
+  "model": "gpt-5.6-sol",
+  "effort": "high",
+  "metrics": {
+    "providerReadyMs": 810,
+    "conversationStartupMs": 310,
+    "firstTextMs": 950,
+    "firstToolCallMs": 1310,
+    "totalMs": 4720,
+    "toolCalls": 1,
+    "retries": 0,
+    "inputTokens": 840,
+    "outputTokens": 95
+  }
+}
+{ "type": "status", "state": "idle" }
 ```
 
-Ends the current Agent SDK session. The next `user_message` on this
-connection starts a brand new session (no `resume`), so the agent has no
-memory of anything before the reset.
+Token counts are omitted when a provider does not report them. Hidden reasoning
+is never transported to the renderer.
 
-## Server → Client messages
+Interruption is:
 
-Sent by the sidecar (`sidecar/src/bridgeSession.ts`).
-
-### `assistant_text_delta`
-
-```ts
-{ type: 'assistant_text_delta'; text: string }
+```json
+{ "type": "interrupt" }
 ```
 
-A chunk of assistant-authored text. One is emitted per `text` content block
-found in each `assistant` message the Agent SDK yields for the turn. This is
-chunk-level (per content block), not per-token — the SDK's `query()` helper
-does not expose token-level streaming the way `messages.stream()` does on the
-raw Claude API. A single turn may emit several deltas if Claude interleaves
-text and tool calls.
+## CAD tool forwarding
 
-### `assistant_done`
+Both provider adapters are generated from `sidecar/src/cadToolSpecs.ts`. A tool
+definition contains one strict Zod object schema, its generated Draft 7 JSON
+Schema, description, timeout, and browser bridge handler.
 
-```ts
-{ type: 'assistant_done' }
+Sidecar to renderer:
+
+```json
+{
+  "type": "tool_call",
+  "callId": "f8eb...",
+  "name": "draw_rectangle",
+  "input": {
+    "corner1": { "x": 0, "y": 0 },
+    "corner2": { "x": 20, "y": 10 },
+    "layer": "AI_BENCHMARK"
+  }
+}
 ```
 
-Sent once after the agent loop finishes the turn (the `result` message from
-the SDK has been consumed). Marks the end of the streamed response for this
-`user_message`.
+Renderer to sidecar:
 
-### `tool_call`
-
-```ts
-{ type: 'tool_call'; callId: string; name: string; input: unknown }
+```json
+{
+  "type": "tool_result",
+  "callId": "f8eb...",
+  "result": {
+    "data": {
+      "entityIds": ["42"],
+      "corner1": { "x": 0, "y": 0 },
+      "corner2": { "x": 20, "y": 10 },
+      "layer": "AI_BENCHMARK"
+    }
+  }
+}
 ```
 
-Sent from inside a CAD tool's handler (registered on the in-process MCP
-server — see [`sidecar/src/cadTools.ts`](../sidecar/src/cadTools.ts)) the
-moment Claude invokes that tool. `name` is the bare tool name (e.g.
-`draw_line`), not the MCP-qualified `mcp__cad__draw_line`. `callId` is
-generated by the sidecar per call and must be echoed back unchanged in the
-matching `tool_result`.
+A failure uses `{ "result": { "error": "..." } }`; `data` and `error` are
+mutually exclusive. Invalid arguments are rejected before browser dispatch.
+Unknown call IDs and tool names are protocol errors.
 
-The sidecar waits up to **30 seconds** for the matching `tool_result`. If it
-times out, the pending call is resolved with
-`{ error: "Timed out waiting for the browser to respond to <name> after 30s" }`
-and the agent loop continues as if the browser had reported that error.
+Tool calls are serialized in both sidecar and renderer. Each mutating browser
+handler opens and commits one database transaction, preserving one-call/one-undo
+semantics. A tool failure stops the provider workflow rather than becoming a
+successful model observation.
 
-### `status`
+The canonical catalog contains CAD operations only. It has no filesystem,
+shell, process, network, web, connector, app, plugin, skill, or subagent tool.
 
-```ts
-{ type: 'status'; state: 'thinking' | 'idle' }
-```
+## Provider boundaries
 
-`thinking` is sent the moment a `user_message` starts a turn; `idle` is sent
-once the turn fully completes (after `assistant_done`) or the turn errors.
-This is a coarse "is the agent doing anything right now" signal, distinct
-from the browser's own WebSocket `connectionState` (see
-[`src/agent/bridge.ts`](../src/agent/bridge.ts)), which reflects whether the
-sidecar process is reachable at all.
+Claude:
 
-### `error`
+- installed Claude Code subscription login only;
+- `tools: []`;
+- `allowedTools: ["mcp__cad__*"]`;
+- `permissionMode: "dontAsk"`;
+- no settings sources, skills, plugins, or built-in tools.
 
-```ts
-{ type: 'error'; message: string }
-```
+Codex:
 
-Sent when the Agent SDK's `query()` loop throws (e.g. the underlying Claude
-Code process failed, or the session could not be resumed). Always followed
-by a `status: 'idle'` message.
+- installed Codex CLI ChatGPT login only;
+- `codex app-server --stdio`, experimental dynamic tools;
+- process launch pins the `openai` model provider and official ChatGPT backend;
+- zero-turn `account/read` re-attests ChatGPT authentication before model
+  discovery and every conversation;
+- empty `%LOCALAPPDATA%\EnvCAD\ai-runtime\session-*` working directory;
+- read-only sandbox, `never` approvals, no model fallback;
+- project instructions/context disabled;
+- every configured MCP server explicitly disabled;
+- shell, web, apps, connectors, plugins, skills, remote control, and
+  multi-agent features disabled.
 
-The same message shape is also used for visible transport and protocol
-failures, such as a second `user_message` received while a turn is already
-running or a `tool_result` with an unknown `callId`.
+Codex `thread/started` and `thread/settings/updated` are validated against the
+official model provider, expected model, effort, working directory, approval
+policy, read-only/no-network sandbox, and explicit-request-only multi-agent
+mode. Logout or any alternate authentication update fails closed. Command,
+file-change, web, app, connector, MCP, or subagent events interrupt and fail the
+turn.
 
-## Selection snapshot semantics
+## Preferences
 
-The browser captures `view.selectionSet.ids` at the moment it sends a
-`user_message`, attaching them as `selectionSnapshot`. The sidecar keeps the
-most recent `user_message`'s `selectionSnapshot` on the `BridgeSession` and:
+The renderer does not use `localStorage` for AI selection. A narrow preload API
+loads/saves strict JSON under Electron `userData`:
 
-1. Appends a short context note to the prompt text passed to `query()`, e.g.
-   `Selection attached: 3 entities, ids [h1a, h1b, h1c]` or
-   `Selection attached: none` when `count` is 0.
-2. When the `get_selected_entities` tool is invoked (regardless of what
-   arguments Claude passes to it), the sidecar substitutes the ids from that
-   turn's snapshot before forwarding the call to the browser as a
-   `tool_call`. This is deliberate: it guarantees the browser always answers
-   from the snapshot attached to the message that triggered the turn, not
-   whatever the live selection happens to be by the time the tool call
-   actually runs.
+- selected provider;
+- last selected model per provider;
+- last effort per provider/model;
+- optional benchmark recommendations;
+- schema version.
 
-The system prompt (`sidecar/src/systemPrompt.ts`) instructs Claude to always
-call `get_selected_entities` before acting on "this/these/selected", and to
-ask the user rather than guess when no selection is attached.
-
-## Tool forwarding
-
-Every CAD tool registered on the sidecar's in-process MCP server
-(`createSdkMcpServer` + `tool()`, see `sidecar/src/cadTools.ts`) shares one
-forwarding path:
-
-1. The tool handler calls `BridgeSession.callTool(name, input)`.
-2. That generates a `callId`, sends `{ type: 'tool_call', callId, name, input }`
-   to the browser, and returns a promise that resolves when the matching
-   `tool_result` arrives (or after the 30s timeout).
-3. The resolved `{ data?, error? }` is converted to the MCP `CallToolResult`
-   shape the Agent SDK expects:
-   - `{ error }` → `{ content: [{ type: 'text', text: error }], isError: true }`
-   - `{ data }` → `{ content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] }`
-
-The full list of registered tool names is `CAD_TOOL_NAMES` in
-`src/agent/protocol.ts`: `get_selected_entities`, `get_drawing_context`,
-`move_entities`, `copy_entities`, `rotate_entities`, `scale_entities`,
-`delete_entities`, `set_entity_layer`, `change_text`, `calculate_area`,
-`calculate_length`, `draw_line`, `draw_polyline`, `draw_rectangle`,
-`draw_circle`, `draw_arc`, `draw_text`, `add_linear_dimension`,
-`add_radius_dimension`, `add_leader`, `add_mtext`, `draw_hatch`, `create_layer`,
-`set_current_layer`, `zoom_extents`, `get_sheet_setup`,
-`set_sheet_definition`, `set_title_block_fields`.
-
-The browser (`src/agent/handlers.ts`) implements every registered tool.
-Pure rotation, bounding-box, area, and length math lives in
-`src/agent/geometry.ts`, together with linear-dimension offsets, angles,
-measurements, and arrowhead construction; bulge extraction from `AcDbPolyline` lives in
-`src/agent/polyline.ts`.
-
-### One tool call, one undo step
-
-Every database-modifying handler wraps all of its mutations in a single
-`acapRunDatabaseEdit(db, label, fn)`, which delegates to
-`AcDbDatabase.runDatabaseEdit` → `transactionManager.runUndoable`. That opens
-exactly one undo mark, so a multi-entity move, a copy that clones and appends
-several entities, and a layer change that also creates the layer each collapse
-into one Ctrl+Z. `runDatabaseEdit` is re-entrant (a nested call joins the
-outer mark), so handlers can call viewer services that wrap their own edits
-without splitting the group — `set_current_layer` relies on this.
-
-Two things protect that invariant:
-
-- `AgentBridge` runs tool calls through a serial queue. Claude may emit
-  several tool calls in one assistant turn; without the queue an async handler
-  could interleave with another handler's open transaction and merge two
-  operations into one undo step.
-- The toolbar's `canUndo`/`canRedo` are refreshed from the viewer's
-  `undo-stack-changed` event (`src/viewer/useCadViewer.ts`), which
-  `acapRunDatabaseEdit` emits, so agent edits enable Undo just like
-  toolbar-driven ones.
-
-Sheet tools (`get_sheet_setup`, `set_sheet_definition`,
-`set_title_block_fields`) update the reactive sheet store, which lives outside
-the drawing database and is therefore **not** covered by undo. The tool
-descriptions and the system prompt both say so.
-
-## Session and credentials
-
-The sidecar calls the Agent SDK's `query()` with `permissionMode: 'dontAsk'`
-and `tools: []` (which removes every built-in tool — Bash, Read, Write, Edit,
-Glob, Grep, WebSearch, WebFetch — from Claude's context entirely), plus
-`allowedTools: ['mcp__cad__*']` so the CAD tools run without any interactive
-permission prompt. `model` is pinned to `'sonnet'`.
-
-One `BridgeSession` keeps a single Agent SDK session id across turns
-(captured from the `system`/`init` message's `session_id` field) and passes
-it as `resume` on every subsequent `query()` call, so the conversation has
-memory. A `reset` client message clears the stored session id, so the next
-turn starts a fresh Agent SDK session.
-
-**No API key is ever set, logged, or used.** Startup fails closed when a
-non-empty `ANTHROPIC_API_KEY` is present, without reading or printing its
-value. For every query, the sidecar also verifies that the Agent SDK
-`system/init` message reports either `apiKeySource: 'oauth'` or the runtime
-`'none'` value used by Claude Code 2.1.220 when no API-key source exists.
-Actual key sources (`user`, `project`, `org`, or `temporary`) end the turn
-before CAD tools are accepted. The desktop launcher resolves an installed
-`claude.exe`, requires the exact Agent-SDK-compatible version, verifies
-`claude auth status --json`, and supplies that canonical executable path to
-the SDK. The existing Claude Code subscription login is therefore used instead
-of an API key or a separately shipped CLI.
-
-## Development acceptance hook
-
-In development builds, `src/agent/testHarness.ts` installs:
-
-```ts
-window.__agentTest(text: string): Promise<{
-  assistantText: string
-  toolCalls: Array<{
-    callId: string
-    name: string
-    input: unknown
-    result?: { data?: unknown; error?: string }
-  }>
-}>
-```
-
-It captures the selection and sheet snapshots, sends one real bridge message,
-correlates each browser executor result with its `tool_call`, and resolves only
-after `assistant_done`. It rejects on sidecar, protocol, authentication, or
-timeout errors. This hook is intentionally nonvisual; P5c will add the
-user-facing chat interface later.
+Writes use a temporary file and atomic replacement. Credentials and secret-like
+strings are rejected. Corrupt files recover to the existing-user Claude Code
+default without automatically sending a message.
