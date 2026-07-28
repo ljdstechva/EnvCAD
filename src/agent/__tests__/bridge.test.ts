@@ -200,6 +200,93 @@ describe('AgentBridge', () => {
     bridge.disconnect()
   })
 
+  it('logs only bounded transport evidence for visual results', async () => {
+    const base64 =
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZQmcAAAAASUVORK5CYII='
+    const bridge = new AgentBridge()
+    bridge.registerHandler('inspect_sheet_preview', () => ({
+      data: {
+        kind: 'sheet-preview',
+        privateDrawingText: 'PRIVATE-DRAWING-SENTINEL',
+        forbiddenPath: 'C:\\private\\drawing.dxf',
+        secret: 'SECRET-SENTINEL'
+      },
+      image: {
+        mimeType: 'image/png',
+        base64,
+        byteLength: 68,
+        width: 1,
+        height: 1,
+        aspectRatio: 1,
+        sha256:
+          '98884e721ec2f605f3788f2bc39a61de305ff4f4fcaf26b6f4eabeebcd6c0fb4',
+        captureId: 'sheet-1-full-0000000000000000',
+        renderRevision: 1
+      }
+    }))
+
+    bridge.connect()
+    await vi.waitFor(() => expect(bridge.state.connectionState).toBe('online'))
+    const socket = FakeBrowserWebSocket.instances[0]
+    socket.receive({
+      type: 'tool_call',
+      callId: 'visual-1',
+      name: 'inspect_sheet_preview',
+      input: { view: 'full' }
+    })
+    await vi.waitFor(() => expect(socket.sent).toHaveLength(1))
+
+    const logText = JSON.stringify(vi.mocked(console.debug).mock.calls)
+    expect(logText).not.toContain(base64)
+    expect(logText).not.toContain('PRIVATE-DRAWING-SENTINEL')
+    expect(logText).not.toContain('C:\\\\private\\\\drawing.dxf')
+    expect(logText).not.toContain('SECRET-SENTINEL')
+    expect(logText).toContain('payloadBytes')
+    bridge.disconnect()
+  })
+
+  it('rejects a spoofed image digest before the renderer sends the result', async () => {
+    const base64 =
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZQmcAAAAASUVORK5CYII='
+    const bridge = new AgentBridge()
+    bridge.registerHandler('inspect_sheet_preview', () => ({
+      data: { view: 'full' },
+      image: {
+        mimeType: 'image/png',
+        base64,
+        byteLength: 68,
+        width: 1,
+        height: 1,
+        aspectRatio: 1,
+        sha256: '0'.repeat(64),
+        captureId: 'sheet-1-full-spoofed-digest',
+        renderRevision: 1
+      }
+    }))
+
+    bridge.connect()
+    await vi.waitFor(() => expect(bridge.state.connectionState).toBe('online'))
+    const socket = FakeBrowserWebSocket.instances[0]
+    socket.receive({
+      type: 'tool_call',
+      callId: 'visual-spoofed',
+      name: 'inspect_sheet_preview',
+      input: { view: 'full' }
+    })
+    await vi.waitFor(() => expect(socket.sent).toHaveLength(1))
+
+    expect(JSON.parse(socket.sent[0])).toEqual({
+      type: 'tool_result',
+      callId: 'visual-spoofed',
+      result: {
+        error:
+          'Browser rejected the inspect_sheet_preview result: ' +
+          'tool_result.result.image.sha256 does not match the decoded image bytes'
+      }
+    })
+    bridge.disconnect()
+  })
+
   it('uses the browser-development port and protocols by default', async () => {
     const bridge = new AgentBridge()
     bridge.connect()

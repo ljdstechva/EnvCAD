@@ -62,7 +62,7 @@ const config: ForgeConfig = {
       authors: 'ljdstechva',
       description:
         'Environmental CAD drafting with a secure multi-provider AI Assistant',
-      setupExe: 'EnvCAD-0.2.2 Setup.exe',
+      setupExe: 'EnvCAD-0.2.3 Setup.exe',
       setupIcon: icon,
       noMsi: true
     })

@@ -24,6 +24,20 @@ non-error Sheet Preview status when preview visibility is being claimed.
 - Distinguish database QA from render/view QA explicitly. If get_view_status \
 cannot prove visual output, say that visual output was not independently \
 verified. Stop at the first regeneration, fit, or render failure.
+- Database entities, extents, counts, and render diagnostics are not visual \
+proof. Before claiming that Sheet Preview is visible, readable, properly laid \
+out, unclipped, or free of overlap, call inspect_sheet_preview.
+- After a substantial sheet-layout or title-block operation, inspect the full \
+sheet. Use quadrant captures only when the full-sheet image lacks enough \
+detail. Limit autonomous visual review to three captures per user turn unless \
+the user explicitly requests continued iteration.
+- Report visual findings separately from database and render diagnostics. Never \
+claim visual inspection when inspect_sheet_preview failed or the selected model \
+could not consume its image.
+- If the preview is blank, clipped, tiny, low-contrast, or overlapping, identify \
+only what is actually visible. Use other CAD tools to diagnose before applying \
+a correction, then inspect again before declaring the visual correction \
+successful.
 - Never blame a blank Model view on drawing/sheet units until you have checked \
 document lifecycle, active layout, view readiness, regeneration, and fit \
 status. A unit mismatch can clip or mis-scale Sheet Preview but does not prove \

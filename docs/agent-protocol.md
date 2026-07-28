@@ -1,8 +1,16 @@
 # EnvCAD AI Assistant protocol
 
-This document describes the v0.2.2 renderer-to-sidecar contract. The protocol is
+This document describes the v0.2.3 renderer-to-sidecar contract. The protocol is
 provider-neutral: Claude Code and OpenAI Codex share configuration, lifecycle,
 streaming, metrics, and CAD tool messages.
+
+`inspect_sheet_preview` is the only CAD tool permitted to return an image. Its
+successful result contains bounded text metadata and one validated PNG or WebP
+payload from the same final SVG used by the Sheet Preview UI. Claude receives
+that payload as an MCP image content block; Codex receives it as a dynamic-tool
+`inputImage` data URL. The renderer and sidecar independently reject malformed,
+oversized, stale, non-tool-associated, resource-bearing, or digest-spoofed
+image results.
 
 ## Transport and authentication
 
@@ -266,6 +274,24 @@ successful model observation.
 The canonical catalog contains CAD operations only. It has no filesystem,
 shell, process, network, web, connector, app, plugin, skill, or subagent tool.
 
+### Sheet Preview image integrity
+
+`inspect_sheet_preview` may return exactly one `image` object and no other tool
+may return one. The payload is canonical Base64 PNG or WebP and is limited to
+1,179,648 decoded bytes. The protocol accepts dimensions up to 4,096 pixels per
+side and 16,777,216 total pixels; EnvCAD's rasterizer targets a 1,400-pixel
+longest side and will not shrink below 700 pixels merely to fit the byte limit.
+Declared byte length, MIME header, dimensions, aspect ratio, capture ID, render
+revision, and lowercase SHA-256 are mandatory.
+
+The renderer structurally validates the result and then recomputes SHA-256 with
+Web Crypto immediately before WebSocket send. The sidecar repeats structural
+validation and independently recomputes SHA-256 from the decoded bytes before
+the provider adapter can observe the image. Either mismatch becomes a tool
+failure. The image is generated in memory from the singleton Sheet Preview
+service's final SVG; no temporary image file or arbitrary screen capture is
+used.
+
 ## Provider boundaries
 
 Claude:
@@ -274,7 +300,14 @@ Claude:
 - `tools: []`;
 - `allowedTools: ["mcp__cad__*"]`;
 - `permissionMode: "dontAsk"`;
-- no settings sources, skills, plugins, or built-in tools.
+- no settings sources, skills, plugins, or built-in tools;
+- one streaming-input SDK query per in-app conversation;
+- `persistSession: false`, with no disk-backed `resume`.
+
+Claude preview payloads therefore remain in the live SDK stream and are not
+written to `~/.claude/projects`. On upgrade, EnvCAD removes only legacy Claude
+project directories whose key exactly matches an EnvCAD-owned
+`%LOCALAPPDATA%\EnvCAD\ai-runtime\session-*` directory.
 
 Codex:
 

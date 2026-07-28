@@ -32,6 +32,11 @@ import {
 } from '@mlightcad/data-model'
 import { sheetStore } from '../sheet/sheetStore'
 import { sheetUnitMismatch } from '../sheet/sheetStore'
+import { sheetPreviewService } from '../sheet/previewService'
+import {
+  SHEET_PREVIEW_VIEWS,
+  type SheetPreviewView
+} from '../sheet/rasterizeSheet'
 import { listTemplates } from '../sheet/templates/registry'
 import { PAPER_SIZES, type PaperSizeId, type SheetDefinition } from '../sheet/types'
 import { agentBridge, type ToolHandler } from './bridge'
@@ -1350,6 +1355,32 @@ async function getViewStatus(): Promise<ToolResult> {
   }
 }
 
+async function inspectSheetPreview(rawInput: unknown): Promise<ToolResult> {
+  requireEditableCadSession()
+  const input = asRecord(rawInput, 'inspect_sheet_preview')
+  if (Object.keys(input).some((key) => key !== 'view')) {
+    throw new Error('inspect_sheet_preview input contains unsupported fields')
+  }
+  const view = input.view ?? 'full'
+  if (
+    typeof view !== 'string' ||
+    !SHEET_PREVIEW_VIEWS.includes(view as SheetPreviewView)
+  ) {
+    throw new Error(
+      `view must be one of: ${SHEET_PREVIEW_VIEWS.join(', ')}`
+    )
+  }
+  const regeneration = await awaitCadSessionRegeneration()
+  if (regeneration && !regeneration.completed) {
+    throw new Error(
+      regeneration.error
+        ? `CAD regeneration failed: ${regeneration.error}`
+        : 'CAD regeneration is incomplete.'
+    )
+  }
+  return sheetPreviewService.capture(view as SheetPreviewView)
+}
+
 function getCanvasDimensions(): { width: number; height: number } {
   if (
     cadSessionState.status !== 'active' ||
@@ -1836,6 +1867,7 @@ const REAL_HANDLERS: Record<(typeof CAD_TOOL_NAMES)[number], ToolHandler> = {
   get_selected_entities: (input) => getSelectedEntities(input),
   get_drawing_context: () => getDrawingContext(),
   get_view_status: () => getViewStatus(),
+  inspect_sheet_preview: (input) => inspectSheetPreview(input),
   move_entities: (input) => moveEntities(input),
   copy_entities: (input) => copyEntities(input),
   rotate_entities: (input) => rotateEntities(input),

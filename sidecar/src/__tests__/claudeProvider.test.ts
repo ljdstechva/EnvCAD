@@ -1,4 +1,8 @@
-import type { ModelInfo, Query } from '@anthropic-ai/claude-agent-sdk'
+import type {
+  ModelInfo,
+  Query,
+  SDKUserMessage
+} from '@anthropic-ai/claude-agent-sdk'
 import { describe, expect, it, vi } from 'vitest'
 import {
   ClaudeProvider,
@@ -171,7 +175,21 @@ describe('ClaudeProvider', () => {
       { type: 'text_delta', text: 'Created.' },
       { type: 'token_usage', inputTokens: 10, outputTokens: 4 }
     ])
-    expect(queryFactory.mock.calls[1][0].prompt).toBe(longPrompt)
+    const promptStream = queryFactory.mock.calls[1][0]
+      .prompt as AsyncIterable<SDKUserMessage>
+    const promptMessage = await promptStream[Symbol.asyncIterator]().next()
+    expect(promptMessage).toEqual({
+      done: false,
+      value: {
+        type: 'user',
+        session_id: '',
+        message: {
+          role: 'user',
+          content: [{ type: 'text', text: longPrompt }]
+        },
+        parent_tool_use_id: null
+      }
+    })
     const turnOptions = queryFactory.mock.calls[1][0].options
     expect(turnOptions).toMatchObject({
       model: 'default',
@@ -182,12 +200,100 @@ describe('ClaudeProvider', () => {
       settingSources: [],
       skills: [],
       plugins: [],
-      strictMcpConfig: true
+      strictMcpConfig: true,
+      persistSession: false
     })
     expect(turnOptions.env).not.toHaveProperty('ANTHROPIC_API_KEY')
     expect(turnOptions).not.toHaveProperty('Bash')
     await conversation.close()
     expect(turnQuery.close).toHaveBeenCalled()
+  })
+
+  it('keeps one non-persistent streaming query for multiple turns without resume', async () => {
+    const capturedPrompts: SDKUserMessage[] = []
+    let turnQuery: Query | undefined
+    const queryFactory = vi
+      .fn()
+      .mockReturnValueOnce(fakeQuery([], models))
+      .mockImplementationOnce(
+        (input: {
+          prompt: AsyncIterable<SDKUserMessage>
+          options: Record<string, unknown>
+        }) => {
+          const messages = (async function* () {
+            let turn = 0
+            for await (const prompt of input.prompt) {
+              capturedPrompts.push(prompt)
+              if (turn === 0) {
+                yield {
+                  type: 'system',
+                  subtype: 'init',
+                  apiKeySource: 'oauth',
+                  session_id: 'ephemeral-session',
+                  model: 'claude-opus-test',
+                  tools: ['mcp__cad__inspect_sheet_preview']
+                }
+              }
+              yield {
+                type: 'assistant',
+                message: {
+                  content: [{ type: 'text', text: `Turn ${turn + 1}.` }]
+                }
+              }
+              yield {
+                type: 'result',
+                subtype: 'success',
+                session_id: 'ephemeral-session',
+                usage: { input_tokens: 5 + turn, output_tokens: 2 }
+              }
+              turn += 1
+            }
+          })()
+          turnQuery = Object.assign(messages, {
+            supportedModels: vi.fn(async () => []),
+            interrupt: vi.fn(async () => undefined),
+            close: vi.fn()
+          }) as unknown as Query
+          return turnQuery
+        }
+      )
+    const provider = new ClaudeProvider(baseOptions(queryFactory))
+    await provider.discover()
+    const conversation = await provider.createConversation(
+      { provider: 'claude-code', model: 'default', effort: 'high' },
+      {
+        callTool: vi.fn(async () => ({ data: null })),
+        getSelectionSnapshot: () => undefined
+      }
+    )
+
+    await expect(
+      collect(conversation.runTurn({ prompt: 'First exact prompt.' }))
+    ).resolves.toEqual([
+      { type: 'resolved_model', model: 'claude-opus-test' },
+      { type: 'text_delta', text: 'Turn 1.' },
+      { type: 'token_usage', inputTokens: 5, outputTokens: 2 }
+    ])
+    await expect(
+      collect(conversation.runTurn({ prompt: 'Second exact prompt.' }))
+    ).resolves.toEqual([
+      { type: 'text_delta', text: 'Turn 2.' },
+      { type: 'token_usage', inputTokens: 6, outputTokens: 2 }
+    ])
+
+    expect(queryFactory).toHaveBeenCalledTimes(2)
+    expect(queryFactory.mock.calls[1][0].options).toMatchObject({
+      persistSession: false
+    })
+    expect(queryFactory.mock.calls[1][0].options).not.toHaveProperty('resume')
+    expect(
+      capturedPrompts.map((message) => message.message.content)
+    ).toEqual([
+      [{ type: 'text', text: 'First exact prompt.' }],
+      [{ type: 'text', text: 'Second exact prompt.' }]
+    ])
+    await conversation.close()
+    expect(turnQuery?.close).toHaveBeenCalledOnce()
   })
 
   it('rejects API-key environments before discovery and redacts no secret into status', async () => {

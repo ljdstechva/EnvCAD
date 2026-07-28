@@ -7,10 +7,12 @@ import {
   type SidecarConnectionConfig
 } from '../../desktop/runtimeProtocol'
 import { pushToast } from '../toast/toastStore'
+import { verifyToolImageSha256 } from './imageIntegrity'
 import {
   MAX_WEBSOCKET_PAYLOAD_BYTES,
   parseClientMessage,
   parseServerMessage,
+  validateToolResultForTool,
   type AgentConfiguration,
   type ClientMessage,
   type ProviderCapability,
@@ -772,6 +774,20 @@ export class AgentBridge {
     } catch (error) {
       result = {
         error: error instanceof Error ? error.message : String(error)
+      }
+    }
+    const validated = validateToolResultForTool(name, result)
+    if (!validated.ok) {
+      result = {
+        error: `Browser rejected the ${name} result: ${validated.error}`
+      }
+    } else {
+      result = validated.value
+      const integrity = await verifyToolImageSha256(result)
+      if (!integrity.ok) {
+        result = {
+          error: `Browser rejected the ${name} result: ${integrity.error}`
+        }
       }
     }
     this.state.pendingToolCalls = this.state.pendingToolCalls.filter(

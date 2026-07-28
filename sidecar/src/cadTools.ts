@@ -7,17 +7,48 @@ import {
 
 interface ForwardedCallToolResult {
   [key: string]: unknown
-  content: Array<{ type: 'text'; text: string }>
+  content: Array<
+    | { type: 'text'; text: string }
+    | { type: 'image'; data: string; mimeType: 'image/png' | 'image/webp' }
+  >
   isError?: boolean
 }
 
-function toCallToolResult(result: ToolResult): ForwardedCallToolResult {
+const MAX_VISUAL_METADATA_CHARACTERS = 32_000
+
+export function toClaudeCallToolResult(
+  result: ToolResult
+): ForwardedCallToolResult {
   if (result.error) {
     return { content: [{ type: 'text', text: result.error }], isError: true }
   }
   const text =
     typeof result.data === 'string' ? result.data : JSON.stringify(result.data ?? null, null, 2)
-  return { content: [{ type: 'text', text }] }
+  if (!result.image) return { content: [{ type: 'text', text }] }
+  if (
+    text.length > MAX_VISUAL_METADATA_CHARACTERS ||
+    text.includes(result.image.base64)
+  ) {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: 'Sheet Preview metadata was unsafe or too large to send.'
+        }
+      ],
+      isError: true
+    }
+  }
+  return {
+    content: [
+      { type: 'text', text },
+      {
+        type: 'image',
+        data: result.image.base64,
+        mimeType: result.image.mimeType
+      }
+    ]
+  }
 }
 
 /**
@@ -26,7 +57,8 @@ function toCallToolResult(result: ToolResult): ForwardedCallToolResult {
  */
 export function createCadMcpServer(
   bridge: CadToolBridge,
-  onToolFailure?: (error: Error) => void
+  onToolFailure?: (error: Error) => void,
+  onVisualResult?: (result: ToolResult) => void | Promise<void>
 ) {
   const server = createSdkMcpServer({
     name: 'cad',
@@ -47,7 +79,11 @@ export function createCadMcpServer(
             new Error(`Claude CAD tool ${spec.name} failed: ${result.error}`)
           )
         }
-        return toCallToolResult(result)
+        const forwarded = toClaudeCallToolResult(result)
+        if (result.image && !forwarded.isError) {
+          await onVisualResult?.(result)
+        }
+        return forwarded
       }
     )
   }

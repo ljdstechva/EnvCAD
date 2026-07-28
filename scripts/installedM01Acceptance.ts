@@ -215,9 +215,12 @@ async function openDrawing(page: Page, filePath: string): Promise<void> {
     undefined,
     { timeout: 60_000 }
   )
-  const toast = page.locator('.toast[role="alert"]')
-  if (await toast.isVisible()) {
-    throw new Error(`Opening M-01 reported: ${(await toast.textContent())?.trim()}`)
+  const drawingName = path.basename(filePath)
+  const openError = (
+    await page.locator('.toast[role="alert"] .message').allTextContents()
+  ).find((message) => message.trim().startsWith(`Couldn't open ${drawingName}`))
+  if (openError) {
+    throw new Error(`Opening M-01 reported: ${openError.trim()}`)
   }
 }
 

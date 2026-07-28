@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { WebSocket } from 'ws'
 import type {
   AgentConfiguration,
@@ -10,7 +10,10 @@ import type {
   ToolResult,
   TurnMetrics
 } from '../../src/agent/protocol'
-import { parseClientMessage } from '../../src/agent/protocol'
+import {
+  parseClientMessage,
+  validateToolResultForTool
+} from '../../src/agent/protocol'
 import { getCadToolSpec, type CadToolBridge } from './cadToolSpecs'
 import { redactProviderDiagnostic } from './providers/environment'
 import { ProviderManager } from './providers/providerManager'
@@ -451,7 +454,27 @@ export class BridgeSession {
     }
     clearTimeout(pending.timer)
     this.pendingCalls.delete(callId)
-    pending.resolve(result)
+    const validated = validateToolResultForTool(pending.name, result)
+    if (!validated.ok) {
+      const message = `invalid ${pending.name} result: ${validated.error}`
+      this.reportProtocolError(message)
+      pending.resolve({ error: `Browser returned an invalid ${pending.name} result.` })
+      return
+    }
+    if (
+      validated.value.image &&
+      createHash('sha256')
+        .update(Buffer.from(validated.value.image.base64, 'base64'))
+        .digest('hex') !== validated.value.image.sha256
+    ) {
+      const message =
+        `invalid ${pending.name} result: ` +
+        'tool_result.result.image.sha256 does not match the decoded image bytes'
+      this.reportProtocolError(message)
+      pending.resolve({ error: `Browser returned an invalid ${pending.name} result.` })
+      return
+    }
+    pending.resolve(validated.value)
   }
 
   private providerCapability(configuration: AgentConfiguration): ProviderCapability | undefined {

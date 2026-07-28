@@ -1,51 +1,46 @@
-import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { onBeforeUnmount, onMounted, toRefs, watch } from 'vue'
 import { AcApDocManager } from '@mlightcad/cad-simple-viewer'
 import type { AcDbDatabase } from '@mlightcad/data-model'
 import {
   cadSessionState,
-  recordSheetPreview,
   requireEditableCadSession
 } from '../../cad/session'
-import { sheetRenderer } from '../../sheet/renderSheet'
+import { sheetPreviewService } from '../../sheet/previewService'
 import { sheetStore } from '../../sheet/sheetStore'
-import type {
-  SheetRenderDiagnostics,
-  SheetRenderResult
-} from '../../sheet/types'
 
 const RENDER_DEBOUNCE_MS = 500
 const MANAGER_POLL_MS = 300
 
 export function useSheetRender() {
-  const svg = ref('')
-  const warnings = ref<string[]>([])
-  const rendering = ref(false)
-  const renderError = ref<string | null>(null)
-  const diagnostics = ref<SheetRenderDiagnostics | null>(null)
+  const {
+    svg,
+    svgSha256,
+    warnings,
+    rendering,
+    renderError,
+    diagnostics,
+    renderRevision
+  } = toRefs(sheetPreviewService.state)
 
   let debounceHandle: ReturnType<typeof setTimeout> | null = null
   let pollHandle: ReturnType<typeof setInterval> | null = null
   let boundDatabase: AcDbDatabase | null = null
-  let renderToken = 0
   let managerBound = false
+  let pendingForce = false
 
-  const onDbChanged = () => scheduleRender()
+  const onDbChanged = () => {
+    sheetPreviewService.invalidate()
+    scheduleRender()
+  }
   const onDocumentActivated = () => {
     bindDatabaseEvents(getCurrentDatabase())
+    sheetPreviewService.invalidate()
     scheduleRender()
   }
 
   function getCurrentDatabase(): AcDbDatabase | null {
     try {
       return requireEditableCadSession().database
-    } catch {
-      return null
-    }
-  }
-
-  function getCurrentDocument(): unknown {
-    try {
-      return requireEditableCadSession().manager.curDocument
     } catch {
       return null
     }
@@ -87,90 +82,40 @@ export function useSheetRender() {
     return true
   }
 
-  function scheduleRender() {
+  function scheduleRender(force = false) {
+    pendingForce ||= force
     if (debounceHandle) clearTimeout(debounceHandle)
     debounceHandle = setTimeout(() => {
       debounceHandle = null
-      void doRender()
+      const shouldForce = pendingForce
+      pendingForce = false
+      void doRender(shouldForce)
     }, RENDER_DEBOUNCE_MS)
   }
 
-  async function doRender() {
-    const token = ++renderToken
-    rendering.value = true
-    renderError.value = null
+  async function doRender(force = false) {
     if (
       cadSessionState.status !== 'active' ||
       !cadSessionState.editable ||
       !cadSessionState.viewReady
     ) {
-      svg.value = ''
-      warnings.value = []
-      diagnostics.value = null
-      rendering.value = false
-      recordSheetPreview({
-        status: 'unavailable',
-        entityCount: 0,
-        visibleEntityCount: 0,
-        drawableElementCount: 0,
-        warnings: [],
-        unitMismatch: false,
-        clipping: false
-      })
+      sheetPreviewService.clearVisiblePreview()
       return
     }
-    recordSheetPreview({
-      status: 'rendering',
-      entityCount: cadSessionState.entityCount,
-      visibleEntityCount: cadSessionState.visibleEntityCount,
-      drawableElementCount: 0,
-      warnings: [],
-      unitMismatch: false,
-      clipping: false
-    })
     try {
-      const doc = getCurrentDocument()
-      const result: SheetRenderResult = await sheetRenderer.render(
-        doc,
-        sheetStore.current
-      )
-      if (token !== renderToken) return
-      svg.value = result.svg
-      warnings.value = result.warnings
-      diagnostics.value = result.diagnostics
-      recordSheetPreview({
-        status: result.warnings.length > 0 ? 'warning' : 'ready',
-        entityCount: result.diagnostics.entityCount,
-        visibleEntityCount: result.diagnostics.visibleEntityCount,
-        drawableElementCount: result.diagnostics.drawableElementCount,
-        warnings: result.warnings,
-        unitMismatch: result.diagnostics.unitMismatch,
-        clipping: result.diagnostics.clipping
-      })
-    } catch (err) {
-      if (token !== renderToken) return
-      renderError.value = err instanceof Error ? err.message : String(err)
-      diagnostics.value = null
-      recordSheetPreview({
-        status: 'error',
-        entityCount: cadSessionState.entityCount,
-        visibleEntityCount: cadSessionState.visibleEntityCount,
-        drawableElementCount: 0,
-        warnings: [],
-        unitMismatch:
-          cadSessionState.databaseUnit !== 'unknown' &&
-          cadSessionState.databaseUnit !== sheetStore.current.drawingUnit,
-        clipping: false,
-        error: renderError.value
-      })
-    } finally {
-      if (token === renderToken) rendering.value = false
+      await sheetPreviewService.render(force)
+    } catch {
+      // The shared service records the bounded UI error and preview status.
     }
   }
 
-  const stopSheetWatch = watch(() => sheetStore.current, scheduleRender, {
-    deep: true
-  })
+  const stopSheetWatch = watch(
+    () => sheetStore.current,
+    () => scheduleRender(),
+    {
+      deep: true
+    }
+  )
   const stopSessionWatch = watch(
     () => [
       cadSessionState.status,
@@ -222,6 +167,8 @@ export function useSheetRender() {
     rendering,
     renderError,
     diagnostics,
-    refresh: scheduleRender
+    svgSha256,
+    renderRevision,
+    refresh: () => scheduleRender(true)
   }
 }

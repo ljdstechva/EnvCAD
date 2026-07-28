@@ -2,9 +2,11 @@ import {
   query,
   type ModelInfo,
   type Query,
+  type SDKMessage,
   type SDKRateLimitInfo,
   type SDKResultError,
-  type SDKSystemMessage
+  type SDKSystemMessage,
+  type SDKUserMessage
 } from '@anthropic-ai/claude-agent-sdk'
 import {
   discoverClaudeExecutable,
@@ -20,7 +22,10 @@ import { createCadMcpServer } from '../cadTools'
 import { CAD_TOOL_NAMES, type CadToolBridge } from '../cadToolSpecs'
 import { createEffortCapabilities } from '../providerCatalog'
 import { SYSTEM_PROMPT } from '../systemPrompt'
-import { recordProviderPromptEvidence } from './acceptanceEvidence'
+import {
+  recordProviderPromptEvidence,
+  recordProviderVisualEvidence
+} from './acceptanceEvidence'
 import {
   presentBlockedEnvironmentNames,
   redactProviderDiagnostic,
@@ -53,6 +58,44 @@ export interface ClaudeProviderOptions {
   authenticate?: typeof isClaudeAuthenticated
   logger?: ProviderLogger
   discoveryTimeoutMs?: number
+}
+
+class AsyncMessageQueue<T> implements AsyncIterable<T> {
+  private readonly values: T[] = []
+  private readonly waiters: Array<(result: IteratorResult<T>) => void> = []
+  private ended = false
+
+  push(value: T): void {
+    if (this.ended) throw new Error('Claude prompt stream is closed.')
+    const waiter = this.waiters.shift()
+    if (waiter) waiter({ done: false, value })
+    else this.values.push(value)
+  }
+
+  close(): void {
+    if (this.ended) return
+    this.ended = true
+    for (const waiter of this.waiters.splice(0)) {
+      waiter({ done: true, value: undefined })
+    }
+  }
+
+  [Symbol.asyncIterator](): AsyncIterator<T> {
+    return {
+      next: () => {
+        const value = this.values.shift()
+        if (value !== undefined) {
+          return Promise.resolve({ done: false, value })
+        }
+        if (this.ended) {
+          return Promise.resolve({ done: true, value: undefined })
+        }
+        return new Promise<IteratorResult<T>>((resolve) => {
+          this.waiters.push(resolve)
+        })
+      }
+    }
+  }
 }
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
@@ -139,8 +182,11 @@ function mapModels(models: readonly ModelInfo[]): ModelCapability[] {
 }
 
 class ClaudeConversation implements AgentConversation {
-  private sessionId: string | undefined
   private currentQuery: Query | undefined
+  private currentMessages: AsyncIterator<SDKMessage> | undefined
+  private promptStream: AsyncMessageQueue<SDKUserMessage> | undefined
+  private activeToolFailure: Error | undefined
+  private turnRunning = false
   private closed = false
   private generation = 0
 
@@ -156,47 +202,41 @@ class ClaudeConversation implements AgentConversation {
 
   async *runTurn(input: { prompt: string }): AsyncIterable<AgentEvent> {
     if (this.closed) throw new Error('Claude conversation is closed.')
-    if (this.currentQuery) throw new Error('A Claude turn is already running.')
+    if (this.turnRunning) throw new Error('A Claude turn is already running.')
     const generation = this.generation
-    let activeQuery: Query | undefined
+    this.turnRunning = true
     let rateLimitError: string | undefined
-    let toolFailure: Error | undefined
+    this.activeToolFailure = undefined
+    let activeQuery: Query | undefined
     try {
       await recordProviderPromptEvidence(
         'claude-code',
         input.prompt,
         this.environment
       )
-      activeQuery = this.queryFactory({
-        prompt: input.prompt,
-        options: {
-          model: this.configuration.model,
-          ...(this.configuration.effort
-            ? { effort: this.configuration.effort as 'low' | 'medium' | 'high' | 'xhigh' | 'max' }
-            : {}),
-          systemPrompt: SYSTEM_PROMPT,
-          mcpServers: {
-            cad: createCadMcpServer(this.tools, (error) => {
-              toolFailure = error
-              void activeQuery?.interrupt().catch(() => {})
-            })
-          },
-          allowedTools: ['mcp__cad__*'],
-          tools: [],
-          permissionMode: 'dontAsk',
-          pathToClaudeCodeExecutable: this.executablePath,
-          cwd: this.runtimeDirectory,
-          env: sanitizedProviderEnvironment(this.environment),
-          settingSources: [],
-          skills: [],
-          plugins: [],
-          strictMcpConfig: true,
-          ...(this.sessionId ? { resume: this.sessionId } : {})
-        }
+      activeQuery = this.ensureQuery()
+      const messages = this.currentMessages
+      const prompts = this.promptStream
+      if (!messages || !prompts) {
+        throw new Error('Claude streaming query was not initialized.')
+      }
+      prompts.push({
+        type: 'user',
+        session_id: '',
+        message: {
+          role: 'user',
+          content: [{ type: 'text', text: input.prompt }]
+        },
+        parent_tool_use_id: null
       })
-      this.currentQuery = activeQuery
 
-      for await (const message of activeQuery) {
+      while (true) {
+        const next = await messages.next()
+        if (next.done) {
+          if (this.closed || generation !== this.generation) return
+          throw new Error('Claude query ended before returning a turn result.')
+        }
+        const message = next.value
         if (message.type === 'system' && message.subtype === 'init') {
           const authSource = assertClaudeSubscriptionAuthentication(message)
           const forbidden = message.tools.filter(
@@ -212,9 +252,6 @@ class ClaudeConversation implements AgentConversation {
               ? '[sidecar] Claude authentication source verified: Claude Code login.'
               : '[sidecar] Claude authentication source verified: no API key; Claude Code login.'
           )
-          if (message.session_id && generation === this.generation) {
-            this.sessionId = message.session_id
-          }
           if (message.model) yield { type: 'resolved_model', model: message.model }
         } else if (message.type === 'assistant') {
           if (message.error) {
@@ -242,9 +279,6 @@ class ClaudeConversation implements AgentConversation {
         ) {
           rateLimitError = formatRateLimitError(message.rate_limit_info)
         } else if (message.type === 'result') {
-          if (message.session_id && generation === this.generation) {
-            this.sessionId = message.session_id
-          }
           if (message.subtype !== 'success') {
             const resultError = formatResultError(message)
             throw new Error(rateLimitError ? `${rateLimitError}; ${resultError}` : resultError)
@@ -263,39 +297,51 @@ class ClaudeConversation implements AgentConversation {
                 : {})
             }
           }
+          if (this.activeToolFailure) throw this.activeToolFailure
+          if (rateLimitError) throw new Error(rateLimitError)
+          break
         }
       }
-      if (toolFailure) throw toolFailure
-      if (rateLimitError) throw new Error(rateLimitError)
     } catch (error) {
       // Interrupting the SDK is how EnvCAD stops generation after a browser
       // CAD-tool error. Some SDK versions surface that interrupt before the
       // async iterator ends, so preserve the authoritative tool failure.
+      if (this.closed || generation !== this.generation) return
+      const toolFailure = this.activeToolFailure
+      if (activeQuery) this.discardQuery(activeQuery)
       if (toolFailure) throw toolFailure
       throw error
     } finally {
-      activeQuery?.close()
-      if (this.currentQuery === activeQuery) this.currentQuery = undefined
+      this.activeToolFailure = undefined
+      this.turnRunning = false
     }
   }
 
   async interrupt(): Promise<void> {
-    await this.currentQuery?.interrupt()
+    if (this.turnRunning) await this.currentQuery?.interrupt()
   }
 
   async reset(): Promise<void> {
     this.generation += 1
-    this.sessionId = undefined
-    await this.interrupt()
+    const query = this.currentQuery
+    if (!query) return
+    try {
+      const interrupt = query.interrupt()
+      void interrupt.catch(() => {
+        // Closing the persistent query below is authoritative.
+      })
+    } catch {
+      // Closing the persistent query below is authoritative.
+    }
+    this.discardQuery(query)
   }
 
   async close(): Promise<void> {
     if (this.closed) return
     this.closed = true
     this.generation += 1
-    this.sessionId = undefined
     const query = this.currentQuery
-    this.currentQuery = undefined
+    if (!query) return
     try {
       const interrupt = query?.interrupt()
       void interrupt?.catch(() => {
@@ -304,7 +350,67 @@ class ClaudeConversation implements AgentConversation {
     } catch {
       // Closing the query below is authoritative.
     }
-    query?.close()
+    this.discardQuery(query)
+  }
+
+  private ensureQuery(): Query {
+    if (this.currentQuery) return this.currentQuery
+
+    const prompts = new AsyncMessageQueue<SDKUserMessage>()
+    let activeQuery: Query | undefined
+    activeQuery = this.queryFactory({
+      prompt: prompts,
+      options: {
+        model: this.configuration.model,
+        ...(this.configuration.effort
+          ? { effort: this.configuration.effort as 'low' | 'medium' | 'high' | 'xhigh' | 'max' }
+          : {}),
+        systemPrompt: SYSTEM_PROMPT,
+        mcpServers: {
+          cad: createCadMcpServer(
+            this.tools,
+            (error) => {
+              this.activeToolFailure = error
+              void activeQuery?.interrupt().catch(() => {})
+            },
+            (result) =>
+              recordProviderVisualEvidence(
+                {
+                  provider: 'claude-code',
+                  configuration: this.configuration,
+                  transport: 'claude-mcp-image',
+                  result
+                },
+                this.environment
+              )
+          )
+        },
+        allowedTools: ['mcp__cad__*'],
+        tools: [],
+        permissionMode: 'dontAsk',
+        pathToClaudeCodeExecutable: this.executablePath,
+        cwd: this.runtimeDirectory,
+        env: sanitizedProviderEnvironment(this.environment),
+        settingSources: [],
+        skills: [],
+        plugins: [],
+        strictMcpConfig: true,
+        persistSession: false
+      }
+    })
+    this.currentQuery = activeQuery
+    this.currentMessages = activeQuery[Symbol.asyncIterator]()
+    this.promptStream = prompts
+    return activeQuery
+  }
+
+  private discardQuery(query: Query): void {
+    if (this.currentQuery !== query) return
+    this.currentQuery = undefined
+    this.currentMessages = undefined
+    this.promptStream?.close()
+    this.promptStream = undefined
+    query.close()
   }
 }
 

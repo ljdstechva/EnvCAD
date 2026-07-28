@@ -11,6 +11,16 @@ const props = defineProps<{
 type TabId = 'ai' | 'sheet'
 
 const activeTab = ref<TabId>('ai')
+const chatPanel = ref<InstanceType<typeof ChatPanel> | null>(null)
+
+function inspectSheetWithAi(): boolean {
+  const sent =
+    chatPanel.value?.sendMessage(
+      'Inspect the current Sheet Preview. State whether it is blank, clipped, unreadable, low-contrast, or overlapping, and describe only what you can actually see.'
+    ) ?? false
+  if (sent) activeTab.value = 'ai'
+  return sent
+}
 </script>
 
 <template>
@@ -24,8 +34,15 @@ const activeTab = ref<TabId>('ai')
       </button>
     </div>
     <div class="tab-content" :class="{ chat: activeTab === 'ai' }">
-      <ChatPanel v-if="activeTab === 'ai'" :viewer="props.viewer" />
-      <SheetPreviewPanel v-else />
+      <ChatPanel
+        v-show="activeTab === 'ai'"
+        ref="chatPanel"
+        :viewer="props.viewer"
+      />
+      <SheetPreviewPanel
+        v-show="activeTab === 'sheet'"
+        :inspect-with-ai="inspectSheetWithAi"
+      />
     </div>
   </div>
 </template>

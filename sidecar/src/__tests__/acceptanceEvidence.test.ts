@@ -4,6 +4,7 @@ import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
   buildProviderPromptEvidence,
+  buildProviderVisualEvidence,
   recordProviderPromptEvidence
 } from '../providers/acceptanceEvidence'
 
@@ -38,6 +39,7 @@ describe('provider prompt acceptance evidence', () => {
     const evidence = JSON.parse(raw.trim())
     expect(evidence).toEqual(
       expect.objectContaining({
+        evidenceType: 'prompt',
         provider: 'openai-codex',
         promptCharacters: prompt.length,
         promptUtf8Bytes: Buffer.byteLength(prompt, 'utf8'),
@@ -76,5 +78,50 @@ describe('provider prompt acceptance evidence', () => {
         ENVCAD_ACCEPTANCE_EVIDENCE_PATH: 'relative.jsonl'
       })
     ).rejects.toThrow('absolute .jsonl path')
+  })
+
+  it('records only bounded hashes and dimensions for provider-native image transport', () => {
+    const evidence = buildProviderVisualEvidence({
+      provider: 'openai-codex',
+      configuration: {
+        provider: 'openai-codex',
+        model: 'gpt-test',
+        effort: 'xhigh'
+      },
+      transport: 'codex-dynamic-inputImage',
+      result: {
+        data: {
+          svgSha256: '1'.repeat(64),
+          privateDrawingText: 'DO-NOT-RECORD'
+        },
+        image: {
+          mimeType: 'image/png',
+          base64: 'DO-NOT-RECORD-BASE64',
+          byteLength: 1234,
+          width: 1400,
+          height: 990,
+          aspectRatio: 1400 / 990,
+          sha256: '2'.repeat(64),
+          captureId: 'sheet-7-full-2222222222222222',
+          renderRevision: 7
+        }
+      }
+    })
+    expect(evidence).toEqual(
+      expect.objectContaining({
+        evidenceType: 'visual-image',
+        provider: 'openai-codex',
+        requestedModel: 'gpt-test',
+        effort: 'xhigh',
+        transport: 'codex-dynamic-inputImage',
+        width: 1400,
+        height: 990,
+        byteLength: 1234,
+        rasterSha256: '2'.repeat(64),
+        svgSha256: '1'.repeat(64),
+        renderRevision: 7
+      })
+    )
+    expect(JSON.stringify(evidence)).not.toContain('DO-NOT-RECORD')
   })
 })

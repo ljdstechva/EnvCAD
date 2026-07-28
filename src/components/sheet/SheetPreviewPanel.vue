@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { agentBridge } from '../../agent/bridge'
+import { modelImageInputSupport } from '../../agent/protocol'
 import { cadSessionState } from '../../cad/session'
 import { sheetStore } from '../../sheet/sheetStore'
 import { PAPER_SIZES } from '../../sheet/types'
@@ -8,10 +10,22 @@ import { exportSheetToPdf } from './pdfExport'
 import { useSheetRender } from './useSheetRender'
 import { pushToast } from '../../toast/toastStore'
 
+const props = defineProps<{
+  inspectWithAi: () => boolean
+}>()
+
 const PX_PER_MM = 96 / 25.4
 
-const { svg, warnings, rendering, renderError, diagnostics, refresh } =
-  useSheetRender()
+const {
+  svg,
+  svgSha256,
+  warnings,
+  rendering,
+  renderError,
+  diagnostics,
+  renderRevision,
+  refresh
+} = useSheetRender()
 
 type ZoomMode = 'fit' | '100'
 const zoomMode = ref<ZoomMode>('fit')
@@ -19,6 +33,8 @@ const fitScale = ref(1)
 const dismissedWarnings = ref<Set<string>>(new Set())
 const exporting = ref(false)
 const exportError = ref<string | null>(null)
+const inspectState = ref<'idle' | 'loading' | 'success' | 'failure'>('idle')
+const inspectToolSucceeded = ref(false)
 
 const viewportEl = ref<HTMLDivElement | null>(null)
 let resizeObserver: ResizeObserver | null = null
@@ -57,6 +73,60 @@ const canExport = computed(
     diagnostics.value.drawableElementCount > 0 &&
     !diagnostics.value.unitMismatch
 )
+const selectedProvider = computed(() =>
+  agentBridge.selectedProviderCapability()
+)
+const selectedModel = computed(() => agentBridge.selectedModelCapability())
+const selectedModelImageSupport = computed(() =>
+  selectedModel.value
+    ? modelImageInputSupport(selectedModel.value)
+    : 'unknown'
+)
+const canInspectWithAi = computed(
+  () =>
+    documentReady.value &&
+    Boolean(svg.value) &&
+    diagnostics.value !== null &&
+    !rendering.value &&
+    agentBridge.state.connectionState === 'online' &&
+    agentBridge.state.status !== 'thinking' &&
+    !agentBridge.state.refreshingCapabilities &&
+    agentBridge.state.configurationReady &&
+    selectedProvider.value?.status === 'ready' &&
+    Boolean(selectedModel.value) &&
+    selectedModelImageSupport.value !== 'unsupported'
+)
+const inspectTitle = computed(() => {
+  if (selectedModelImageSupport.value === 'unsupported') {
+    return 'The selected model explicitly excludes image input. Choose an image-capable model to inspect Sheet Preview.'
+  }
+  if (!documentReady.value || !svg.value || diagnostics.value === null) {
+    return 'Wait for an open drawing and a completed Sheet Preview render.'
+  }
+  const provider = selectedProvider.value?.displayName ?? 'the selected AI provider'
+  return `Send the current Sheet Preview image to ${provider}. This uses the selected model and effort in a real provider turn.`
+})
+const inspectLabel = computed(() => {
+  if (inspectState.value === 'loading') return 'Inspecting…'
+  if (inspectState.value === 'success') return 'Inspected'
+  if (inspectState.value === 'failure') return 'Inspection failed'
+  return 'Inspect with AI'
+})
+
+const unsubscribeAgent = agentBridge.subscribe((message) => {
+  if (inspectState.value !== 'loading') return
+  if (
+    message.type === 'tool_result' &&
+    message.name === 'inspect_sheet_preview'
+  ) {
+    if (message.result.error) inspectState.value = 'failure'
+    else inspectToolSucceeded.value = true
+  } else if (message.type === 'assistant_done') {
+    inspectState.value = inspectToolSucceeded.value ? 'success' : 'failure'
+  } else if (message.type === 'error' || message.type === 'connection_reset') {
+    inspectState.value = 'failure'
+  }
+})
 
 function dismissWarning(warning: string) {
   dismissedWarnings.value = new Set(dismissedWarnings.value).add(warning)
@@ -95,7 +165,18 @@ onMounted(recomputeFitScale)
 
 onBeforeUnmount(() => {
   resizeObserver?.disconnect()
+  unsubscribeAgent()
 })
+
+function onInspectWithAi() {
+  if (!canInspectWithAi.value) return
+  inspectState.value = 'loading'
+  inspectToolSucceeded.value = false
+  if (!props.inspectWithAi()) {
+    inspectState.value = 'failure'
+    pushToast('The Sheet Preview inspection request could not be sent.')
+  }
+}
 
 async function onExportPdf() {
   if (!canExport.value) {
@@ -134,6 +215,15 @@ function getDrawingName(): string {
       <button :class="{ active: zoomMode === '100' }" @click="zoomMode = '100'">100%</button>
       <span class="sep"></span>
       <button @click="refresh" :disabled="rendering">{{ rendering ? 'Rendering…' : 'Refresh' }}</button>
+      <button
+        class="inspect-btn"
+        :disabled="!canInspectWithAi"
+        :title="inspectTitle"
+        :data-state="inspectState"
+        @click="onInspectWithAi"
+      >
+        {{ inspectLabel }}
+      </button>
       <span class="grow"></span>
       <button
         class="export-btn"
@@ -177,6 +267,8 @@ function getDrawingName(): string {
       :data-render-status="cadSessionState.sheetPreview.status"
       :data-drawable-elements="diagnostics?.drawableElementCount ?? 0"
       :data-unit-mismatch="diagnostics?.unitMismatch ?? false"
+      :data-svg-sha256="svgSha256"
+      :data-render-revision="renderRevision"
     >
       <div
         v-if="svg"
@@ -239,6 +331,10 @@ function getDrawingName(): string {
   background: var(--success-bg) !important;
   border-color: var(--success-border) !important;
   color: var(--text-on-accent) !important;
+}
+
+.inspect-btn {
+  border-color: var(--accent-border) !important;
 }
 
 .sep {

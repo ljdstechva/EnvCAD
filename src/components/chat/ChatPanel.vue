@@ -19,6 +19,7 @@ const { entries, sendMessage, interrupt, resetChat, dispose } =
   useChatTimeline()
 
 onBeforeUnmount(dispose)
+defineExpose({ sendMessage })
 
 const bridgeState = agentBridge.state
 const isOffline = computed(() => bridgeState.connectionState !== 'online')
@@ -202,6 +203,7 @@ function openLogs() {
             :data-invocation-name="model.invocationName"
             :data-resolved-model="model.resolvedModel"
             :data-default-effort="model.defaultEffort"
+            :data-input-modalities="model.inputModalities?.join(',')"
             :data-is-default="model.isDefault"
           >
             {{ model.displayName

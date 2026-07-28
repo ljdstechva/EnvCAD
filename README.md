@@ -12,16 +12,22 @@ the renderer.
 
 ## Windows installation
 
-EnvCAD v0.2.2 targets Windows 11 x64. Install the generated Squirrel
-`EnvCAD-0.2.2 Setup.exe`, then launch **EnvCAD** from the Desktop shortcut or
+EnvCAD v0.2.3 targets Windows 11 x64. Install the generated Squirrel
+`EnvCAD-0.2.3 Setup.exe`, then launch **EnvCAD** from the Desktop shortcut or
 Start menu. The installer is currently unsigned, so Windows may show a
 SmartScreen warning.
 
-Version 0.2.2 makes the document lifecycle explicit: the canvas starts without
-a drawing, **New Drawing** creates a clean editable Model space, and **Fit
-Drawing** regenerates then frames every visible entity. Sheet setup is stored
-per drawing with explicit drawing units, and export reports unit mismatch or
-clipping instead of producing a misleading page.
+Version 0.2.3 lets either supported AI provider inspect the actual Sheet Preview
+through a bounded, in-memory image generated from the same final SVG shown in
+the UI. **Inspect with AI** uses the selected provider, model, and effort without
+switching providers or granting screen, browser, shell, or filesystem access.
+The renderer and sidecar independently recompute the image SHA-256 before a
+provider can receive it. Claude runs one non-persistent streaming SDK session
+per in-app conversation, so preview Base64 is not written to Claude project
+transcripts; the upgrade also removes only legacy EnvCAD-runtime transcript
+directories created by earlier development builds.
+The explicit document lifecycle, deterministic **Fit Drawing**, per-drawing
+sheet setup, and unit/clipping safeguards from 0.2.2 remain intact.
 
 The AI Assistant requires whichever local provider you intend to use:
 
@@ -93,7 +99,9 @@ WebSocket request, whose selection and sheet context also consume capacity.
 `ultra` is omitted because EnvCAD is intentionally single-agent.
 
 Claude is configured with no built-in tools and may invoke only
-`mcp__cad__*`. Its settings, skills, and plugins are excluded.
+`mcp__cad__*`. Its settings, skills, and plugins are excluded. Its SDK query is
+streaming and non-persistent (`persistSession: false`) and never resumes a
+disk-backed transcript.
 
 See [desktop architecture](docs/desktop.md), [agent protocol](docs/agent-protocol.md),
 and [benchmark method](docs/ai-benchmark.md).
@@ -146,6 +154,19 @@ It uses only a generated metre-unit drawing and the two deterministic benchmark
 prompts. Raw transcripts, DXFs, screenshots, and machine-specific timings are
 written under ignored `output/desktop/ai-benchmark/`. The command refuses to
 make a model call without `--live` and enforces its own turn budget.
+
+The installed visual acceptance is also opt-in and requires the M-01 drawing:
+
+```powershell
+npm run acceptance:visual-installed -- --live --scope=full --drawing "C:\path\to\M-01.dxf"
+```
+
+It sends bounded Sheet Preview images to both selected subscription providers
+and writes screenshots plus a machine-readable report outside the source tree.
+Release acceptance additionally drives both live providers through the actual
+installed Windows shortcut with OS-level UI automation, records the installed
+process path and screenshots, verifies normal close/runtime cleanup, and merges
+that evidence into the report.
 
 See [TESTING.md](TESTING.md) for suite boundaries and installed-app checks.
 

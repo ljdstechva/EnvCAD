@@ -2,7 +2,7 @@
 
 ## Install and launch
 
-EnvCAD v0.2.2 is packaged for Windows x64 with Electron Forge and Squirrel.
+EnvCAD v0.2.3 is packaged for Windows x64 with Electron Forge and Squirrel.
 
 ```powershell
 npm ci
@@ -12,7 +12,7 @@ npm run desktop:make
 The installer is produced under:
 
 ```text
-out\make\squirrel.windows\x64\EnvCAD-0.2.2 Setup.exe
+out\make\squirrel.windows\x64\EnvCAD-0.2.3 Setup.exe
 ```
 
 Install it, then launch EnvCAD from the Desktop shortcut or Start menu. The
@@ -182,6 +182,32 @@ npm run benchmark:ai -- --live
 
 See [ai-benchmark.md](ai-benchmark.md) for prompts, scoring, turn budget, and
 sanitized results.
+
+The installed visual-provider acceptance is opt-in because it makes real Claude
+and Codex subscription turns:
+
+```powershell
+npm run acceptance:visual-installed -- --live --scope=full --drawing "C:\path\to\M-01.dxf" --output "$env:LOCALAPPDATA\EnvCAD-Acceptance\v0.2.3"
+```
+
+It verifies two undisclosed marker layouts, a blank sheet, a visibly
+clipped/overlapping sheet, the M-01 toolbar flow, provider-native image
+transport, SHA-256 integrity, relaunch, port/runtime cleanup, EnvCAD log
+privacy, and the absence of new EnvCAD-keyed Claude transcript files. The full
+deterministic harness loads the exact installed `app.asar` through the matching
+Electron automation driver; the production executable intentionally rejects
+Playwright attachment because its command-line inspection fuse is disabled.
+
+The release gate also uses OS-level Windows UI automation to launch the real
+Desktop or Start Menu shortcut, exercise live visual turns with both providers,
+record the installed process image and screenshots, and close normally. Its
+machine-readable evidence is merged only after validating the shortcut target,
+both provider runs, screenshot hashes, process/runtime cleanup, closed sidecar
+ports, and zero remaining EnvCAD Claude transcripts:
+
+```powershell
+npm run acceptance:installed-shortcut:merge -- --report "C:\path\installed-visual-acceptance.json" --evidence "C:\path\installed-shortcut-acceptance.json"
+```
 
 ## Uninstall and retained files
 

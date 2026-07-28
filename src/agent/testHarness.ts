@@ -421,7 +421,23 @@ export function installAgentTestHarness() {
           finish(() => reject(error))
         }
       })
-      console.log('[agentTest] completed:', result)
+      console.log('[agentTest] completed:', {
+        assistantCharacters: result.assistantText.length,
+        tools: result.toolCalls.map((call) => ({
+          name: call.name,
+          succeeded: !call.result?.error,
+          ...(call.result?.image
+            ? {
+                image: {
+                  width: call.result.image.width,
+                  height: call.result.image.height,
+                  byteLength: call.result.image.byteLength,
+                  sha256: call.result.image.sha256.slice(0, 12)
+                }
+              }
+            : {})
+        }))
+      })
       return result
     } catch (error) {
       console.error('[agentTest] failed:', error)

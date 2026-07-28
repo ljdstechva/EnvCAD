@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { CAD_TOOL_NAMES } from '../cadToolSpecs'
 import {
   CodexProvider,
+  toCodexDynamicToolResult,
   type CodexProviderOptions
 } from '../providers/codexProvider'
 import type {
@@ -120,6 +121,7 @@ const modelOne = {
   hidden: false,
   isDefault: true,
   defaultReasoningEffort: 'medium',
+  inputModalities: ['text', 'image'],
   supportedReasoningEfforts: [
     { reasoningEffort: 'low', description: 'Fast' },
     { reasoningEffort: 'medium', description: 'Balanced' },
@@ -278,6 +280,7 @@ describe('CodexProvider', () => {
     expect(
       capability.models[0].supportedEfforts.map((effort) => effort.value)
     ).toEqual(['low', 'medium'])
+    expect(capability.models[0].inputModalities).toEqual(['text', 'image'])
     expect(
       capability.models.some((model) => model.id === 'gpt-ultra-default')
     ).toBe(false)
@@ -438,6 +441,143 @@ describe('CodexProvider', () => {
     ).dynamicTools
     expect(dynamicTools.map((tool) => tool.name)).toEqual([...CAD_TOOL_NAMES])
     expect(dynamicTools.every((tool) => tool.inputSchema)).toBe(true)
+  })
+
+  it('returns metadata plus an in-memory inputImage for visual dynamic tools', () => {
+    const base64 = 'iVBORw0KGgo='
+    expect(
+      toCodexDynamicToolResult({
+        data: { kind: 'sheet-preview', width: 1_400, height: 990 },
+        image: {
+          mimeType: 'image/png',
+          base64,
+          byteLength: 8,
+          width: 1_400,
+          height: 990,
+          aspectRatio: 1_400 / 990,
+          sha256: 'a'.repeat(64),
+          captureId: 'sheet-1-full-aaaaaaaaaaaaaaaa',
+          renderRevision: 1
+        }
+      })
+    ).toEqual({
+      contentItems: [
+        {
+          type: 'inputText',
+          text: JSON.stringify(
+            { kind: 'sheet-preview', width: 1_400, height: 990 },
+            null,
+            2
+          )
+        },
+        {
+          type: 'inputImage',
+          imageUrl: `data:image/png;base64,${base64}`
+        }
+      ],
+      success: true
+    })
+    expect(
+      toCodexDynamicToolResult({ data: { entityIds: ['line-1'] } })
+    ).toEqual({
+      contentItems: [
+        {
+          type: 'inputText',
+          text: JSON.stringify({ entityIds: ['line-1'] }, null, 2)
+        }
+      ],
+      success: true
+    })
+  })
+
+  it('keeps text-only models usable while omitting only visual inspection', async () => {
+    const clients: FakeCodexClient[] = []
+    const providerOptions = options(clients)
+    const factory = providerOptions.clientFactory!
+    providerOptions.clientFactory = (clientOptions) => {
+      const client = factory(clientOptions) as unknown as FakeCodexClient
+      if (clients.length === 1) {
+        client.modelPages = [
+          {
+            data: [{ ...modelOne, inputModalities: ['text'] }],
+            nextCursor: null
+          }
+        ]
+      }
+      return client as unknown as CodexAppServerClient
+    }
+    const provider = new CodexProvider(providerOptions)
+    const capability = await provider.discover()
+    expect(capability.status).toBe('ready')
+    expect(capability.models[0].inputModalities).toEqual(['text'])
+
+    await provider.createConversation(
+      {
+        provider: 'openai-codex',
+        model: 'gpt-default',
+        effort: 'medium'
+      },
+      {
+        callTool: vi.fn(async () => ({ data: { ok: true } })),
+        getSelectionSnapshot: () => undefined
+      }
+    )
+    const threadStart = clients[1].requests.find(
+      (request) => request.method === 'thread/start'
+    )
+    const params = threadStart?.params as {
+      dynamicTools: Array<{ name: string }>
+      developerInstructions: string
+    }
+    expect(params.dynamicTools.map((tool) => tool.name)).not.toContain(
+      'inspect_sheet_preview'
+    )
+    expect(params.dynamicTools.map((tool) => tool.name)).toContain(
+      'get_drawing_context'
+    )
+    expect(params.developerInstructions).toContain(
+      'explicitly excludes image input'
+    )
+  })
+
+  it('treats absent modality metadata as unknown and keeps the visual tool available', async () => {
+    const clients: FakeCodexClient[] = []
+    const providerOptions = options(clients)
+    const factory = providerOptions.clientFactory!
+    providerOptions.clientFactory = (clientOptions) => {
+      const client = factory(clientOptions) as unknown as FakeCodexClient
+      if (clients.length === 1) {
+        const { inputModalities: _modalities, ...unknownModel } = modelOne
+        void _modalities
+        client.modelPages = [{ data: [unknownModel], nextCursor: null }]
+      }
+      return client as unknown as CodexAppServerClient
+    }
+    const provider = new CodexProvider(providerOptions)
+    const capability = await provider.discover()
+    expect(capability.models[0].inputModalities).toBeUndefined()
+
+    await provider.createConversation(
+      {
+        provider: 'openai-codex',
+        model: 'gpt-default',
+        effort: 'medium'
+      },
+      {
+        callTool: vi.fn(async () => ({ data: { ok: true } })),
+        getSelectionSnapshot: () => undefined
+      }
+    )
+    const threadStart = clients[1].requests.find(
+      (request) => request.method === 'thread/start'
+    )
+    expect(
+      (
+        threadStart?.params as {
+          dynamicTools: Array<{ name: string }>
+        }
+      ).dynamicTools.map((tool) => tool.name)
+    ).toContain('inspect_sheet_preview')
   })
 
   it('closes the app-server when conversation startup fails', async () => {

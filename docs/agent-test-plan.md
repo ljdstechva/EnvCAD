@@ -6,7 +6,7 @@ canonical CAD tool → browser executor → drawing database. Each case names th
 tool calls and observable result, so a regression is concrete.
 
 The run log below is the historical Claude Code pass from 2026-07-26. EnvCAD
-v0.2.2 applies the same catalog and schemas to both providers; the installed
+v0.2.3 applies the same catalog and schemas to both providers; the installed
 cross-provider deterministic creation/annotation evidence is recorded in
 `docs/ai-benchmark.md`.
 
@@ -22,6 +22,16 @@ cross-provider deterministic creation/annotation evidence is recorded in
 
 Entity ids in this document (`35`, `36`, …) are the handles this fixture
 produces on a clean load. They are stable per load, not across edits.
+
+For v0.2.3 visual release acceptance, unit tests intentionally corrupt a valid
+PNG's reported SHA-256 and require rejection independently at the renderer-send
+and sidecar-receive boundaries. Claude tests also require one streaming query
+across multiple turns, `persistSession: false`, and no `resume`. The installed
+suite snapshots exact EnvCAD-runtime Claude project keys before and after both
+providers run; the final count and new/modified file count must both be zero.
+The full installed-ASAR suite is complemented by OS-level automation through
+the real Windows shortcut for live Claude and Codex turns, screenshot evidence,
+normal close, and runtime/port cleanup.
 
 ## How the dialogues are driven
 

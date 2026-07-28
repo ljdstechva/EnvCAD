@@ -86,6 +86,26 @@ const specs = [
     z.strictObject({})
   ),
   defineTool(
+    'inspect_sheet_preview',
+    'Return the actual current Sheet Preview as a bounded raster image plus render metadata. ' +
+      'This is the only visual-proof tool: entity counts, extents, and get_view_status are not ' +
+      'evidence that the page is visible, readable, unclipped, or free of overlap. Use full ' +
+      'first; use a quadrant only when the full page lacks enough detail. This tool is read-only ' +
+      'and never changes the drawing, page setup, selection, zoom, or active tab.',
+    z.strictObject({
+      view: z
+        .enum([
+          'full',
+          'top-left',
+          'top-right',
+          'bottom-left',
+          'bottom-right'
+        ])
+        .default('full')
+        .describe('Bounded page view to capture')
+    })
+  ),
+  defineTool(
     'move_entities',
     'Move one or more entities by a relative offset (dx, dy) in drawing units.',
     z.strictObject({

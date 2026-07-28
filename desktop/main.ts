@@ -1,6 +1,5 @@
 import { randomBytes } from 'node:crypto'
 import { mkdirSync } from 'node:fs'
-import { rm } from 'node:fs/promises'
 import path from 'node:path'
 import {
   app,
@@ -25,6 +24,8 @@ import { AiPreferencesStore } from './aiPreferences'
 import { SheetPreferencesStore } from './sheetPreferences'
 import { handleSquirrelStartup } from './squirrelStartup'
 import { focusExistingWindow } from './windowLifecycle'
+import { removeRuntimeDirectoryWithRetry } from './runtimeDirectoryCleanup'
+import { removeLegacyEnvCadClaudeTranscripts } from './claudeTranscriptCleanup'
 
 declare const MAIN_WINDOW_VITE_DEV_SERVER_URL: string | undefined
 
@@ -305,6 +306,16 @@ async function startDesktop(): Promise<void> {
   if (!localAppData) {
     throw new Error('LOCALAPPDATA is unavailable; cannot create the isolated AI runtime.')
   }
+  const removedLegacyTranscripts =
+    await removeLegacyEnvCadClaudeTranscripts({
+      homeDirectory: app.getPath('home'),
+      localAppData
+    })
+  if (removedLegacyTranscripts > 0) {
+    desktopLogger.info(
+      `Removed ${removedLegacyTranscripts} legacy EnvCAD Claude transcript directories.`
+    )
+  }
   aiRuntimeDirectory = path.join(
     path.resolve(localAppData),
     'EnvCAD',
@@ -375,7 +386,7 @@ async function shutdown(): Promise<void> {
   }
   if (aiRuntimeDirectory) {
     try {
-      await rm(aiRuntimeDirectory, { recursive: true, force: true })
+      await removeRuntimeDirectoryWithRetry(aiRuntimeDirectory)
     } catch (error) {
       desktopLogger.error(
         `Isolated AI runtime cleanup failed: ${

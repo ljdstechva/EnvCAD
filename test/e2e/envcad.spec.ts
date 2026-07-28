@@ -8,6 +8,11 @@ import {
   geometryFingerprint,
   inspectDxf
 } from '../../scripts/aiBenchmark'
+import {
+  createVisualFixtureDxf,
+  visualFixtureExpectation,
+  type VisualMarkerQuadrant
+} from '../../scripts/visualFixtures'
 import { MAX_WEBSOCKET_PAYLOAD_BYTES } from '../../src/agent/protocol'
 
 const FIXTURE = path.join(process.cwd(), 'test', 'fixtures', 'sample-site.dxf')
@@ -276,6 +281,219 @@ function pngPixelVariance(png: Buffer): { uniqueColors: number; brightnessRange:
   }
 }
 
+interface PreviewCaptureEvidence {
+  error?: string
+  view?: string
+  mimeType?: string
+  width?: number
+  height?: number
+  byteLength?: number
+  rasterSha256?: string
+  svgSha256?: string
+  renderRevision?: number
+  documentRevision?: number
+  contentRevision?: number
+  entityCount?: number
+  drawableElementCount?: number
+  unitMismatch?: boolean
+  clipping?: boolean
+  warningCount?: number
+  imageBytesDuplicatedInMetadata?: boolean
+  uniqueColors?: number
+  brightnessRange?: number
+  nonWhiteRatio?: number
+  whiteCornerRatio?: number
+  quadrantColors?: Partial<Record<VisualMarkerQuadrant, string[]>>
+}
+
+async function capturePreviewEvidence(
+  page: Page,
+  view:
+    | 'full'
+    | 'top-left'
+    | 'top-right'
+    | 'bottom-left'
+    | 'bottom-right'
+): Promise<PreviewCaptureEvidence> {
+  return page.evaluate(async (requestedView) => {
+    const result = await window.__cadTest!.callTool('inspect_sheet_preview', {
+      view: requestedView
+    })
+    if (result.error || !result.image) {
+      return { error: result.error ?? 'No preview image was returned.' }
+    }
+
+    const metadata =
+      result.data && typeof result.data === 'object'
+        ? (result.data as Record<string, unknown>)
+        : {}
+    const diagnostics =
+      metadata.renderDiagnostics &&
+      typeof metadata.renderDiagnostics === 'object'
+        ? (metadata.renderDiagnostics as Record<string, unknown>)
+        : {}
+    const binary = atob(result.image.base64)
+    const bytes = new Uint8Array(binary.length)
+    for (let index = 0; index < binary.length; index += 1) {
+      bytes[index] = binary.charCodeAt(index)
+    }
+    const bitmap = await createImageBitmap(
+      new Blob([bytes], { type: result.image.mimeType })
+    )
+    const canvas = document.createElement('canvas')
+    canvas.width = bitmap.width
+    canvas.height = bitmap.height
+    const context = canvas.getContext('2d', { alpha: false })
+    if (!context) throw new Error('Could not decode preview image pixels.')
+    context.drawImage(bitmap, 0, 0)
+    bitmap.close()
+    const pixels = context.getImageData(
+      0,
+      0,
+      canvas.width,
+      canvas.height
+    ).data
+
+    const colors = new Set<number>()
+    let minimumBrightness = 255
+    let maximumBrightness = 0
+    let sampled = 0
+    let nonWhite = 0
+    const colorCounts: Record<string, Record<string, number>> = {
+      'top-left': {},
+      'top-right': {},
+      'bottom-left': {},
+      'bottom-right': {}
+    }
+    const sampleStep = Math.max(
+      1,
+      Math.floor((canvas.width * canvas.height) / 120_000)
+    )
+    for (
+      let pixel = 0;
+      pixel < canvas.width * canvas.height;
+      pixel += sampleStep
+    ) {
+      const offset = pixel * 4
+      const red = pixels[offset]
+      const green = pixels[offset + 1]
+      const blue = pixels[offset + 2]
+      const x = pixel % canvas.width
+      const y = Math.floor(pixel / canvas.width)
+      const quadrant = `${y < canvas.height / 2 ? 'top' : 'bottom'}-${
+        x < canvas.width / 2 ? 'left' : 'right'
+      }`
+      const detectedColor =
+        red > 170 && green < 110 && blue < 110
+          ? 'red'
+          : red > 150 && green > 150 && blue < 120
+            ? 'yellow'
+            : red < 120 && green > 150 && blue < 120
+              ? 'green'
+              : red < 120 && green > 150 && blue > 150
+                ? 'cyan'
+                : red < 120 && green < 120 && blue > 150
+                  ? 'blue'
+                  : red > 150 && green < 120 && blue > 150
+                    ? 'magenta'
+                    : undefined
+      if (detectedColor) {
+        colorCounts[quadrant][detectedColor] =
+          (colorCounts[quadrant][detectedColor] ?? 0) + 1
+      }
+      colors.add((red << 16) | (green << 8) | blue)
+      const brightness = (red + green + blue) / 3
+      minimumBrightness = Math.min(minimumBrightness, brightness)
+      maximumBrightness = Math.max(maximumBrightness, brightness)
+      if (red < 250 || green < 250 || blue < 250) nonWhite += 1
+      sampled += 1
+    }
+
+    const cornerSize = Math.min(20, canvas.width, canvas.height)
+    let cornerPixels = 0
+    let whiteCornerPixels = 0
+    for (let y = 0; y < cornerSize; y += 1) {
+      for (let x = 0; x < cornerSize; x += 1) {
+        const offset = (y * canvas.width + x) * 4
+        if (
+          pixels[offset] >= 250 &&
+          pixels[offset + 1] >= 250 &&
+          pixels[offset + 2] >= 250
+        ) {
+          whiteCornerPixels += 1
+        }
+        cornerPixels += 1
+      }
+    }
+
+    const imageMetadata =
+      metadata.image && typeof metadata.image === 'object'
+        ? (metadata.image as Record<string, unknown>)
+        : {}
+    return {
+      view:
+        typeof metadata.view === 'string' ? metadata.view : requestedView,
+      mimeType: result.image.mimeType,
+      width: result.image.width,
+      height: result.image.height,
+      byteLength: result.image.byteLength,
+      rasterSha256: result.image.sha256,
+      svgSha256:
+        typeof metadata.svgSha256 === 'string'
+          ? metadata.svgSha256
+          : undefined,
+      renderRevision:
+        typeof metadata.renderRevision === 'number'
+          ? metadata.renderRevision
+          : undefined,
+      documentRevision:
+        typeof metadata.documentRevision === 'number'
+          ? metadata.documentRevision
+          : undefined,
+      contentRevision:
+        typeof metadata.contentRevision === 'number'
+          ? metadata.contentRevision
+          : undefined,
+      entityCount:
+        typeof diagnostics.entityCount === 'number'
+          ? diagnostics.entityCount
+          : undefined,
+      drawableElementCount:
+        typeof diagnostics.drawableElementCount === 'number'
+          ? diagnostics.drawableElementCount
+          : undefined,
+      unitMismatch:
+        typeof diagnostics.unitMismatch === 'boolean'
+          ? diagnostics.unitMismatch
+          : undefined,
+      clipping:
+        typeof diagnostics.clipping === 'boolean'
+          ? diagnostics.clipping
+          : undefined,
+      warningCount: Array.isArray(metadata.warnings)
+        ? metadata.warnings.length
+        : undefined,
+      imageBytesDuplicatedInMetadata:
+        JSON.stringify(metadata).includes(result.image.base64) ||
+        imageMetadata.base64 !== undefined,
+      uniqueColors: colors.size,
+      brightnessRange: maximumBrightness - minimumBrightness,
+      nonWhiteRatio: sampled > 0 ? nonWhite / sampled : 0,
+      whiteCornerRatio:
+        cornerPixels > 0 ? whiteCornerPixels / cornerPixels : 0,
+      quadrantColors: Object.fromEntries(
+        Object.entries(colorCounts).map(([quadrant, counts]) => [
+          quadrant,
+          Object.entries(counts)
+            .filter(([, count]) => count >= 8)
+            .sort((left, right) => right[1] - left[1])
+            .map(([color]) => color)
+        ])
+      )
+    }
+  }, view)
+}
+
 function byId(entities: TestEntity[], ids: string[]): TestEntity[] {
   return ids
     .map((id) => entities.find((entity) => entity.id === id))
@@ -296,6 +514,7 @@ test.describe.serial('EnvCAD preview with scripted fake sidecar', () => {
     await request.post(`${CONTROL_URL}/start`)
     await request.post(`${CONTROL_URL}/scenario?name=ready`)
     await request.post(`${CONTROL_URL}/delay?ms=0`)
+    await request.post(`${CONTROL_URL}/visual-result?mode=success`)
   })
 
   test.afterEach(() => {
@@ -553,6 +772,302 @@ test.describe.serial('EnvCAD preview with scripted fake sidecar', () => {
     expect(variance.brightnessRange).toBeGreaterThan(20)
   })
 
+  test('captures the exact shared Sheet Preview SVG as bounded full and quadrant images while its tab is hidden', async ({
+    page
+  }) => {
+    await loadFixture(page)
+    await expect(
+      page.getByRole('button', { name: 'AI Assistant' })
+    ).toHaveClass(/active/)
+    await expect
+      .poll(() =>
+        page.locator('.preview-viewport').getAttribute('data-render-status')
+      )
+      .toMatch(/^(ready|warning)$/)
+
+    const stateBefore = await page.evaluate(() => ({
+      selection: window.__cadTest!.selection(),
+      sheet: window.__cadTest!.sheet(),
+      view: window.__cadTest!.viewState()
+    }))
+    const full = await capturePreviewEvidence(page, 'full')
+    expect(full.error).toBeUndefined()
+    expect(full.view).toBe('full')
+    expect(full.mimeType).toMatch(/^image\/(?:png|webp)$/)
+    expect(full.width).toBe(1_400)
+    expect(full.height).toBe(990)
+    expect(full.byteLength).toBeGreaterThan(100)
+    expect(full.byteLength).toBeLessThanOrEqual(1_179_648)
+    expect(full.rasterSha256).toMatch(/^[a-f0-9]{64}$/)
+    expect(full.svgSha256).toMatch(/^[a-f0-9]{64}$/)
+    expect(full.imageBytesDuplicatedInMetadata).toBe(false)
+    expect(full.whiteCornerRatio).toBeGreaterThan(0.99)
+    expect(full.uniqueColors).toBeGreaterThan(4)
+    expect(full.brightnessRange).toBeGreaterThan(20)
+    expect(full.nonWhiteRatio).toBeGreaterThan(0.001)
+    await expect(
+      page.getByRole('button', { name: 'AI Assistant' })
+    ).toHaveClass(/active/)
+
+    const quadrants = await Promise.all(
+      (
+        [
+          'top-left',
+          'top-right',
+          'bottom-left',
+          'bottom-right'
+        ] as const
+      ).map((view) => capturePreviewEvidence(page, view))
+    )
+    for (const quadrant of quadrants) {
+      expect(quadrant.error).toBeUndefined()
+      expect(quadrant.width).toBe(1_400)
+      expect(quadrant.height).toBe(990)
+      expect(quadrant.byteLength).toBeLessThanOrEqual(1_179_648)
+      expect(quadrant.svgSha256).toBe(full.svgSha256)
+      expect(quadrant.renderRevision).toBe(full.renderRevision)
+    }
+
+    await page.getByRole('button', { name: 'Sheet Preview' }).click()
+    await expect(page.locator('.preview-viewport')).toHaveAttribute(
+      'data-svg-sha256',
+      full.svgSha256!
+    )
+    await expect(page.locator('.preview-viewport')).toHaveAttribute(
+      'data-render-revision',
+      String(full.renderRevision)
+    )
+    expect(
+      await page.evaluate(() => ({
+        selection: window.__cadTest!.selection(),
+        sheet: window.__cadTest!.sheet(),
+        view: window.__cadTest!.viewState()
+      }))
+    ).toEqual(stateBefore)
+  })
+
+  test('renders two undisclosed marker arrangements as distinct visual captures', async ({
+    page
+  }, testInfo) => {
+    const rasterHashes: string[] = []
+    for (const id of ['a', 'b'] as const) {
+      const fixturePath = testInfo.outputPath(`x-${id}.dxf`)
+      await fs.writeFile(fixturePath, createVisualFixtureDxf(id), 'utf8')
+      await page.goto('/')
+      await expect
+        .poll(() => page.evaluate(() => Boolean(window.__cadTest)))
+        .toBe(true)
+      await page.locator('input[accept=".dxf,.dwg"]').setInputFiles(fixturePath)
+      await expect(page.getByRole('button', { name: 'Save DXF' })).toBeEnabled()
+      await expect
+        .poll(() => page.evaluate(() => window.__cadTest!.entities().length))
+        .toBe(20)
+      await expect
+        .poll(() =>
+          page.locator('.preview-viewport').getAttribute('data-render-status')
+        )
+        .toBe('ready')
+
+      const capture = await capturePreviewEvidence(page, 'full')
+      const expected = visualFixtureExpectation(id)
+      expect(capture.error).toBeUndefined()
+      expect(capture.svgSha256).toMatch(/^[a-f0-9]{64}$/)
+      expect(capture.rasterSha256).toMatch(/^[a-f0-9]{64}$/)
+      expect(capture.uniqueColors).toBeGreaterThan(5)
+      expect(capture.brightnessRange).toBeGreaterThan(50)
+      for (const marker of expected.markers) {
+        expect(capture.quadrantColors?.[marker.quadrant]).toContain(
+          marker.color
+        )
+      }
+      rasterHashes.push(capture.rasterSha256!)
+
+      await page.getByRole('button', { name: 'Sheet Preview' }).click()
+      await page.locator('.preview-viewport').screenshot({
+        path: testInfo.outputPath(`x-${id}.png`)
+      })
+      await expect(page.locator('.preview-viewport')).toHaveAttribute(
+        'data-svg-sha256',
+        capture.svgSha256!
+      )
+    }
+    expect(rasterHashes[1]).not.toBe(rasterHashes[0])
+  })
+
+  test('captures generated blank and visibly clipped/overlapping acceptance pages', async ({
+    page
+  }, testInfo) => {
+    for (const id of ['blank', 'defect'] as const) {
+      const fixturePath = testInfo.outputPath(`x-${id}.dxf`)
+      await fs.writeFile(fixturePath, createVisualFixtureDxf(id), 'utf8')
+      await page.goto('/')
+      await expect
+        .poll(() => page.evaluate(() => Boolean(window.__cadTest)))
+        .toBe(true)
+      await page.locator('input[accept=".dxf,.dwg"]').setInputFiles(fixturePath)
+      await expect(page.getByRole('button', { name: 'Save DXF' })).toBeEnabled()
+      await expect
+        .poll(() => page.evaluate(() => window.__cadTest!.entities().length))
+        .toBe(id === 'blank' ? 0 : 15)
+      await expect
+        .poll(() =>
+          page.locator('.preview-viewport').getAttribute('data-render-status')
+        )
+        .toMatch(/^(ready|warning)$/)
+
+      const capture = await capturePreviewEvidence(page, 'full')
+      expect(capture.error).toBeUndefined()
+      if (id === 'blank') {
+        expect(capture.entityCount).toBe(0)
+        expect(capture.nonWhiteRatio).toBeLessThan(0.02)
+        expect(capture.clipping).toBe(false)
+      } else {
+        expect(capture.entityCount).toBe(15)
+        expect(capture.clipping).toBe(true)
+        expect(capture.quadrantColors?.['top-left']).toContain('red')
+        expect(capture.quadrantColors?.['bottom-right']).toEqual(
+          expect.arrayContaining(['blue', 'green'])
+        )
+      }
+      await page.getByRole('button', { name: 'Sheet Preview' }).click()
+      await page.locator('.preview-viewport').screenshot({
+        path: testInfo.outputPath(`x-${id}.png`)
+      })
+    }
+  })
+
+  test('returns a legitimate image for an empty drawing and preserves the white page', async ({
+    page
+  }) => {
+    await page.goto('/')
+    await expect.poll(() => page.evaluate(() => Boolean(window.__cadTest))).toBe(true)
+    await page.getByRole('button', { name: 'New Drawing' }).click()
+    await expect
+      .poll(
+        () =>
+          (
+            page.evaluate(
+              () =>
+                (window.__cadTest!.session() as { status?: string }).status
+            )
+          )
+      )
+      .toBe('active')
+    await expect
+      .poll(() =>
+        page.locator('.preview-viewport').getAttribute('data-render-status')
+      )
+      .toMatch(/^(ready|warning)$/)
+
+    const capture = await capturePreviewEvidence(page, 'full')
+    expect(capture.error).toBeUndefined()
+    expect(capture.entityCount).toBe(0)
+    expect(capture.drawableElementCount).toBeLessThanOrEqual(1)
+    expect(capture.width).toBe(1_400)
+    expect(capture.height).toBe(990)
+    expect(capture.whiteCornerRatio).toBeGreaterThan(0.99)
+    expect(capture.nonWhiteRatio).toBeLessThan(0.02)
+    expect(capture.imageBytesDuplicatedInMetadata).toBe(false)
+  })
+
+  test('drives Inspect with AI through disabled, loading, success, failure, and text-only-model states', async ({
+    page,
+    request
+  }) => {
+    await page.goto('/')
+    await expect.poll(() => page.evaluate(() => Boolean(window.__cadTest))).toBe(true)
+    await page.getByRole('button', { name: 'Sheet Preview' }).click()
+    const inspectButton = page.locator('.inspect-btn')
+    await expect(inspectButton).toBeDisabled()
+
+    await loadFixture(page)
+    await page.getByRole('button', { name: 'Sheet Preview' }).click()
+    await expect(inspectButton).toBeEnabled()
+    await expect(inspectButton).toHaveAttribute(
+      'title',
+      /sends? the current Sheet Preview image|Send the current Sheet Preview image/i
+    )
+
+    await request.post(`${CONTROL_URL}/delay?ms=1000`)
+    await inspectButton.click()
+    await expect(inspectButton).toHaveAttribute('data-state', 'loading')
+    await expect(inspectButton).toContainText(/Inspecting/)
+    await expect(page.locator('.tool-chip').last()).toContainText(
+      'inspect_sheet_preview'
+    )
+    await expect(inspectButton).toHaveAttribute('data-state', 'success', {
+      timeout: 15_000
+    })
+    await expect(inspectButton).toContainText('Inspected')
+
+    const successfulChip = page.locator('.tool-chip').last()
+    await expect(successfulChip).toContainText(/1400×990/)
+    await successfulChip.locator('.chip-header').click()
+    await expect(successfulChip).toContainText('[image bytes omitted]')
+    await expect(successfulChip).not.toContainText('data:image/')
+    const stats = (await (
+      await request.get(`${CONTROL_URL}/stats`)
+    ).json()) as {
+      lastVisualResultEvidence?: {
+        success?: boolean
+        width?: number
+        height?: number
+        byteLength?: number
+        rasterSha256?: string
+        svgSha256?: string
+      }
+    }
+    expect(stats.lastVisualResultEvidence).toMatchObject({
+      success: true,
+      width: 1_400,
+      height: 990
+    })
+    expect(stats.lastVisualResultEvidence?.byteLength).toBeLessThanOrEqual(
+      1_179_648
+    )
+    expect(stats.lastVisualResultEvidence?.rasterSha256).toMatch(
+      /^[a-f0-9]{64}$/
+    )
+    expect(stats.lastVisualResultEvidence?.svgSha256).toBe(
+      await page.locator('.preview-viewport').getAttribute('data-svg-sha256')
+    )
+
+    await request.post(`${CONTROL_URL}/delay?ms=0`)
+    await request.post(`${CONTROL_URL}/visual-result?mode=failure`)
+    await page.getByRole('button', { name: 'Sheet Preview' }).click()
+    await inspectButton.click()
+    await expect(inspectButton).toHaveAttribute('data-state', 'failure')
+    await expect(inspectButton).toContainText('Inspection failed')
+    await expect(page.locator('.tool-chip.error').last()).toContainText(
+      'inspect_sheet_preview'
+    )
+
+    await page.getByRole('button', { name: 'AI Assistant' }).click()
+    await page.getByLabel('AI provider', { exact: true }).selectOption(
+      'openai-codex'
+    )
+    await request.post(`${CONTROL_URL}/scenario?name=codex-text-only`)
+    await expect
+      .poll(() =>
+        page
+          .getByLabel('AI model', { exact: true })
+          .locator('option:checked')
+          .getAttribute('data-input-modalities')
+      )
+      .toBe('text')
+    await page.getByRole('button', { name: 'Sheet Preview' }).click()
+    await expect(inspectButton).toBeDisabled()
+    await expect(inspectButton).toHaveAttribute(
+      'title',
+      /explicitly excludes image input/
+    )
+    await page.getByRole('button', { name: 'AI Assistant' }).click()
+    await expect(page.locator('.chat-textarea')).toBeEnabled()
+    await expect(page.getByLabel('AI provider', { exact: true })).toHaveValue(
+      'openai-codex'
+    )
+  })
+
   test('revalidates Fit Drawing after camera, viewport, UI, theme, and history changes', async ({
     page
   }) => {
@@ -689,6 +1204,13 @@ test.describe.serial('EnvCAD preview with scripted fake sidecar', () => {
       )
     ).toBe(true)
 
+    const warningCapture = await capturePreviewEvidence(page, 'full')
+    expect(warningCapture.error).toBeUndefined()
+    expect(warningCapture.unitMismatch).toBe(true)
+    expect(warningCapture.warningCount).toBeGreaterThan(0)
+    expect(warningCapture.width).toBe(1_400)
+    expect(warningCapture.byteLength).toBeLessThanOrEqual(1_179_648)
+
     await page.locator('input[accept=".dxf,.dwg"]').setInputFiles(FIXTURE)
     await expect
       .poll(() => page.evaluate(() => window.__cadTest?.sheet()))
@@ -697,8 +1219,18 @@ test.describe.serial('EnvCAD preview with scripted fake sidecar', () => {
       millimeterFixture
     )
     await expect
-      .poll(() => page.evaluate(() => window.__cadTest?.sheet()))
-      .toMatchObject({ drawingUnit: 'm' })
+      .poll(() =>
+        page.evaluate(() => ({
+          sheet: window.__cadTest?.sheet(),
+          databaseUnit: (
+            window.__cadTest?.session() as { databaseUnit?: string } | undefined
+          )?.databaseUnit
+        }))
+      )
+      .toMatchObject({
+        sheet: { drawingUnit: 'm' },
+        databaseUnit: 'mm'
+      })
 
     await page
       .getByRole('button', { name: 'Page Setup', exact: true })

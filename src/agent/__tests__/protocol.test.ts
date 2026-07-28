@@ -1,5 +1,32 @@
 import { describe, expect, it } from 'vitest'
-import { parseClientMessage, parseServerMessage } from '../protocol'
+import {
+  MAX_TOOL_IMAGE_BYTES,
+  modelImageInputSupport,
+  parseClientMessage,
+  parseServerMessage,
+  type ModelCapability,
+  type ProviderCapability,
+  validateToolResultForTool
+} from '../protocol'
+
+const onePixelPng =
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZQmcAAAAASUVORK5CYII='
+const onePixelPngSha256 =
+  '98884e721ec2f605f3788f2bc39a61de305ff4f4fcaf26b6f4eabeebcd6c0fb4'
+
+function validImage() {
+  return {
+    mimeType: 'image/png',
+    base64: onePixelPng,
+    byteLength: Buffer.from(onePixelPng, 'base64').byteLength,
+    width: 1,
+    height: 1,
+    aspectRatio: 1,
+    sha256: onePixelPngSha256,
+    captureId: 'sheet-1-full-0000000000000000',
+    renderRevision: 1
+  }
+}
 
 const validUserMessage = {
   type: 'user_message',
@@ -91,6 +118,90 @@ describe('agent protocol validation', () => {
     })
   })
 
+  it('accepts one validated image only for inspect_sheet_preview', () => {
+    const result = { data: { view: 'full' }, image: validImage() }
+    expect(
+      parseClientMessage({
+        type: 'tool_result',
+        callId: 'visual-1',
+        result
+      })
+    ).toEqual({
+      ok: true,
+      value: {
+        type: 'tool_result',
+        callId: 'visual-1',
+        result
+      }
+    })
+    expect(validateToolResultForTool('inspect_sheet_preview', result)).toEqual({
+      ok: true,
+      value: result
+    })
+    expect(validateToolResultForTool('get_view_status', result)).toEqual({
+      ok: false,
+      error: 'CAD tool "get_view_status" is not allowed to return an image'
+    })
+  })
+
+  it.each([
+    ['malformed Base64', { ...validImage(), base64: 'AB==' }],
+    ['unsupported MIME', { ...validImage(), mimeType: 'image/jpeg' }],
+    ['spoofed MIME', { ...validImage(), base64: Buffer.from('not a png').toString('base64') }],
+    ['mismatched dimensions', { ...validImage(), width: 2, aspectRatio: 2 }],
+    ['zero dimension', { ...validImage(), width: 0, aspectRatio: 0 }],
+    ['arbitrary path', { ...validImage(), path: 'C:\\secret.png' }],
+    ['arbitrary URL', { ...validImage(), url: 'https://example.com/preview.png' }]
+  ])('rejects a %s image payload', (_label, image) => {
+    expect(
+      parseClientMessage({
+        type: 'tool_result',
+        callId: 'visual-invalid',
+        result: { data: {}, image }
+      }).ok
+    ).toBe(false)
+  })
+
+  it('rejects oversized, multiple, missing, and error-conflicting images', () => {
+    const oversizedBase64 = 'A'.repeat(
+      Math.ceil((MAX_TOOL_IMAGE_BYTES + 1) / 3) * 4
+    )
+    expect(
+      parseClientMessage({
+        type: 'tool_result',
+        callId: 'visual-oversized',
+        result: {
+          data: {},
+          image: {
+            ...validImage(),
+            base64: oversizedBase64,
+            byteLength: MAX_TOOL_IMAGE_BYTES + 1
+          }
+        }
+      }).ok
+    ).toBe(false)
+    expect(
+      parseClientMessage({
+        type: 'tool_result',
+        callId: 'visual-multiple',
+        result: { data: {}, image: validImage(), images: [validImage()] }
+      }).ok
+    ).toBe(false)
+    expect(
+      validateToolResultForTool('inspect_sheet_preview', { data: {} })
+    ).toEqual({
+      ok: false,
+      error: 'CAD tool "inspect_sheet_preview" returned no image'
+    })
+    expect(
+      parseClientMessage({
+        type: 'tool_result',
+        callId: 'visual-conflict',
+        result: { error: 'failed', image: validImage() }
+      }).ok
+    ).toBe(false)
+  })
+
   it('rejects unknown client message types', () => {
     expect(parseClientMessage({ type: 'run_shell', command: 'whoami' })).toEqual({
       ok: false,
@@ -176,7 +287,7 @@ describe('agent protocol validation', () => {
   })
 
   it('validates capability defaults and completion metrics', () => {
-    const capability = {
+    const capability: ProviderCapability = {
       id: 'openai-codex',
       displayName: 'OpenAI Codex',
       status: 'ready',
@@ -215,6 +326,18 @@ describe('agent protocol validation', () => {
       ok: false,
       error: 'ai_capabilities.refreshing must be a boolean'
     })
+    const visualCapability: ModelCapability = {
+      ...capability.models[0],
+      inputModalities: ['text', 'image']
+    }
+    expect(modelImageInputSupport(visualCapability)).toBe('supported')
+    expect(
+      modelImageInputSupport({
+        ...capability.models[0],
+        inputModalities: ['text']
+      })
+    ).toBe('unsupported')
+    expect(modelImageInputSupport(capability.models[0])).toBe('unknown')
     expect(
       parseServerMessage({
         type: 'assistant_done',

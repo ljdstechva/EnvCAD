@@ -32,6 +32,7 @@ interface CliOptions {
 }
 
 interface PromptEvidence {
+  evidenceType?: 'prompt'
   recordedAt: string
   provider: ProviderId
   promptCharacters: number
@@ -682,7 +683,9 @@ async function readEvidence(filePath: string): Promise<PromptEvidence[]> {
   return contents
     .split(/\r?\n/)
     .filter(Boolean)
-    .map((line) => JSON.parse(line) as PromptEvidence)
+    .map((line) => JSON.parse(line) as { evidenceType?: string })
+    .filter((row) => row.evidenceType !== 'visual-image')
+    .map((row) => row as PromptEvidence)
 }
 
 async function main(): Promise<void> {

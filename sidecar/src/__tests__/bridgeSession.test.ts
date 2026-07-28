@@ -347,6 +347,54 @@ describe('BridgeSession', () => {
     await expect(second).resolves.toEqual({ data: null })
   })
 
+  it('rejects a spoofed image digest at the sidecar trust boundary', async () => {
+    const { ws, session } = sessionFixture()
+    await session.discoveryReady
+    ws.sent = []
+
+    const pending = session.callTool('inspect_sheet_preview', { view: 'full' })
+    await vi.waitFor(() => {
+      expect(
+        decodedMessages(ws).filter((message) => message.type === 'tool_call')
+      ).toHaveLength(1)
+    })
+    const call = decodedMessages(ws).find(
+      (message) => message.type === 'tool_call'
+    )
+    if (call?.type !== 'tool_call') throw new Error('missing visual tool call')
+
+    const base64 =
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZQmcAAAAASUVORK5CYII='
+    send(ws, {
+      type: 'tool_result',
+      callId: call.callId,
+      result: {
+        data: { view: 'full' },
+        image: {
+          mimeType: 'image/png',
+          base64,
+          byteLength: 68,
+          width: 1,
+          height: 1,
+          aspectRatio: 1,
+          sha256: '0'.repeat(64),
+          captureId: 'sheet-1-full-spoofed-digest',
+          renderRevision: 1
+        }
+      }
+    })
+
+    await expect(pending).resolves.toEqual({
+      error: 'Browser returned an invalid inspect_sheet_preview result.'
+    })
+    expect(decodedMessages(ws)).toContainEqual({
+      type: 'error',
+      message:
+        'Invalid browser message: invalid inspect_sheet_preview result: ' +
+        'tool_result.result.image.sha256 does not match the decoded image bytes'
+    })
+  })
+
   it('rejects unknown tools and times out an unanswered browser call', async () => {
     const { session } = sessionFixture()
     await session.discoveryReady

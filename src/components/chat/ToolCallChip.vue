@@ -13,7 +13,33 @@ const status = computed<'pending' | 'ok' | 'error'>(() => {
   return props.entry.result.error ? 'error' : 'ok'
 })
 
-const inputSummary = computed(() => summarize(props.entry.input))
+const inputSummary = computed(() => {
+  const image = props.entry.result?.image
+  if (props.entry.name === 'inspect_sheet_preview' && image) {
+    return `${image.width}×${image.height} · ${image.sha256.slice(0, 12)}`
+  }
+  return summarize(props.entry.input)
+})
+
+const displayResult = computed(() => {
+  const result = props.entry.result
+  if (!result?.image) return result
+  const image = result.image
+  return {
+    ...result,
+    image: {
+      mimeType: image.mimeType,
+      base64: '[image bytes omitted]',
+      byteLength: image.byteLength,
+      width: image.width,
+      height: image.height,
+      aspectRatio: image.aspectRatio,
+      sha256: image.sha256,
+      captureId: image.captureId,
+      renderRevision: image.renderRevision
+    }
+  }
+})
 
 const affectedIds = computed<string[]>(() => {
   const data = props.entry.result?.data
@@ -55,7 +81,7 @@ function summarize(value: unknown): string {
       </div>
       <div v-if="entry.result" class="detail-block">
         <div class="detail-label">Result</div>
-        <pre>{{ JSON.stringify(entry.result, null, 2) }}</pre>
+        <pre>{{ JSON.stringify(displayResult, null, 2) }}</pre>
       </div>
     </div>
   </div>

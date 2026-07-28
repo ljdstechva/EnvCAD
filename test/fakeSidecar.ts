@@ -19,6 +19,22 @@ let nextCallId = 1
 let userMessageCount = 0
 let toolResultCount = 0
 let completionDelayMs = 0
+let visualResultMode: 'success' | 'failure' = 'success'
+let currentScenario = 'ready'
+let lastVisualResultEvidence:
+  | {
+      provider: AgentConfiguration['provider']
+      model: string
+      toolName: 'inspect_sheet_preview'
+      success: boolean
+      mimeType?: string
+      width?: number
+      height?: number
+      byteLength?: number
+      rasterSha256?: string
+      svgSha256?: string
+    }
+  | undefined
 let lastPromptEvidence:
   | {
       provider: AgentConfiguration['provider']
@@ -43,6 +59,7 @@ const readyProviders: ProviderCapability[] = [
         invocationName: 'fake-claude',
         displayName: 'Fake Claude',
         description: 'Deterministic E2E model',
+        inputModalities: ['text', 'image'],
         supportedEfforts: [
           {
             value: 'low',
@@ -74,6 +91,7 @@ const readyProviders: ProviderCapability[] = [
         invocationName: 'fake-codex-balanced',
         displayName: 'Fake Codex Balanced',
         description: 'Deterministic balanced E2E model',
+        inputModalities: ['text', 'image'],
         supportedEfforts: [
           {
             value: 'low',
@@ -96,6 +114,7 @@ const readyProviders: ProviderCapability[] = [
         invocationName: 'fake-codex-fast',
         displayName: 'Fake Codex Fast',
         description: 'Deterministic fast E2E model',
+        inputModalities: ['text', 'image'],
         supportedEfforts: [
           {
             value: 'low',
@@ -119,6 +138,18 @@ function clonedCatalog(catalog: readonly ProviderCapability[]): ProviderCapabili
 function setScenario(name: string): boolean {
   if (name === 'ready') {
     providers = clonedCatalog(readyProviders)
+  } else if (name === 'codex-text-only') {
+    providers = clonedCatalog(readyProviders).map((provider) =>
+      provider.id === 'openai-codex'
+        ? {
+            ...provider,
+            models: provider.models.map((model) => ({
+              ...model,
+              inputModalities: ['text']
+            }))
+          }
+        : provider
+    )
   } else if (name === 'codex-missing') {
     providers = clonedCatalog(readyProviders).map((provider) =>
       provider.id === 'openai-codex'
@@ -144,6 +175,7 @@ function setScenario(name: string): boolean {
   } else {
     return false
   }
+  currentScenario = name
   if (webSocketServer) {
     for (const client of webSocketServer.clients) {
       send(client, {
@@ -214,29 +246,64 @@ async function runScriptedExchange(
     hasEndSentinel: message.text.includes('END-LONG-PROMPT-SENTINEL')
   }
   const callId = `fake-call-${nextCallId++}`
+  const visualRequest = message.text.includes(
+    'Inspect the current Sheet Preview.'
+  )
   send(socket, { type: 'status', state: 'thinking' })
   send(socket, {
     type: 'assistant_text_delta',
-    text: 'I will move the attached entities by exactly 5 drawing units. '
+    text: visualRequest
+      ? 'I will inspect the actual Sheet Preview image. '
+      : 'I will move the attached entities by exactly 5 drawing units. '
   })
   send(socket, {
     type: 'tool_call',
     callId,
-    name: 'move_entities',
-    input: {
-      entityIds: [...message.selectionSnapshot.ids],
-      dx: 5,
-      dy: 0
-    }
+    name: visualRequest ? 'inspect_sheet_preview' : 'move_entities',
+    input: visualRequest
+      ? { view: visualResultMode === 'success' ? 'full' : 'outside-page' }
+      : {
+          entityIds: [...message.selectionSnapshot.ids],
+          dx: 5,
+          dy: 0
+        }
   })
 
   const result = await waitForToolResult(socket, callId)
+  if (visualRequest) {
+    const data =
+      result.data && typeof result.data === 'object'
+        ? (result.data as Record<string, unknown>)
+        : undefined
+    lastVisualResultEvidence = {
+      provider: configuration.provider,
+      model: configuration.model,
+      toolName: 'inspect_sheet_preview',
+      success: Boolean(result.image) && !result.error,
+      ...(result.image
+        ? {
+            mimeType: result.image.mimeType,
+            width: result.image.width,
+            height: result.image.height,
+            byteLength: result.image.byteLength,
+            rasterSha256: result.image.sha256
+          }
+        : {}),
+      ...(typeof data?.svgSha256 === 'string'
+        ? { svgSha256: data.svgSha256 }
+        : {})
+    }
+  }
   if (completionDelayMs > 0) {
     await new Promise((resolve) => setTimeout(resolve, completionDelayMs))
   }
   send(socket, {
     type: 'assistant_text_delta',
-    text: result.error ? `The move failed: ${result.error}` : 'The scripted move completed.'
+    text: result.error
+      ? `${visualRequest ? 'The inspection' : 'The move'} failed: ${result.error}`
+      : visualRequest
+        ? 'The scripted visual inspection completed.'
+        : 'The scripted move completed.'
   })
   send(socket, {
     type: 'assistant_done',
@@ -363,16 +430,11 @@ async function handleControl(
       wsRunning: Boolean(webSocketServer),
       userMessageCount,
       toolResultCount,
-      scenario:
-        providers[0]?.status === 'ready' && providers[1]?.status === 'ready'
-          ? 'ready'
-          : providers.every(
-                (provider) => provider.status === 'authentication-required'
-              )
-            ? 'both-unavailable'
-            : 'codex-missing',
+      scenario: currentScenario,
       completionDelayMs,
-      lastPromptEvidence
+      visualResultMode,
+      lastPromptEvidence,
+      lastVisualResultEvidence
     })
     return
   }
@@ -390,6 +452,7 @@ async function handleControl(
     userMessageCount = 0
     toolResultCount = 0
     lastPromptEvidence = undefined
+    lastVisualResultEvidence = undefined
     json(response, 200, { ok: true })
     return
   }
@@ -410,6 +473,16 @@ async function handleControl(
     }
     completionDelayMs = value
     json(response, 200, { ok: true, completionDelayMs })
+    return
+  }
+  if (request.method === 'POST' && requestUrl.pathname === '/visual-result') {
+    const mode = requestUrl.searchParams.get('mode')
+    if (mode !== 'success' && mode !== 'failure') {
+      json(response, 400, { error: 'Visual result mode must be success or failure' })
+      return
+    }
+    visualResultMode = mode
+    json(response, 200, { ok: true, visualResultMode })
     return
   }
   json(response, 404, { error: 'Not found' })

@@ -5,9 +5,12 @@ import {
 } from '../../../desktop/codexExecutable'
 import type {
   AgentConfiguration,
+  InputModality,
   ModelCapability,
-  ProviderCapability
+  ProviderCapability,
+  ToolResult
 } from '../../../src/agent/protocol'
+import { modelImageInputSupport } from '../../../src/agent/protocol'
 import {
   CAD_TOOL_SPECS,
   executeCadTool,
@@ -35,6 +38,7 @@ import {
   presentBlockedEnvironmentNames,
   redactProviderDiagnostic
 } from './environment'
+import { recordProviderVisualEvidence } from './acceptanceEvidence'
 import { recordProviderPromptEvidence } from './acceptanceEvidence'
 import type {
   AgentConversation,
@@ -158,6 +162,7 @@ interface CodexModel {
     reasoningEffort: string
     description: string
   }>
+  inputModalities?: InputModality[]
 }
 
 interface ModelListResult {
@@ -261,6 +266,23 @@ function parseModelListResult(value: unknown): ModelListResult {
         description: effort.description
       }
     })
+    let inputModalities: InputModality[] | undefined
+    if (Object.prototype.hasOwnProperty.call(raw, 'inputModalities')) {
+      const supported = new Set<InputModality>(['text', 'image', 'audio'])
+      if (
+        !Array.isArray(raw.inputModalities) ||
+        raw.inputModalities.length > supported.size ||
+        !raw.inputModalities.every(
+          (modality) =>
+            typeof modality === 'string' &&
+            supported.has(modality as InputModality)
+        ) ||
+        new Set(raw.inputModalities).size !== raw.inputModalities.length
+      ) {
+        throw new Error('Codex model/list returned malformed input modalities.')
+      }
+      inputModalities = [...raw.inputModalities] as InputModality[]
+    }
     return {
       id: raw.id as string,
       model: raw.model as string,
@@ -269,7 +291,8 @@ function parseModelListResult(value: unknown): ModelListResult {
       hidden: raw.hidden,
       isDefault: raw.isDefault,
       defaultReasoningEffort: raw.defaultReasoningEffort as string,
-      supportedReasoningEfforts
+      supportedReasoningEfforts,
+      ...(inputModalities ? { inputModalities } : {})
     }
   })
   return {
@@ -309,6 +332,9 @@ function mapModels(models: readonly CodexModel[]): ModelCapability[] {
       description: model.description,
       supportedEfforts: createEffortCapabilities(values, defaultEffort, descriptions),
       ...(defaultEffort ? { defaultEffort } : {}),
+      ...(model.inputModalities
+        ? { inputModalities: [...model.inputModalities] }
+        : {}),
       isDefault: model.isDefault
     } satisfies ModelCapability
   })
@@ -317,21 +343,50 @@ function mapModels(models: readonly CodexModel[]): ModelCapability[] {
   return mapped.map((model, index) => ({ ...model, isDefault: index === defaultIndex }))
 }
 
-function dynamicToolResult(result: { data?: unknown; error?: string }) {
+const MAX_VISUAL_METADATA_CHARACTERS = 32_000
+
+export function toCodexDynamicToolResult(result: ToolResult) {
   if (result.error) {
     return {
       contentItems: [{ type: 'inputText', text: result.error }],
       success: false
     }
   }
+  const text =
+    typeof result.data === 'string'
+      ? result.data
+      : JSON.stringify(result.data ?? null, null, 2)
+  if (result.image) {
+    if (
+      text.length > MAX_VISUAL_METADATA_CHARACTERS ||
+      text.includes(result.image.base64)
+    ) {
+      return {
+        contentItems: [
+          {
+            type: 'inputText',
+            text: 'Sheet Preview metadata was unsafe or too large to send.'
+          }
+        ],
+        success: false
+      }
+    }
+    return {
+      contentItems: [
+        { type: 'inputText', text },
+        {
+          type: 'inputImage',
+          imageUrl: `data:${result.image.mimeType};base64,${result.image.base64}`
+        }
+      ],
+      success: true
+    }
+  }
   return {
     contentItems: [
       {
         type: 'inputText',
-        text:
-          typeof result.data === 'string'
-            ? result.data
-            : JSON.stringify(result.data ?? null, null, 2)
+        text
       }
     ],
     success: true
@@ -395,6 +450,9 @@ class CodexConversation implements AgentConversation {
   private fatalError: Error | undefined
   private readonly removeNotificationListener: () => void
   private readonly removeProtocolErrorListener: () => void
+  private readonly dynamicToolSpecs: typeof CAD_TOOL_SPECS
+  private readonly allowedDynamicToolNames: Set<string>
+  private readonly instructions: string
 
   private constructor(
     private readonly configuration: AgentConfiguration,
@@ -402,8 +460,24 @@ class CodexConversation implements AgentConversation {
     private readonly client: CodexAppServerClient,
     private readonly runtimeDirectory: string,
     private readonly environment: NodeJS.ProcessEnv,
+    imageInputSupport: ReturnType<typeof modelImageInputSupport>,
     private readonly onClosed: () => void
   ) {
+    this.dynamicToolSpecs =
+      imageInputSupport === 'unsupported'
+        ? CAD_TOOL_SPECS.filter(
+            (spec) => spec.name !== 'inspect_sheet_preview'
+          )
+        : CAD_TOOL_SPECS
+    this.allowedDynamicToolNames = new Set(
+      this.dynamicToolSpecs.map((spec) => spec.name)
+    )
+    this.instructions =
+      imageInputSupport === 'unsupported'
+        ? `${SECURITY_INSTRUCTIONS}
+
+The selected Codex model explicitly excludes image input. The visual Sheet Preview tool is disabled for this conversation. Ordinary CAD tools remain available, but you must state that this model cannot visually inspect Sheet Preview and must never claim visual QA.`
+        : SECURITY_INSTRUCTIONS
     client.setServerRequestHandler((request) => this.handleServerRequest(request))
     this.removeNotificationListener = client.onNotification((notification) =>
       this.handleNotification(notification)
@@ -420,6 +494,7 @@ class CodexConversation implements AgentConversation {
     runtimeDirectory: string,
     environment: NodeJS.ProcessEnv,
     disabledMcpServerNames: readonly string[],
+    imageInputSupport: ReturnType<typeof modelImageInputSupport>,
     onClosed: () => void
   ): Promise<CodexConversation> {
     const conversation = new CodexConversation(
@@ -428,6 +503,7 @@ class CodexConversation implements AgentConversation {
       client,
       runtimeDirectory,
       environment,
+      imageInputSupport,
       onClosed
     )
     try {
@@ -450,9 +526,9 @@ class CodexConversation implements AgentConversation {
         ephemeral: true,
         experimentalRawEvents: false,
         environments: [],
-        baseInstructions: SECURITY_INSTRUCTIONS,
-        developerInstructions: SECURITY_INSTRUCTIONS,
-        dynamicTools: CAD_TOOL_SPECS.map((spec) => ({
+        baseInstructions: conversation.instructions,
+        developerInstructions: conversation.instructions,
+        dynamicTools: conversation.dynamicToolSpecs.map((spec) => ({
           type: 'function',
           name: spec.name,
           description: spec.description,
@@ -583,6 +659,13 @@ class CodexConversation implements AgentConversation {
     if (params.namespace !== undefined && params.namespace !== null) {
       throw new Error('Codex namespaced tools are disabled in EnvCAD.')
     }
+    if (!this.allowedDynamicToolNames.has(params.tool as string)) {
+      throw new Error(
+        `Codex requested a dynamic CAD tool that is unavailable for the selected model: ${String(
+          params.tool
+        )}`
+      )
+    }
     const result = await executeCadTool(
       this.tools,
       params.tool as string,
@@ -594,7 +677,23 @@ class CodexConversation implements AgentConversation {
       )
       setImmediate(() => this.securityFailure(failure))
     }
-    return dynamicToolResult(result)
+    const forwarded = toCodexDynamicToolResult(result)
+    if (
+      result.image &&
+      forwarded.success &&
+      forwarded.contentItems.some((item) => item.type === 'inputImage')
+    ) {
+      await recordProviderVisualEvidence(
+        {
+          provider: 'openai-codex',
+          configuration: this.configuration,
+          transport: 'codex-dynamic-inputImage',
+          result
+        },
+        this.environment
+      )
+    }
+    return forwarded
   }
 
   private handleNotification(notification: CodexNotification): void {
@@ -1363,6 +1462,14 @@ export class CodexProvider implements AgentProvider {
     if (this.capability.status !== 'ready' || !this.executablePath) {
       throw new Error(`OpenAI Codex is unavailable: ${this.capability.statusMessage}`)
     }
+    const model = this.capability.models.find(
+      (candidate) => candidate.invocationName === configuration.model
+    )
+    if (!model) {
+      throw new Error(
+        `OpenAI Codex did not advertise the selected model: ${configuration.model}`
+      )
+    }
     const client = this.createClient(this.executablePath)
     let conversation: CodexConversation | undefined
     conversation = await CodexConversation.create(
@@ -1372,6 +1479,7 @@ export class CodexProvider implements AgentProvider {
       this.options.runtimeDirectory,
       this.environment,
       this.disabledMcpServerNames,
+      modelImageInputSupport(model),
       () => {
         if (conversation) this.conversations.delete(conversation)
       }

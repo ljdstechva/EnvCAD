@@ -117,6 +117,22 @@ let manager: AcApDocManager | null = null
 let container: HTMLElement | null = null
 let hooks: CadSessionHooks | null = null
 let pendingRegenerationCheck: Promise<void> = Promise.resolve()
+let documentRevision = 0
+let contentRevision = 0
+
+export interface CadSessionRevision {
+  documentRevision: number
+  contentRevision: number
+}
+
+export function getCadSessionRevision(): CadSessionRevision {
+  return { documentRevision, contentRevision }
+}
+
+function advanceDocumentRevision(): void {
+  documentRevision += 1
+  contentRevision = 0
+}
 
 export function bindCadSession(
   nextManager: AcApDocManager,
@@ -130,6 +146,7 @@ export function bindCadSession(
 }
 
 export function setNoCadDocument(): void {
+  advanceDocumentRevision()
   Object.assign(mutableState, {
     status: 'no-document' satisfies CadSessionStatus,
     documentName: undefined,
@@ -152,6 +169,7 @@ export function setNoCadDocument(): void {
 }
 
 export function beginCadDocumentReplacement(): void {
+  advanceDocumentRevision()
   Object.assign(mutableState, {
     status: 'closing' satisfies CadSessionStatus,
     editable: false,
@@ -161,11 +179,13 @@ export function beginCadDocumentReplacement(): void {
     visibleEntityCount: 0,
     renderableGeometryCount: 0,
     renderedEntityCount: 0,
-    drawingExtents: undefined
+    drawingExtents: undefined,
+    sheetPreview: { ...EMPTY_PREVIEW }
   })
 }
 
 export function beginCadDocumentOpen(documentName: string): void {
+  advanceDocumentRevision()
   Object.assign(mutableState, {
     status: 'opening' satisfies CadSessionStatus,
     documentName,
@@ -187,6 +207,7 @@ export function beginCadDocumentOpen(documentName: string): void {
 }
 
 export function failCadDocumentOpen(documentName: string, error: string): void {
+  advanceDocumentRevision()
   Object.assign(mutableState, {
     status: 'failed' satisfies CadSessionStatus,
     documentName,
@@ -217,6 +238,7 @@ export async function activateCadDocument(
   }
 
   const database = manager.curDocument.database
+  advanceDocumentRevision()
   const modelSpaceId = database.tables.blockTable.modelSpace.objectId
   const modelLayout = prepareCadDocumentView(manager)
 
@@ -334,6 +356,7 @@ export function markCadSessionDatabaseEdited(): void {
 
 export function scheduleCadSessionRegeneration(): void {
   const active = requireEditableCadSession()
+  contentRevision += 1
   const attemptedAt = Date.now()
   invalidateRenderedEvidence()
   mutableState.lastRegeneration = {

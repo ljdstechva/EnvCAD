@@ -27,6 +27,8 @@ export interface EffortCapability {
   isDefault: boolean
 }
 
+export type InputModality = 'text' | 'image' | 'audio'
+
 export interface ModelCapability {
   /** Stable row id from the provider catalog. */
   id: string
@@ -38,6 +40,11 @@ export interface ModelCapability {
   description: string
   supportedEfforts: EffortCapability[]
   defaultEffort?: string
+  /**
+   * Provider-advertised input modalities. Absence means the runtime did not
+   * report modality metadata and image support must be verified by a real call.
+   */
+  inputModalities?: InputModality[]
   isDefault: boolean
 }
 
@@ -84,8 +91,35 @@ export interface SheetSnapshot {
   fields?: Record<string, string>
 }
 
+export const TOOL_IMAGE_MIME_TYPES = ['image/png', 'image/webp'] as const
+export type ToolImageMimeType = (typeof TOOL_IMAGE_MIME_TYPES)[number]
+
+/**
+ * Keeps Base64-expanded tool results comfortably below both EnvCAD's 2 MiB
+ * WebSocket limit and Codex app-server's 2 MiB JSONL line limit.
+ */
+export const MAX_TOOL_IMAGE_BYTES = 1_179_648
+export const MAX_TOOL_IMAGE_DIMENSION = 4_096
+export const MAX_TOOL_IMAGE_PIXELS = 16_777_216
+export const IMAGE_CAPABLE_CAD_TOOL_NAMES = [
+  'inspect_sheet_preview'
+] as const satisfies readonly CadToolName[]
+
+export interface ToolImagePayload {
+  mimeType: ToolImageMimeType
+  base64: string
+  byteLength: number
+  width: number
+  height: number
+  aspectRatio: number
+  sha256: string
+  captureId: string
+  renderRevision: number
+}
+
 export interface ToolResult {
   data?: unknown
+  image?: ToolImagePayload
   error?: string
 }
 
@@ -161,6 +195,11 @@ const MAX_DESCRIPTION_LENGTH = 4_000
 const MAX_SELECTION_IDS = 10_000
 const MAX_MODELS_PER_PROVIDER = 100
 const MAX_EFFORTS_PER_MODEL = 10
+const INPUT_MODALITY_SET = new Set<InputModality>(['text', 'image', 'audio'])
+const TOOL_IMAGE_MIME_TYPE_SET = new Set<string>(TOOL_IMAGE_MIME_TYPES)
+const IMAGE_CAPABLE_CAD_TOOL_NAME_SET = new Set<string>(
+  IMAGE_CAPABLE_CAD_TOOL_NAMES
+)
 export const MAX_WEBSOCKET_PAYLOAD_BYTES = 2 * 1024 * 1024
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -282,18 +321,266 @@ function parseSheetSnapshot(value: unknown): ProtocolParseResult<SheetSnapshot> 
 
 function parseToolResult(value: unknown): ProtocolParseResult<ToolResult> {
   if (!isRecord(value)) return failure('tool_result.result must be an object')
-  if (!hasOnlyKeys(value, ['data', 'error'])) {
+  if (!hasOnlyKeys(value, ['data', 'image', 'error'])) {
     return failure('tool_result.result contains unsupported fields')
   }
   const hasData = hasOwn(value, 'data')
+  const hasImage = hasOwn(value, 'image')
   const hasError = hasOwn(value, 'error')
-  if (hasData === hasError) {
+  if (hasData === hasError || (hasError && hasImage)) {
     return failure('tool_result.result must contain exactly one of data or error')
   }
   if (hasError && !isNonEmptyString(value.error)) {
     return failure('tool_result.result.error must be a bounded non-empty string')
   }
+  if (hasImage) {
+    const image = parseToolImagePayload(value.image)
+    if (!image.ok) return failure(image.error)
+  }
   return { ok: true, value: value as ToolResult }
+}
+
+function parseToolImagePayload(
+  value: unknown
+): ProtocolParseResult<ToolImagePayload> {
+  if (!isRecord(value)) return failure('tool_result.result.image must be an object')
+  if (
+    !hasOnlyKeys(value, [
+      'mimeType',
+      'base64',
+      'byteLength',
+      'width',
+      'height',
+      'aspectRatio',
+      'sha256',
+      'captureId',
+      'renderRevision'
+    ])
+  ) {
+    return failure('tool_result.result.image contains unsupported fields')
+  }
+  if (
+    typeof value.mimeType !== 'string' ||
+    !TOOL_IMAGE_MIME_TYPE_SET.has(value.mimeType)
+  ) {
+    return failure('tool_result.result.image.mimeType is unsupported')
+  }
+  if (typeof value.base64 !== 'string') {
+    return failure('tool_result.result.image.base64 must be a Base64 string')
+  }
+  const decodedLength = decodedBase64Length(value.base64)
+  if (decodedLength === undefined) {
+    return failure('tool_result.result.image.base64 is malformed')
+  }
+  if (decodedLength <= 0 || decodedLength > MAX_TOOL_IMAGE_BYTES) {
+    return failure(
+      `tool_result.result.image exceeds the ${MAX_TOOL_IMAGE_BYTES}-byte decoded limit`
+    )
+  }
+  if (
+    !Number.isSafeInteger(value.byteLength) ||
+    value.byteLength !== decodedLength
+  ) {
+    return failure(
+      'tool_result.result.image.byteLength must equal the decoded Base64 length'
+    )
+  }
+  if (
+    !validImageDimension(value.width) ||
+    !validImageDimension(value.height) ||
+    (value.width as number) * (value.height as number) > MAX_TOOL_IMAGE_PIXELS
+  ) {
+    return failure('tool_result.result.image dimensions are invalid or excessive')
+  }
+  const expectedAspectRatio = (value.width as number) / (value.height as number)
+  if (
+    typeof value.aspectRatio !== 'number' ||
+    !Number.isFinite(value.aspectRatio) ||
+    Math.abs(value.aspectRatio - expectedAspectRatio) > 1e-9
+  ) {
+    return failure('tool_result.result.image.aspectRatio does not match its dimensions')
+  }
+  const headerDimensions = imageHeaderDimensions(
+    value.base64,
+    value.mimeType as ToolImageMimeType
+  )
+  if (
+    !headerDimensions ||
+    headerDimensions.width !== value.width ||
+    headerDimensions.height !== value.height
+  ) {
+    return failure(
+      'tool_result.result.image bytes do not match the declared MIME type and dimensions'
+    )
+  }
+  if (
+    typeof value.sha256 !== 'string' ||
+    !/^[a-f0-9]{64}$/.test(value.sha256)
+  ) {
+    return failure('tool_result.result.image.sha256 must be a lowercase SHA-256 hex digest')
+  }
+  if (
+    typeof value.captureId !== 'string' ||
+    !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/.test(value.captureId)
+  ) {
+    return failure('tool_result.result.image.captureId is invalid')
+  }
+  if (!isRevision(value.renderRevision)) {
+    return failure('tool_result.result.image.renderRevision must be a positive safe integer')
+  }
+  return { ok: true, value: value as unknown as ToolImagePayload }
+}
+
+function validImageDimension(value: unknown): value is number {
+  return (
+    Number.isSafeInteger(value) &&
+    (value as number) > 0 &&
+    (value as number) <= MAX_TOOL_IMAGE_DIMENSION
+  )
+}
+
+function decodedBase64Length(value: string): number | undefined {
+  if (
+    value.length === 0 ||
+    value.length % 4 !== 0 ||
+    !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(
+      value
+    )
+  ) {
+    return undefined
+  }
+
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+  if (value.endsWith('==')) {
+    const trailing = alphabet.indexOf(value[value.length - 3])
+    if (trailing < 0 || (trailing & 0x0f) !== 0) return undefined
+  } else if (value.endsWith('=')) {
+    const trailing = alphabet.indexOf(value[value.length - 2])
+    if (trailing < 0 || (trailing & 0x03) !== 0) return undefined
+  }
+  const padding = value.endsWith('==') ? 2 : value.endsWith('=') ? 1 : 0
+  return (value.length / 4) * 3 - padding
+}
+
+function imageHeaderDimensions(
+  base64: string,
+  mimeType: ToolImageMimeType
+): { width: number; height: number } | undefined {
+  const bytes = decodeBase64Prefix(base64, 30)
+  if (mimeType === 'image/png') {
+    if (
+      bytes.length < 24 ||
+      !sameBytes(bytes, 0, [137, 80, 78, 71, 13, 10, 26, 10]) ||
+      !sameBytes(bytes, 12, [73, 72, 68, 82])
+    ) {
+      return undefined
+    }
+    return {
+      width: readUint32BigEndian(bytes, 16),
+      height: readUint32BigEndian(bytes, 20)
+    }
+  }
+
+  if (
+    bytes.length < 30 ||
+    !sameBytes(bytes, 0, [82, 73, 70, 70]) ||
+    !sameBytes(bytes, 8, [87, 69, 66, 80])
+  ) {
+    return undefined
+  }
+  const chunk = String.fromCharCode(...bytes.slice(12, 16))
+  if (chunk === 'VP8X') {
+    return {
+      width: 1 + readUint24LittleEndian(bytes, 24),
+      height: 1 + readUint24LittleEndian(bytes, 27)
+    }
+  }
+  if (chunk === 'VP8L' && bytes[20] === 0x2f) {
+    return {
+      width: 1 + bytes[21] + ((bytes[22] & 0x3f) << 8),
+      height:
+        1 +
+        ((bytes[22] & 0xc0) >> 6) +
+        (bytes[23] << 2) +
+        ((bytes[24] & 0x0f) << 10)
+    }
+  }
+  if (
+    chunk === 'VP8 ' &&
+    sameBytes(bytes, 23, [0x9d, 0x01, 0x2a])
+  ) {
+    return {
+      width: (bytes[26] | (bytes[27] << 8)) & 0x3fff,
+      height: (bytes[28] | (bytes[29] << 8)) & 0x3fff
+    }
+  }
+  return undefined
+}
+
+function decodeBase64Prefix(value: string, maximumBytes: number): number[] {
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+  const bytes: number[] = []
+  for (let index = 0; index < value.length && bytes.length < maximumBytes; index += 4) {
+    const a = alphabet.indexOf(value[index])
+    const b = alphabet.indexOf(value[index + 1])
+    const c = value[index + 2] === '=' ? 0 : alphabet.indexOf(value[index + 2])
+    const d = value[index + 3] === '=' ? 0 : alphabet.indexOf(value[index + 3])
+    if (a < 0 || b < 0 || c < 0 || d < 0) return []
+    bytes.push((a << 2) | (b >> 4))
+    if (value[index + 2] !== '=') bytes.push(((b & 0x0f) << 4) | (c >> 2))
+    if (value[index + 3] !== '=') bytes.push(((c & 0x03) << 6) | d)
+  }
+  return bytes.slice(0, maximumBytes)
+}
+
+function sameBytes(
+  source: readonly number[],
+  offset: number,
+  expected: readonly number[]
+): boolean {
+  return expected.every((value, index) => source[offset + index] === value)
+}
+
+function readUint32BigEndian(bytes: readonly number[], offset: number): number {
+  return (
+    bytes[offset] * 0x1000000 +
+    (bytes[offset + 1] << 16) +
+    (bytes[offset + 2] << 8) +
+    bytes[offset + 3]
+  )
+}
+
+function readUint24LittleEndian(bytes: readonly number[], offset: number): number {
+  return bytes[offset] | (bytes[offset + 1] << 8) | (bytes[offset + 2] << 16)
+}
+
+export function validateToolResultForTool(
+  name: string,
+  value: unknown
+): ProtocolParseResult<ToolResult> {
+  const parsed = parseToolResult(value)
+  if (!parsed.ok) return parsed
+  if (
+    parsed.value.image &&
+    !IMAGE_CAPABLE_CAD_TOOL_NAME_SET.has(name)
+  ) {
+    return failure(`CAD tool "${name}" is not allowed to return an image`)
+  }
+  if (
+    !parsed.value.image &&
+    IMAGE_CAPABLE_CAD_TOOL_NAME_SET.has(name) &&
+    !parsed.value.error
+  ) {
+    return failure(`CAD tool "${name}" returned no image`)
+  }
+  return parsed
+}
+
+export function modelImageInputSupport(
+  model: Pick<ModelCapability, 'inputModalities'>
+): 'supported' | 'unsupported' | 'unknown' {
+  if (model.inputModalities === undefined) return 'unknown'
+  return model.inputModalities.includes('image') ? 'supported' : 'unsupported'
 }
 
 export function parseAgentConfiguration(
@@ -352,6 +639,7 @@ function parseModelCapability(value: unknown): ProtocolParseResult<ModelCapabili
       'description',
       'supportedEfforts',
       'defaultEffort',
+      'inputModalities',
       'isDefault'
     ])
   ) {
@@ -401,6 +689,22 @@ function parseModelCapability(value: unknown): ProtocolParseResult<ModelCapabili
     (markedDefaults.length !== 1 || markedDefaults[0].value !== value.defaultEffort)
   ) {
     return failure('model capability default effort metadata is inconsistent')
+  }
+  if (value.inputModalities !== undefined) {
+    if (
+      !Array.isArray(value.inputModalities) ||
+      value.inputModalities.length > INPUT_MODALITY_SET.size ||
+      !value.inputModalities.every(
+        (modality) =>
+          typeof modality === 'string' &&
+          INPUT_MODALITY_SET.has(modality as InputModality)
+      ) ||
+      new Set(value.inputModalities).size !== value.inputModalities.length
+    ) {
+      return failure(
+        'model capability inputModalities must be unique supported modality names when provided'
+      )
+    }
   }
   if (typeof value.isDefault !== 'boolean') {
     return failure('model capability isDefault must be a boolean')
