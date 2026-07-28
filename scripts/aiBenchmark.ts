@@ -291,7 +291,7 @@ export function resolveBenchmarkLaunchTarget(
   const executable = candidates.find((candidate) => existsSync(candidate))
   if (!executable) {
     throw new Error(
-      'Installed EnvCAD was not found. Install v0.2.0 or pass --executable <EnvCAD.exe>.'
+      'Installed EnvCAD was not found. Install v0.2.1 or pass --executable <EnvCAD.exe>.'
     )
   }
   const requestedExecutable = path.resolve(executable)

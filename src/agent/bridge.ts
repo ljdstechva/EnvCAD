@@ -8,6 +8,7 @@ import {
 } from '../../desktop/runtimeProtocol'
 import { pushToast } from '../toast/toastStore'
 import {
+  MAX_WEBSOCKET_PAYLOAD_BYTES,
   parseClientMessage,
   parseServerMessage,
   type AgentConfiguration,
@@ -147,6 +148,7 @@ export class AgentBridge {
   private pendingConfiguration: AgentConfiguration | undefined
   private pendingResetRevision: number | undefined
   private readonly fallbackNotices = new Set<string>()
+  private lastSendError: string | undefined
 
   registerHandler(name: string, handler: ToolHandler): void {
     this.handlers.set(name, handler)
@@ -301,7 +303,10 @@ export class AgentBridge {
       configurationRevision: this.state.appliedRevision
     }
     if (!this.send(message)) {
-      throw new Error('AI Assistant sidecar is offline; the message was not sent.')
+      throw new Error(
+        this.lastSendError ??
+          'AI Assistant sidecar is offline; the message was not sent.'
+      )
     }
     this.state.messages.push({ role: 'user', text })
   }
@@ -472,25 +477,43 @@ export class AgentBridge {
   }
 
   private send(message: ClientMessage): boolean {
+    this.lastSendError = undefined
     const parsed = parseClientMessage(message)
     if (!parsed.ok) {
-      this.reportBridgeError(
-        `Refusing to send invalid browser message: ${parsed.error}`
-      )
+      this.lastSendError = `Refusing to send invalid browser message: ${parsed.error}`
+      this.reportBridgeError(this.lastSendError)
       return false
     }
-    if (import.meta.env.DEV) console.debug('[agent-bridge] ->', message)
+    const serialized = JSON.stringify(parsed.value)
+    const payloadBytes = new TextEncoder().encode(serialized).byteLength
+    if (payloadBytes > MAX_WEBSOCKET_PAYLOAD_BYTES) {
+      this.lastSendError =
+        `The complete AI request is ${payloadBytes.toLocaleString()} bytes and exceeds ` +
+        "EnvCAD's 2 MiB transport capacity. Reduce the prompt, selection, or sheet context and try again."
+      this.reportBridgeError(this.lastSendError)
+      return false
+    }
+    if (import.meta.env.DEV) {
+      console.debug('[agent-bridge] ->', {
+        type: message.type,
+        payloadBytes,
+        ...(message.type === 'user_message'
+          ? { promptCharacters: message.text.length }
+          : {})
+      })
+    }
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       try {
-        this.ws.send(JSON.stringify(message))
+        this.ws.send(serialized)
         return true
       } catch (error) {
-        this.reportBridgeError(
-          `Failed to send ${message.type}: ${
-            error instanceof Error ? error.message : String(error)
-          }`
-        )
+        this.lastSendError = `Failed to send ${message.type}: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+        this.reportBridgeError(this.lastSendError)
       }
+    } else {
+      this.lastSendError = 'AI Assistant sidecar is offline; the message was not sent.'
     }
     return false
   }

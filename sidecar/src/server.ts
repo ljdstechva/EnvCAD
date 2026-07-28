@@ -9,9 +9,9 @@ import {
 import { ClaudeProvider } from './providers/claudeProvider'
 import { CodexProvider } from './providers/codexProvider'
 import { ProviderManager } from './providers/providerManager'
+import { MAX_WEBSOCKET_PAYLOAD_BYTES } from '../../src/agent/protocol'
 
 const DEFAULT_CLOSE_TIMEOUT_MS = 2_000
-const MAX_WEBSOCKET_PAYLOAD_BYTES = 2 * 1024 * 1024
 
 export interface SidecarLogger {
   log(message: string): void

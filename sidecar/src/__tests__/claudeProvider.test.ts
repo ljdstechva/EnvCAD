@@ -68,7 +68,13 @@ async function collect<T>(events: AsyncIterable<T>): Promise<T[]> {
 describe('ClaudeProvider', () => {
   it('maps live aliases, resolved models, and advertised effort levels', async () => {
     const queryFactory = vi.fn(() => fakeQuery([], models))
-    const provider = new ClaudeProvider(baseOptions(queryFactory))
+    const options = baseOptions(queryFactory)
+    options.environment = {
+      ...options.environment,
+      ENVCAD_ACCEPTANCE_EVIDENCE_PATH:
+        'C:\\acceptance\\provider-prompt-evidence.jsonl'
+    }
+    const provider = new ClaudeProvider(options)
 
     await expect(provider.discover()).resolves.toMatchObject({
       id: 'claude-code',
@@ -110,6 +116,9 @@ describe('ClaudeProvider', () => {
       skills: [],
       plugins: []
     })
+    expect(discoveryOptions.env).not.toHaveProperty(
+      'ENVCAD_ACCEPTANCE_EVIDENCE_PATH'
+    )
   })
 
   it('passes the exact model and effort while keeping every built-in tool absent', async () => {
@@ -152,13 +161,17 @@ describe('ClaudeProvider', () => {
       }
     )
 
+    const longPrompt =
+      `BEGIN-CLAUDE-SENTINEL\n${'α🌏'.repeat(8_000)}` +
+      `\nMIDDLE-CLAUDE-SENTINEL\n${'z'.repeat(8_000)}\nEND-CLAUDE-SENTINEL  `
     await expect(
-      collect(conversation.runTurn({ prompt: 'draw' }))
+      collect(conversation.runTurn({ prompt: longPrompt }))
     ).resolves.toEqual([
       { type: 'resolved_model', model: 'claude-opus-test' },
       { type: 'text_delta', text: 'Created.' },
       { type: 'token_usage', inputTokens: 10, outputTokens: 4 }
     ])
+    expect(queryFactory.mock.calls[1][0].prompt).toBe(longPrompt)
     const turnOptions = queryFactory.mock.calls[1][0].options
     expect(turnOptions).toMatchObject({
       model: 'default',

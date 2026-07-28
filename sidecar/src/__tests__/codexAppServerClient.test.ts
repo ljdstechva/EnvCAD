@@ -3,6 +3,7 @@ import { PassThrough } from 'node:stream'
 import type { ChildProcessWithoutNullStreams } from 'node:child_process'
 import { describe, expect, it, vi } from 'vitest'
 import { CodexAppServerClient } from '../providers/codexAppServerClient'
+import { buildCodexProcessOverrides } from '../providers/codexSecurityConfig'
 
 class FakeChild extends EventEmitter {
   stdin = new PassThrough()
@@ -28,7 +29,10 @@ interface Harness {
   client: CodexAppServerClient
 }
 
-function harness(requestTimeoutMs = 100): Harness {
+function harness(
+  requestTimeoutMs = 100,
+  disabledMcpServerNames: readonly string[] = []
+): Harness {
   const child = new FakeChild()
   const writes: Array<Record<string, unknown>> = []
   let buffer = ''
@@ -54,6 +58,8 @@ function harness(requestTimeoutMs = 100): Harness {
     runtimeDirectory:
       'C:\\Users\\test\\AppData\\Local\\EnvCAD\\ai-runtime\\test',
     environment: {
+      ENVCAD_ACCEPTANCE_EVIDENCE_PATH:
+        'C:\\acceptance\\provider-prompt-evidence.jsonl',
       PATH: 'C:\\tools',
       USERPROFILE: 'C:\\Users\\test',
       OPENAI_API_KEY: 'sk-proj-never-forward',
@@ -62,7 +68,8 @@ function harness(requestTimeoutMs = 100): Harness {
     requestTimeoutMs,
     closeTimeoutMs: 20,
     spawnProcess: spawn as never,
-    logger: { log: vi.fn(), error: vi.fn() }
+    logger: { log: vi.fn(), error: vi.fn() },
+    disabledMcpServerNames
   })
   return { child, writes, spawn, client }
 }
@@ -75,10 +82,10 @@ describe('CodexAppServerClient', () => {
     expect(test.spawn).toHaveBeenCalledWith(
       'C:\\tools\\codex.exe',
       [
-        '-c',
-        'model_provider="openai"',
-        '-c',
-        'chatgpt_base_url="https://chatgpt.com/backend-api/"',
+        ...buildCodexProcessOverrides([]).flatMap((override) => [
+          '-c',
+          override
+        ]),
         'app-server',
         '--stdio'
       ],
@@ -96,14 +103,38 @@ describe('CodexAppServerClient', () => {
     })
     expect(spawnEnvironment).not.toHaveProperty('OPENAI_API_KEY')
     expect(spawnEnvironment).not.toHaveProperty('UNRELATED_SECRET')
+    expect(spawnEnvironment).not.toHaveProperty(
+      'ENVCAD_ACCEPTANCE_EVIDENCE_PATH'
+    )
     expect(test.writes[0]).toMatchObject({
       method: 'initialize',
       params: {
-        clientInfo: { name: 'envcad', title: 'EnvCAD', version: '0.2.0' },
+        clientInfo: { name: 'envcad', title: 'EnvCAD', version: '0.2.1' },
         capabilities: { experimentalApi: true }
       }
     })
     expect(test.writes[1]).toEqual({ method: 'initialized', params: {} })
+    await test.client.close()
+  })
+
+  it('passes every validated MCP disable through the production process boundary', async () => {
+    const test = harness(100, ['docs', 'node_repl'])
+    await test.client.start()
+
+    const args = test.spawn.mock.calls[0][1] as string[]
+    expect(args).toEqual([
+      ...buildCodexProcessOverrides(['docs', 'node_repl']).flatMap(
+        (override) => ['-c', override]
+      ),
+      'app-server',
+      '--stdio'
+    ])
+    expect(args).toContain('mcp_servers.docs.enabled=false')
+    expect(args).toContain('mcp_servers.node_repl.enabled=false')
+    expect(args).toContain('features.apps=false')
+    expect(args).toContain('features.plugins=false')
+    expect(args).toContain('features.shell_tool=false')
+    expect(args).toContain('features.multi_agent=false')
     await test.client.close()
   })
 

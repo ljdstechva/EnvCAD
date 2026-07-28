@@ -12,8 +12,8 @@ the renderer.
 
 ## Windows installation
 
-EnvCAD v0.2.0 targets Windows 11 x64. Install the generated Squirrel
-`EnvCAD-0.2.0 Setup.exe`, then launch **EnvCAD** from the Desktop shortcut or
+EnvCAD v0.2.1 targets Windows 11 x64. Install the generated Squirrel
+`EnvCAD-0.2.1 Setup.exe`, then launch **EnvCAD** from the Desktop shortcut or
 Start menu. The installer is currently unsigned, so Windows may show a
 SmartScreen warning.
 
@@ -69,11 +69,19 @@ The utility process contains a provider-neutral coordinator:
 Codex runs in an empty per-session directory under
 `%LOCALAPPDATA%\EnvCAD\ai-runtime`, with a read-only sandbox, `never` approvals,
 web/shell/apps/connectors/plugins/skills/subagents disabled, and every
-user-configured MCP server explicitly disabled. EnvCAD validates the runtime
-settings and passive-notification schemas, requires ChatGPT authentication to
-remain active, pins the official OpenAI provider and ChatGPT backend, re-attests
-the account before discovery and every conversation, and treats command, file,
-web, app, connector, MCP, or subagent events as security failures.
+user-configured MCP server explicitly disabled. A short-lived zero-turn
+`config/read` probe discovers validated MCP names; a separate production process
+then proves those servers are disabled and inert and that no unexpected
+`codex_apps` surface exists before account/model access or conversation startup.
+EnvCAD validates runtime settings and passive-notification schemas, requires
+ChatGPT authentication to remain active, pins the official OpenAI provider and
+ChatGPT backend, re-attests the account before discovery and every conversation,
+and treats command, file, web, app, connector, MCP, or subagent events as
+security failures.
+
+User prompts have no fixed character-count limit. EnvCAD preserves prompt text
+and formatting and applies the 2 MiB ceiling only to the complete serialized
+WebSocket request, whose selection and sheet context also consume capacity.
 `ultra` is never advertised as an effort, and a model whose provider default is
 `ultra` is omitted because EnvCAD is intentionally single-agent.
 

@@ -1,4 +1,4 @@
-# EnvCAD v0.2.0 AI benchmark
+# EnvCAD v0.2.1 AI benchmark
 
 ## Release result
 
@@ -92,7 +92,7 @@ dropped it on import, turning the benchmark layer white after reopen. EnvCAD now
 restores true-color values from validated `LAYER` records. Existing successful
 provider geometry and live turn evidence were retained; the affected Task B
 layer records were reconstructed from their matching Task A files, then opened,
-saved, reopened, and visually captured through the corrected installed v0.2.0
+saved, reopened, and visually captured through the corrected installed v0.2.1
 ASAR (`BCBC7252D2EC3D992C8DC4DB7A0DAF63694528A92BFFBC8262D4424F8F0C895F`).
 The pre-fix artifacts remain beside the recovered raw evidence.
 

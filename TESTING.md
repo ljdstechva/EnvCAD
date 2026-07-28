@@ -32,9 +32,15 @@ Coverage includes:
   rejection, rate limits, lifecycle, and authoritative close when interrupt
   acknowledgement is wedged;
 - Codex executable/version/auth discovery, paginated live catalog mapping,
-  JSONL app-server requests, dynamic tools, runtime-settings attestation,
+  short-lived `config/read` probing, JSONL app-server requests, dynamic tools,
+  effective disabled/inert MCP attestation, unexpected-app rejection,
   passive-event schema/identity checks, ChatGPT auth-change rejection,
   forbidden-event rejection, redaction, timeout, and process shutdown;
+- exact 4,000-, 4,001-, 16,000-, Unicode, multiline, and substantially larger
+  prompt preservation through protocol, renderer, WebSocket, sidecar, context
+  construction, Claude, and Codex boundaries;
+- exact complete-request UTF-8 boundary acceptance/rejection, dynamic selection
+  capacity, draft preservation, no false user turn, and no socket disconnect;
 - strict protocol catalogs, revisions, metrics, malformed messages, and reset
   acknowledgement;
 - atomic/corrupt preference behavior and the Claude existing-user default;
@@ -61,6 +67,9 @@ The suite verifies:
   undo/redo;
 - provider/model/effort dropdown population and model-dependent efforts;
 - keyboard selection and 280/420 px chat-panel layout without overflow;
+- >4,000-character Claude and Codex submissions with SHA-256/length/sentinel
+  evidence, plus local rejection of a synthetic >2 MiB request without clearing
+  the draft or disconnecting;
 - turn-time control locking, response provider/model/effort/metrics labels, and
   new-conversation boundaries;
 - provider missing/auth-required recovery while CAD stays usable;
@@ -170,15 +179,20 @@ It never uses API keys and never uploads a client drawing.
 
 ## Installed release acceptance
 
-After making and installing v0.2.0:
+After making and installing v0.2.1, run the guarded live harness against the
+installed Squirrel stub:
 
-1. launch the Desktop shortcut five consecutive times;
-2. inspect provider/model/effort controls at normal and narrow width;
-3. confirm preferences and benchmark recommendations after relaunch;
-4. verify Task A for both providers from saved/reopened DXF evidence;
-5. repeat sample DXF open, selection, pan/zoom, layers, page setup, save/reopen,
-   and searchable vector PDF;
-6. verify single-instance behavior and provider failure states;
-7. close the app and confirm no EnvCAD-owned utility, Claude, Codex app-server,
-   updater, port, or runtime directory remains;
-8. leave v0.2.0 installed with no related process running.
+```powershell
+npm run acceptance:installed -- --live --executable "$env:LOCALAPPDATA\EnvCAD\EnvCAD.exe"
+```
+
+The command refuses to make real provider calls without `--live`. It launches
+the exact installed `app.asar`, refreshes provider discovery twice, sends one
+meaningful >4,000-character Unicode CAD request through both Codex and Claude,
+compares the exact UI prompt with hashes/lengths/sentinel positions recorded at
+each provider boundary, verifies required tool calls and saved/reopened 10 m by
+6 m DXF geometry, and captures screenshots. It also rejects a synthetic >2 MiB
+complete request without clearing the draft, adding a false user turn, calling
+a provider, or disconnecting; then relaunches and confirms both sidecar ports
+close. Raw evidence stays under ignored `output/desktop/installed-acceptance/`;
+prompt bodies are never written to evidence or logs.

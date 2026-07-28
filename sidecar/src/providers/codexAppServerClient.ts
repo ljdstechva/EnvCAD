@@ -2,9 +2,8 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createInterface, type Interface as ReadlineInterface } from 'node:readline'
 import { redactProviderDiagnostic, sanitizedProviderEnvironment } from './environment'
 import type { ProviderLogger } from './types'
+import { buildCodexProcessOverrides } from './codexSecurityConfig'
 
-const OFFICIAL_CODEX_MODEL_PROVIDER = 'openai'
-const OFFICIAL_CHATGPT_BASE_URL = 'https://chatgpt.com/backend-api/'
 const DEFAULT_REQUEST_TIMEOUT_MS = 20_000
 const DEFAULT_CLOSE_TIMEOUT_MS = 2_000
 const MAX_JSONL_LINE_LENGTH = 2 * 1024 * 1024
@@ -101,14 +100,9 @@ export class CodexAppServerClient {
     const child = (this.options.spawnProcess ?? spawn)(
       this.options.executablePath,
       [
-        '-c',
-        `model_provider="${OFFICIAL_CODEX_MODEL_PROVIDER}"`,
-        '-c',
-        `chatgpt_base_url="${OFFICIAL_CHATGPT_BASE_URL}"`,
-        ...(this.options.disabledMcpServerNames ?? []).flatMap((name) => [
-          '-c',
-          `mcp_servers.${name}.enabled=false`
-        ]),
+        ...buildCodexProcessOverrides(
+          this.options.disabledMcpServerNames ?? []
+        ).flatMap((override) => ['-c', override]),
         'app-server',
         '--stdio'
       ],
@@ -143,7 +137,7 @@ export class CodexAppServerClient {
       clientInfo: {
         name: 'envcad',
         title: 'EnvCAD',
-        version: '0.2.0'
+        version: '0.2.1'
       },
       capabilities: {
         experimentalApi: true,

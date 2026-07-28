@@ -6,7 +6,7 @@ canonical CAD tool → browser executor → drawing database. Each case names th
 tool calls and observable result, so a regression is concrete.
 
 The run log below is the historical Claude Code pass from 2026-07-26. EnvCAD
-v0.2.0 applies the same catalog and schemas to both providers; the installed
+v0.2.1 applies the same catalog and schemas to both providers; the installed
 cross-provider deterministic creation/annotation evidence is recorded in
 `docs/ai-benchmark.md`.
 
@@ -250,7 +250,7 @@ descriptions and system prompt both say so, and D8's reply repeated it.
 These historical dialogue results ran on 2026-07-26 against the live app, against
 `@mlightcad/data-model` 1.12.0 / `@mlightcad/cad-simple-viewer` 1.5.8, with the
 sidecar on the Claude Code subscription login. They are not presented as a
-v0.2.0 Codex benchmark.
+v0.2.1 Codex benchmark.
 
 | Dialogue | Expected tool calls | Result |
 |---|---|---|

@@ -161,6 +161,7 @@ const MAX_DESCRIPTION_LENGTH = 4_000
 const MAX_SELECTION_IDS = 10_000
 const MAX_MODELS_PER_PROVIDER = 100
 const MAX_EFFORTS_PER_MODEL = 10
+export const MAX_WEBSOCKET_PAYLOAD_BYTES = 2 * 1024 * 1024
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -184,6 +185,10 @@ function failure<T>(error: string): ProtocolParseResult<T> {
 
 function isNonEmptyString(value: unknown, max = MAX_DESCRIPTION_LENGTH): value is string {
   return typeof value === 'string' && value.trim().length > 0 && value.length <= max
+}
+
+function isNonBlankPrompt(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0
 }
 
 function isOptionalString(value: unknown, max = MAX_DESCRIPTION_LENGTH): value is string | undefined {
@@ -544,8 +549,8 @@ export function parseClientMessage(value: unknown): ProtocolParseResult<ClientMe
       ) {
         return failure('user_message contains unsupported fields')
       }
-      if (!isNonEmptyString(value.text)) {
-        return failure('user_message.text must be a bounded non-empty string')
+      if (!isNonBlankPrompt(value.text)) {
+        return failure('user_message.text must contain at least one non-whitespace character')
       }
       if (!isRevision(value.configurationRevision)) {
         return failure('user_message.configurationRevision must be a positive safe integer')

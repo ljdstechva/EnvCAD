@@ -2,7 +2,7 @@
 
 ## Install and launch
 
-EnvCAD v0.2.0 is packaged for Windows x64 with Electron Forge and Squirrel.
+EnvCAD v0.2.1 is packaged for Windows x64 with Electron Forge and Squirrel.
 
 ```powershell
 npm ci
@@ -12,7 +12,7 @@ npm run desktop:make
 The installer is produced under:
 
 ```text
-out\make\squirrel.windows\x64\EnvCAD-0.2.0 Setup.exe
+out\make\squirrel.windows\x64\EnvCAD-0.2.1 Setup.exe
 ```
 
 Install it, then launch EnvCAD from the Desktop shortcut or Start menu. The
@@ -88,7 +88,8 @@ Sidecar:
 
 - binds loopback only on an operating-system-selected port;
 - requires exact renderer origin, protocol version, and per-launch token;
-- limits WebSocket payloads to 2 MiB;
+- limits complete serialized WebSocket messages to 2 MiB and rejects oversized
+  requests in the renderer before `send`, preserving the draft and connection;
 - strictly validates every message and CAD tool name;
 - serializes CAD calls and enforces timeouts;
 - redacts provider diagnostics before logs or UI.
@@ -107,8 +108,12 @@ Codex:
 - exact CLI version and ChatGPT authentication required;
 - official OpenAI provider and ChatGPT backend pinned at process launch;
 - `account/read` re-attested before catalog discovery and each conversation;
-- user MCP inventory parsed without exposing transports, then every server is
-  disabled through CLI overrides and thread configuration;
+- a short-lived, zero-turn `config/read` probe extracts only validated user MCP
+  names without exposing transports, then closes;
+- a separate production process disables every discovered MCP through CLI
+  overrides and thread configuration;
+- production `config/read` and bounded `mcpServerStatus/list` attestation require
+  each user MCP to be disabled and inert and reject unexpected `codex_apps`;
 - read-only/no-network sandbox and `never` approvals;
 - project instructions, environment context, web, apps, connectors, shell,
   skills, plugins, hooks, remote control, and subagents disabled;
@@ -116,7 +121,11 @@ Codex:
 - any forbidden command/file/web/app/MCP/subagent event fails closed.
 
 Child environments are allowlisted for Windows runtime discovery and provider
-login. API keys and unrelated secret-bearing variables are not forwarded.
+login. API keys and unrelated secret-bearing variables are not forwarded. The
+non-secret `ENVCAD_ACCEPTANCE_EVIDENCE_PATH` opt-in is forwarded only so the
+release harness can write provider-boundary hashes, lengths, and sentinel
+positions to an absolute `.jsonl` path; it never records prompt bodies, and the
+path is removed again before launching either provider binary.
 
 ## Preferences and logs
 
@@ -144,7 +153,8 @@ provider stderr are not logged.
 | Codex CLI missing | Install Codex CLI, then refresh. |
 | Codex signed out | Run `codex login`, then refresh. |
 | Codex incompatible | Install Codex CLI `0.145.0`. |
-| Codex MCP inventory failed | Repair Codex configuration; EnvCAD disables Codex rather than weakening isolation. |
+| Codex configuration probe failed | Repair Codex configuration; EnvCAD disables Codex rather than weakening isolation. |
+| Codex isolation attestation failed | Refresh after checking Codex configuration; EnvCAD will not enable Codex while any MCP or app surface remains active. |
 | Provider rate limit | Wait until the provider-specific reset time shown in chat. |
 | Sidecar offline | CAD remains usable; open the log folder and relaunch. |
 

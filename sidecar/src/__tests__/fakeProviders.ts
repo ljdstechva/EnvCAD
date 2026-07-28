@@ -53,16 +53,20 @@ export class FakeConversation implements AgentConversation {
   interrupted = false
   resetCount = 0
   closed = false
+  prompts: string[] = []
 
   constructor(
     readonly events: AgentEvent[] = [
       { type: 'text_delta', text: 'done' }
     ],
-    private readonly gate?: Promise<void>
+    private readonly gate?: Promise<void>,
+    private readonly failure?: Error
   ) {}
 
-  async *runTurn(): AsyncIterable<AgentEvent> {
+  async *runTurn(input: { prompt: string }): AsyncIterable<AgentEvent> {
+    this.prompts.push(input.prompt)
     if (this.gate) await this.gate
+    if (this.failure) throw this.failure
     for (const event of this.events) yield event
   }
 
@@ -90,6 +94,7 @@ export class FakeProvider implements AgentProvider {
   discoveryGate: Promise<void> | undefined
   nextEvents: AgentEvent[] = [{ type: 'text_delta', text: 'done' }]
   nextGate: Promise<void> | undefined
+  nextError: Error | undefined
 
   constructor(
     readonly id: ProviderId,
@@ -117,9 +122,14 @@ export class FakeProvider implements AgentProvider {
   ): Promise<AgentConversation> {
     this.configurations.push({ ...configuration })
     this.bridges.push(bridge)
-    const conversation = new FakeConversation(this.nextEvents, this.nextGate)
+    const conversation = new FakeConversation(
+      this.nextEvents,
+      this.nextGate,
+      this.nextError
+    )
     this.conversations.push(conversation)
     this.nextGate = undefined
+    this.nextError = undefined
     return conversation
   }
 

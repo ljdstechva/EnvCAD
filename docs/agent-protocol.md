@@ -1,6 +1,6 @@
 # EnvCAD AI Assistant protocol
 
-This document describes the v0.2.0 renderer-to-sidecar contract. The protocol is
+This document describes the v0.2.1 renderer-to-sidecar contract. The protocol is
 provider-neutral: Claude Code and OpenAI Codex share configuration, lifecycle,
 streaming, metrics, and CAD tool messages.
 
@@ -14,12 +14,18 @@ the Electron utility process. The HTTP upgrade must satisfy all three checks:
 3. a per-launch `envcad.session.<token>` subprotocol.
 
 The 256-bit token exists only in Electron main/preload/utility-process memory.
-Payloads are limited to 2 MiB. The app-server used by Codex is stdio-only and
+Complete serialized WebSocket messages are limited to 2 MiB, including prompt
+text, the selection snapshot, and sheet context. The renderer measures the exact
+UTF-8 serialization before sending, so an oversized request is rejected locally
+without clearing the draft or reconnecting. This is a dynamic transport boundary,
+not a prompt character limit. The app-server used by Codex is stdio-only and
 never exposes a network port.
 
 Every decoded object is strict: unknown fields, unknown message types, invalid
 provider IDs, non-canonical tool names, unsupported effort values, and
-unbounded strings/arrays are rejected.
+unbounded metadata strings/arrays are rejected. `user_message.text` is the sole
+unbounded string surface: it must contain a non-whitespace character and is
+preserved exactly, subject only to the complete-message transport boundary.
 
 ## Capability and configuration lifecycle
 
@@ -280,7 +286,13 @@ Codex:
 - empty `%LOCALAPPDATA%\EnvCAD\ai-runtime\session-*` working directory;
 - read-only sandbox, `never` approvals, no model fallback;
 - project instructions/context disabled;
-- every configured MCP server explicitly disabled;
+- a short-lived, zero-turn `config/read` probe extracts only validated MCP
+  server property names and closes before production startup;
+- a new production process disables every discovered MCP at both process and
+  thread scope;
+- production `config/read` plus bounded `mcpServerStatus/list` pagination proves
+  every user MCP is disabled and inert and rejects unexpected surfaces such as
+  `codex_apps` before account/model access or conversation startup;
 - shell, web, apps, connectors, plugins, skills, remote control, and
   multi-agent features disabled.
 

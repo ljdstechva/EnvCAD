@@ -5,8 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   EXPECTED_CODEX_CLI_VERSION,
   discoverCodexExecutable,
-  isCodexAuthenticatedWithChatGpt,
-  listCodexMcpServerNames
+  isCodexAuthenticatedWithChatGpt
 } from '../codexExecutable'
 
 const directories: string[] = []
@@ -82,31 +81,5 @@ describe('Codex executable discovery', () => {
         }))
       })
     ).resolves.toBe(false)
-  })
-
-  it('extracts only bounded MCP server names for fail-closed disabling', async () => {
-    const executable = await fakeExecutable()
-    const runner = vi.fn(async () => ({
-      exitCode: 0,
-      output: JSON.stringify([
-        {
-          name: 'node_repl',
-          enabled: true,
-          transport: {
-            command: 'must-not-be-returned',
-            env: { TOKEN: 'must-not-be-returned' }
-          }
-        },
-        { name: 'docs', enabled: true, transport: { url: 'https://example' } }
-      ])
-    }))
-    await expect(
-      listCodexMcpServerNames(executable, { runner })
-    ).resolves.toEqual(['node_repl', 'docs'])
-    expect(runner).toHaveBeenCalledWith(
-      executable,
-      ['mcp', 'list', '--json'],
-      undefined
-    )
   })
 })

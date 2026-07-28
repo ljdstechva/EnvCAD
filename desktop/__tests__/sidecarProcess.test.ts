@@ -76,6 +76,8 @@ describe('SidecarProcess', () => {
   it('passes only an allowlisted environment and replaces secret values with sentinels', () => {
     const secret = 'sk-ant-do-not-log-this'
     const environment = sanitizedWorkerEnvironment({
+      ENVCAD_ACCEPTANCE_EVIDENCE_PATH:
+        'C:\\acceptance\\provider-prompt-evidence.jsonl',
       PATH: 'C:\\Windows',
       USERPROFILE: 'C:\\Users\\test',
       ANTHROPIC_API_KEY: secret,
@@ -84,6 +86,8 @@ describe('SidecarProcess', () => {
     })
 
     expect(environment).toMatchObject({
+      ENVCAD_ACCEPTANCE_EVIDENCE_PATH:
+        'C:\\acceptance\\provider-prompt-evidence.jsonl',
       PATH: 'C:\\Windows',
       USERPROFILE: 'C:\\Users\\test',
       ANTHROPIC_API_KEY: '[blocked-by-envcad]',

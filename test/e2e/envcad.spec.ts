@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test'
+import { createHash } from 'node:crypto'
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { inflateSync } from 'node:zlib'
@@ -7,6 +8,7 @@ import {
   geometryFingerprint,
   inspectDxf
 } from '../../scripts/aiBenchmark'
+import { MAX_WEBSOCKET_PAYLOAD_BYTES } from '../../src/agent/protocol'
 
 const FIXTURE = path.join(process.cwd(), 'test', 'fixtures', 'sample-site.dxf')
 const CONTROL_URL = 'http://127.0.0.1:8788'
@@ -455,6 +457,109 @@ test.describe.serial('EnvCAD preview with scripted fake sidecar', () => {
         )
       }
     }
+  })
+
+  test('preserves prompts longer than 4,000 characters through Claude and Codex chat', async ({
+    page,
+    request
+  }) => {
+    await page.goto('/')
+    await request.post(`${CONTROL_URL}/reset-stats`)
+    const input = page.locator('.chat-textarea')
+    await expect(input).toBeEnabled()
+
+    await input.fill('first line')
+    await input.press('Shift+Enter')
+    await expect(input).toHaveValue('first line\n')
+
+    const sendLongPrompt = async (
+      provider: 'claude-code' | 'openai-codex',
+      sequence: number
+    ) => {
+      const prompt =
+        `BEGIN-LONG-PROMPT-SENTINEL ${provider}\n` +
+        `${'Environmental wastewater tank context α🌏\n'.repeat(180)}` +
+        `MIDDLE-LONG-PROMPT-SENTINEL ${sequence}\n` +
+        `${'Preserve this pasted formatting exactly.\n'.repeat(180)}` +
+        'Draw one 1 m horizontal reference line, then zoom extents.\n' +
+        'END-LONG-PROMPT-SENTINEL  '
+      expect(prompt.length).toBeGreaterThan(4_000)
+      await input.fill(prompt)
+      await expect(input).toHaveValue(prompt)
+      await input.press('Enter')
+      await expect(input).toHaveValue('')
+      await expect(page.locator('.bubble.user')).toHaveCount(sequence)
+      await expect(page.locator('.bubble.user').last()).toHaveText(prompt)
+
+      const expectedHash = createHash('sha256')
+        .update(prompt, 'utf8')
+        .digest('hex')
+      await expect
+        .poll(async () => {
+          const stats = await (
+            await request.get(`${CONTROL_URL}/stats`)
+          ).json()
+          return stats.lastPromptEvidence
+        })
+        .toEqual({
+          provider,
+          characters: prompt.length,
+          utf8Bytes: Buffer.byteLength(prompt, 'utf8'),
+          sha256: expectedHash,
+          hasBeginSentinel: true,
+          hasMiddleSentinel: true,
+          hasEndSentinel: true
+        })
+      await expect(page.locator('.status-text')).toHaveText('Idle')
+      await expect(input).toBeEnabled()
+    }
+
+    await sendLongPrompt('claude-code', 1)
+    await page
+      .getByLabel('AI provider', { exact: true })
+      .selectOption('openai-codex')
+    await expect(input).toBeEnabled()
+    await sendLongPrompt('openai-codex', 2)
+  })
+
+  test('rejects an oversized complete request locally while preserving the draft and socket', async ({
+    page,
+    request
+  }) => {
+    await page.goto('/')
+    await request.post(`${CONTROL_URL}/reset-stats`)
+    const input = page.locator('.chat-textarea')
+    const oversizedDraft = `BEGIN-OVERSIZED\n${'x'.repeat(
+      MAX_WEBSOCKET_PAYLOAD_BYTES
+    )}\nEND-OVERSIZED`
+    await input.evaluate((element, value) => {
+      const textarea = element as HTMLTextAreaElement
+      textarea.value = value
+      textarea.dispatchEvent(new Event('input', { bubbles: true }))
+    }, oversizedDraft)
+    await expect
+      .poll(() => input.evaluate((element) => (element as HTMLTextAreaElement).value.length))
+      .toBe(oversizedDraft.length)
+
+    await page.getByRole('button', { name: 'Send' }).click()
+
+    await expect(page.locator('.bubble.error').last()).toContainText(
+      'complete AI request'
+    )
+    await expect(page.locator('.bubble.error').last()).toContainText(
+      '2 MiB transport capacity'
+    )
+    await expect(page.locator('.bubble.user')).toHaveCount(0)
+    await expect
+      .poll(() => input.evaluate((element) => (element as HTMLTextAreaElement).value.length))
+      .toBe(oversizedDraft.length)
+    await expect(page.locator('.offline-banner')).toBeHidden()
+    await expect(input).toBeEnabled()
+    const stats = await (await request.get(`${CONTROL_URL}/stats`)).json()
+    expect(stats).toMatchObject({
+      wsRunning: true,
+      userMessageCount: 0
+    })
   })
 
   test('locks configuration during a turn, labels responses, and starts a new conversation on switch', async ({

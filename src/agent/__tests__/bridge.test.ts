@@ -4,6 +4,7 @@ import {
   DEFAULT_BROWSER_CONNECTION,
   type AgentBridgeEvent
 } from '../bridge'
+import { MAX_WEBSOCKET_PAYLOAD_BYTES } from '../protocol'
 import type { AiPreferences } from '../../../desktop/aiPreferences'
 
 const providerCatalog = [
@@ -121,6 +122,29 @@ class FakeBrowserWebSocket {
   private dispatch(type: string, event: { data?: string } = {}) {
     for (const listener of this.listeners.get(type) ?? []) listener(event)
   }
+}
+
+async function configuredBridge() {
+  const bridge = new AgentBridge()
+  bridge.initializePreferences()
+  bridge.connect()
+  await vi.waitFor(() => expect(bridge.state.connectionState).toBe('online'))
+  const socket = FakeBrowserWebSocket.instances.at(-1)!
+  socket.receive({
+    type: 'ai_capabilities',
+    providers: providerCatalog,
+    refreshing: false
+  })
+  await vi.waitFor(() => expect(socket.sent).toHaveLength(1))
+  const request = JSON.parse(socket.sent[0])
+  socket.receive({
+    type: 'ai_configuration_applied',
+    revision: request.revision,
+    configuration: request.configuration,
+    newConversation: true
+  })
+  socket.sent = []
+  return { bridge, socket, revision: request.revision }
 }
 
 describe('AgentBridge', () => {
@@ -479,6 +503,130 @@ describe('AgentBridge', () => {
       configurationRevision: latest.revision
     })
     bridge.disconnect()
+  })
+
+  it('sends a long multiline Unicode prompt exactly once without truncation', async () => {
+    const { bridge, socket } = await configuredBridge()
+    const text =
+      `BEGIN-SENTINEL\n${'αβ🌏\r\n'.repeat(3_500)}` +
+      `MIDDLE-SENTINEL\n${'x'.repeat(16_000)}\nEND-SENTINEL  `
+
+    bridge.sendUserMessage(
+      text,
+      { ids: [], count: 0, units: 'Meters' },
+      {
+        paper: 'A3',
+        orientation: 'landscape',
+        scaleDenominator: 500,
+        drawingUnit: 'm'
+      }
+    )
+
+    expect(socket.sent).toHaveLength(1)
+    expect(JSON.parse(socket.sent[0]).text).toBe(text)
+    expect(bridge.state.messages).toEqual([{ role: 'user', text }])
+    expect(
+      JSON.stringify(vi.mocked(console.debug).mock.calls)
+    ).not.toContain('BEGIN-SENTINEL')
+    bridge.disconnect()
+  })
+
+  it('enforces the complete serialized 2 MiB request boundary without disconnecting', async () => {
+    const selectionSnapshot = { ids: [], count: 0, units: 'Meters' }
+    const sheet = {
+      paper: 'A3' as const,
+      orientation: 'landscape' as const,
+      scaleDenominator: 500,
+      drawingUnit: 'm'
+    }
+    const accepted = await configuredBridge()
+    const emptyMessage = {
+      type: 'user_message',
+      text: '',
+      selectionSnapshot,
+      sheet,
+      configurationRevision: accepted.revision
+    }
+    const overheadBytes = new TextEncoder().encode(
+      JSON.stringify(emptyMessage)
+    ).byteLength
+    const exactBoundaryText = 'x'.repeat(
+      MAX_WEBSOCKET_PAYLOAD_BYTES - overheadBytes
+    )
+
+    accepted.bridge.sendUserMessage(
+      exactBoundaryText,
+      selectionSnapshot,
+      sheet
+    )
+    expect(new TextEncoder().encode(accepted.socket.sent[0]).byteLength).toBe(
+      MAX_WEBSOCKET_PAYLOAD_BYTES
+    )
+    expect(accepted.socket.readyState).toBe(FakeBrowserWebSocket.OPEN)
+    accepted.bridge.disconnect()
+
+    const rejected = await configuredBridge()
+    const consoleError = vi
+      .spyOn(console, 'error')
+      .mockImplementation(() => undefined)
+    expect(() =>
+      rejected.bridge.sendUserMessage(
+        `${exactBoundaryText}x`,
+        selectionSnapshot,
+        sheet
+      )
+    ).toThrow('complete AI request')
+    expect(rejected.socket.sent).toEqual([])
+    expect(rejected.socket.readyState).toBe(FakeBrowserWebSocket.OPEN)
+    expect(rejected.bridge.state.messages.some((message) => message.role === 'user')).toBe(
+      false
+    )
+    expect(consoleError).toHaveBeenCalledWith(
+      expect.stringContaining('2 MiB transport capacity')
+    )
+    rejected.bridge.disconnect()
+  })
+
+  it('lets selection context dynamically reduce prompt transport capacity', async () => {
+    const sheet = {
+      paper: 'A3' as const,
+      orientation: 'landscape' as const,
+      scaleDenominator: 500,
+      drawingUnit: 'm'
+    }
+    const emptySelection = { ids: [], count: 0, units: 'Meters' }
+    const accepted = await configuredBridge()
+    const baseline = JSON.stringify({
+      type: 'user_message',
+      text: '',
+      selectionSnapshot: emptySelection,
+      sheet,
+      configurationRevision: accepted.revision
+    })
+    const prompt = 'p'.repeat(
+      MAX_WEBSOCKET_PAYLOAD_BYTES -
+        new TextEncoder().encode(baseline).byteLength -
+        1_000
+    )
+    accepted.bridge.sendUserMessage(prompt, emptySelection, sheet)
+    expect(accepted.socket.sent).toHaveLength(1)
+    accepted.bridge.disconnect()
+
+    const rejected = await configuredBridge()
+    const ids = Array.from(
+      { length: 100 },
+      (_, index) => `selected-entity-${index.toString().padStart(3, '0')}`
+    )
+    vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    expect(() =>
+      rejected.bridge.sendUserMessage(
+        prompt,
+        { ids, count: ids.length, units: 'Meters' },
+        sheet
+      )
+    ).toThrow('complete AI request')
+    expect(rejected.socket.sent).toEqual([])
+    rejected.bridge.disconnect()
   })
 
   it('keeps refresh pending through cached capabilities and blocks duplicate refreshes and chat', async () => {

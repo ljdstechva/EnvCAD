@@ -1,5 +1,6 @@
 import path from 'node:path'
 import {
+  ACCEPTANCE_EVIDENCE_ENVIRONMENT_NAME,
   BLOCKED_SECRET_ENVIRONMENT_NAMES,
   sanitizedProviderEnvironment
 } from '../sidecar/src/providers/environment'
@@ -62,7 +63,16 @@ function environmentValue(
 export function sanitizedWorkerEnvironment(
   environment: NodeJS.ProcessEnv
 ): NodeJS.ProcessEnv {
-  const safe = sanitizedProviderEnvironment(environment)
+  const evidencePath = environmentValue(
+    environment,
+    ACCEPTANCE_EVIDENCE_ENVIRONMENT_NAME
+  )
+  const safe = sanitizedProviderEnvironment(
+    environment,
+    evidencePath
+      ? { [ACCEPTANCE_EVIDENCE_ENVIRONMENT_NAME]: evidencePath }
+      : {}
+  )
   for (const name of BLOCKED_SECRET_ENVIRONMENT_NAMES) {
     if (environmentValue(environment, name)?.trim()) {
       safe[name] = '[blocked-by-envcad]'

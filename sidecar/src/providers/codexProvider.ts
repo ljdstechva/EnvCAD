@@ -1,7 +1,6 @@
 import {
   discoverCodexExecutable,
   isCodexAuthenticatedWithChatGpt,
-  listCodexMcpServerNames,
   type CodexDiscoveryResult
 } from '../../../desktop/codexExecutable'
 import type {
@@ -23,9 +22,20 @@ import {
   type CodexServerRequest
 } from './codexAppServerClient'
 import {
+  attestCodexMcpIsolation,
+  probeCodexMcpServerNames
+} from './codexIsolation'
+import {
+  buildCodexThreadSecurityConfig,
+  CODEX_APPROVAL_POLICY,
+  CODEX_SANDBOX_MODE,
+  OFFICIAL_CODEX_MODEL_PROVIDER
+} from './codexSecurityConfig'
+import {
   presentBlockedEnvironmentNames,
   redactProviderDiagnostic
 } from './environment'
+import { recordProviderPromptEvidence } from './acceptanceEvidence'
 import type {
   AgentConversation,
   AgentEvent,
@@ -131,7 +141,7 @@ export interface CodexProviderOptions {
   runtimeDirectory: string
   discoverExecutable?: typeof discoverCodexExecutable
   authenticate?: typeof isCodexAuthenticatedWithChatGpt
-  listMcpServers?: typeof listCodexMcpServerNames
+  probeMcpServerNames?: (executablePath: string) => Promise<string[]>
   clientFactory?: ClientFactory
   logger?: ProviderLogger
 }
@@ -391,6 +401,7 @@ class CodexConversation implements AgentConversation {
     private readonly tools: CadToolBridge,
     private readonly client: CodexAppServerClient,
     private readonly runtimeDirectory: string,
+    private readonly environment: NodeJS.ProcessEnv,
     private readonly onClosed: () => void
   ) {
     client.setServerRequestHandler((request) => this.handleServerRequest(request))
@@ -407,6 +418,7 @@ class CodexConversation implements AgentConversation {
     tools: CadToolBridge,
     client: CodexAppServerClient,
     runtimeDirectory: string,
+    environment: NodeJS.ProcessEnv,
     disabledMcpServerNames: readonly string[],
     onClosed: () => void
   ): Promise<CodexConversation> {
@@ -415,19 +427,25 @@ class CodexConversation implements AgentConversation {
       tools,
       client,
       runtimeDirectory,
+      environment,
       onClosed
     )
     try {
       await client.start()
+      await attestCodexMcpIsolation(
+        client,
+        runtimeDirectory,
+        disabledMcpServerNames
+      )
       assertChatGptAccount(
         await client.request('account/read', { refreshToken: false })
       )
       const result = await client.request('thread/start', {
         model: configuration.model,
-        modelProvider: 'openai',
+        modelProvider: OFFICIAL_CODEX_MODEL_PROVIDER,
         cwd: runtimeDirectory,
-        approvalPolicy: 'never',
-        sandbox: 'read-only',
+        approvalPolicy: CODEX_APPROVAL_POLICY,
+        sandbox: CODEX_SANDBOX_MODE,
         allowProviderModelFallback: false,
         ephemeral: true,
         experimentalRawEvents: false,
@@ -442,47 +460,7 @@ class CodexConversation implements AgentConversation {
           deferLoading: false
         })),
         selectedCapabilityRoots: [],
-        config: {
-          model_provider: 'openai',
-          project_doc_max_bytes: 0,
-          project_doc_fallback_filenames: [],
-          web_search: 'disabled',
-          mcp_servers: Object.fromEntries(
-            disabledMcpServerNames.map((name) => [name, { enabled: false }])
-          ),
-          shell_environment_policy: { include_only: [] },
-          agents: { enabled: false },
-          features: {
-            apps: false,
-            artifact: false,
-            auth_elicitation: false,
-            browser_use: false,
-            browser_use_external: false,
-            browser_use_full_cdp_access: false,
-            code_mode_host: false,
-            code_mode: false,
-            code_mode_buffered_exec: false,
-            computer_use: false,
-            enable_mcp_apps: false,
-            goals: false,
-            hooks: false,
-            image_generation: false,
-            in_app_browser: false,
-            multi_agent: false,
-            plugins: false,
-            remote_plugin: false,
-            request_permissions_tool: false,
-            shell_snapshot: false,
-            shell_tool: false,
-            skill_mcp_dependency_install: false,
-            skill_search: false,
-            standalone_web_search: false,
-            tool_call_mcp_elicitation: false,
-            tool_suggest: false,
-            unified_exec: false,
-            workspace_dependencies: false
-          }
-        }
+        config: buildCodexThreadSecurityConfig(disabledMcpServerNames)
       })
       if (
         !isRecord(result) ||
@@ -513,9 +491,14 @@ class CodexConversation implements AgentConversation {
     const queue = new TurnQueue()
     this.currentQueue = queue
     try {
+      await recordProviderPromptEvidence(
+        'openai-codex',
+        input.prompt,
+        this.environment
+      )
       const result = await this.client.request('turn/start', {
         threadId: this.threadId,
-        input: [{ type: 'text', text: input.prompt }],
+        input: [{ type: 'text', text: input.prompt, text_elements: [] }],
         model: this.configuration.model,
         ...(this.configuration.effort ? { effort: this.configuration.effort } : {})
       })
@@ -1270,7 +1253,14 @@ export class CodexProvider implements AgentProvider {
 
     try {
       this.disabledMcpServerNames = await (
-        this.options.listMcpServers ?? listCodexMcpServerNames
+        this.options.probeMcpServerNames ??
+        ((executablePath) =>
+          probeCodexMcpServerNames({
+            executablePath,
+            runtimeDirectory: this.options.runtimeDirectory,
+            environment: this.environment,
+            clientFactory: this.options.clientFactory
+          }))
       )(discovery.executablePath)
     } catch {
       this.executablePath = undefined
@@ -1280,7 +1270,7 @@ export class CodexProvider implements AgentProvider {
         displayName: this.displayName,
         status: 'failed',
         statusMessage:
-          'Codex MCP inventory could not be verified, so EnvCAD disabled Codex to preserve tool isolation.',
+          'Codex configuration probe failed, so EnvCAD disabled Codex to preserve tool isolation.',
         executableVersion: discovery.version,
         models: [],
         discoveryMs: performance.now() - startedAt
@@ -1288,11 +1278,22 @@ export class CodexProvider implements AgentProvider {
     }
 
     const client = this.createClient(discovery.executablePath)
+    let discoveryPhase:
+      | 'isolation'
+      | 'account'
+      | 'models' = 'isolation'
     try {
       await client.start()
+      await attestCodexMcpIsolation(
+        client,
+        this.options.runtimeDirectory,
+        this.disabledMcpServerNames
+      )
+      discoveryPhase = 'account'
       assertChatGptAccount(
         await client.request('account/read', { refreshToken: false })
       )
+      discoveryPhase = 'models'
       const models: CodexModel[] = []
       const seenCursors = new Set<string>()
       let cursor: string | null = null
@@ -1332,11 +1333,18 @@ export class CodexProvider implements AgentProvider {
       })
     } catch (error) {
       this.executablePath = undefined
+      this.disabledMcpServerNames = []
+      const prefix =
+        discoveryPhase === 'isolation'
+          ? 'Codex isolation attestation failed'
+          : discoveryPhase === 'account'
+            ? 'Codex ChatGPT account verification failed'
+            : 'Codex model discovery failed'
       return this.store({
         id: this.id,
         displayName: this.displayName,
         status: 'failed',
-        statusMessage: `Codex model discovery failed: ${redactProviderDiagnostic(
+        statusMessage: `${prefix}: ${redactProviderDiagnostic(
           error instanceof Error ? error.message : error
         )}`,
         executableVersion: discovery.version,
@@ -1362,6 +1370,7 @@ export class CodexProvider implements AgentProvider {
       tools,
       client,
       this.options.runtimeDirectory,
+      this.environment,
       this.disabledMcpServerNames,
       () => {
         if (conversation) this.conversations.delete(conversation)

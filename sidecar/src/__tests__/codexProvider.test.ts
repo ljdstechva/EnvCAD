@@ -25,6 +25,31 @@ class FakeCodexClient {
   protocolListeners = new Set<CodexProtocolErrorListener>()
   modelPages: unknown[] = []
   failedMethods = new Set<string>()
+  mcpConfigResult: unknown = {
+    config: {
+      mcp_servers: {
+        'test-mcp': {
+          enabled: false,
+          transportSecret: 'must-not-be-inspected'
+        }
+      }
+    }
+  }
+  mcpStatusPages: unknown[] = [
+    {
+      data: [
+        {
+          name: 'test-mcp',
+          serverInfo: null,
+          tools: {},
+          resources: [],
+          resourceTemplates: [],
+          authStatus: 'unsupported'
+        }
+      ],
+      nextCursor: null
+    }
+  ]
   accountResult: unknown = {
     account: {
       type: 'chatgpt',
@@ -46,6 +71,8 @@ class FakeCodexClient {
     let result: unknown
     if (method === 'model/list') result = this.modelPages.shift()
     else if (method === 'account/read') result = this.accountResult
+    else if (method === 'config/read') result = this.mcpConfigResult
+    else if (method === 'mcpServerStatus/list') result = this.mcpStatusPages.shift()
     else if (method === 'thread/start') result = { thread: { id: 'thread-1' } }
     else if (method === 'turn/start') result = { turn: { id: 'turn-1' } }
     else result = {}
@@ -195,7 +222,7 @@ function options(clients: FakeCodexClient[]): CodexProviderOptions {
       version: '0.145.0'
     })),
     authenticate: vi.fn(async () => true),
-    listMcpServers: vi.fn(async () => ['test-mcp']),
+    probeMcpServerNames: vi.fn(async () => ['test-mcp']),
     clientFactory: (_options: CodexAppServerClientOptions) => {
       const client = new FakeCodexClient()
       if (clients.length === 0) {
@@ -270,6 +297,59 @@ describe('CodexProvider', () => {
       method: 'account/read',
       params: { refreshToken: false }
     })
+    const methods = clients[0].requests.map(({ method }) => method)
+    expect(methods.indexOf('config/read')).toBeLessThan(
+      methods.indexOf('account/read')
+    )
+    expect(methods.indexOf('mcpServerStatus/list')).toBeLessThan(
+      methods.indexOf('model/list')
+    )
+    expect(clients[0].closed).toBe(true)
+  })
+
+  it('distinguishes configuration-probe failure and never starts production discovery', async () => {
+    const clients: FakeCodexClient[] = []
+    const providerOptions = options(clients)
+    providerOptions.probeMcpServerNames = vi.fn(async () => {
+      throw new Error('probe transport sentinel must stay private')
+    })
+    const provider = new CodexProvider(providerOptions)
+
+    await expect(provider.discover()).resolves.toMatchObject({
+      status: 'failed',
+      statusMessage:
+        'Codex configuration probe failed, so EnvCAD disabled Codex to preserve tool isolation.'
+    })
+    expect(clients).toEqual([])
+  })
+
+  it('fails closed on production isolation before account or model discovery', async () => {
+    const clients: FakeCodexClient[] = []
+    const providerOptions = options(clients)
+    const factory = providerOptions.clientFactory!
+    providerOptions.clientFactory = (clientOptions) => {
+      const client = factory(clientOptions) as unknown as FakeCodexClient
+      if (clients.length === 1) {
+        client.mcpConfigResult = {
+          config: { mcp_servers: { 'test-mcp': { enabled: true } } }
+        }
+      }
+      return client as unknown as CodexAppServerClient
+    }
+    const provider = new CodexProvider(providerOptions)
+
+    await expect(provider.discover()).resolves.toMatchObject({
+      status: 'failed',
+      statusMessage: expect.stringContaining(
+        'Codex isolation attestation failed'
+      )
+    })
+    expect(clients[0].requests).not.toContainEqual(
+      expect.objectContaining({ method: 'account/read' })
+    )
+    expect(clients[0].requests).not.toContainEqual(
+      expect.objectContaining({ method: 'model/list' })
+    )
     expect(clients[0].closed).toBe(true)
   })
 
@@ -318,6 +398,13 @@ describe('CodexProvider', () => {
 
     const threadStart = clients[1].requests.find(
       (request) => request.method === 'thread/start'
+    )
+    const startupMethods = clients[1].requests.map(({ method }) => method)
+    expect(startupMethods.indexOf('config/read')).toBeLessThan(
+      startupMethods.indexOf('account/read')
+    )
+    expect(startupMethods.indexOf('mcpServerStatus/list')).toBeLessThan(
+      startupMethods.indexOf('thread/start')
     )
     expect(threadStart?.params).toMatchObject({
       model: 'gpt-default',
@@ -477,7 +564,10 @@ describe('CodexProvider', () => {
       },
       bridge
     )
-    const run = collect(conversation.runTurn({ prompt: 'draw' }))
+    const longPrompt =
+      `BEGIN-CODEX-SENTINEL\n${'α🌏'.repeat(8_000)}` +
+      `\nMIDDLE-CODEX-SENTINEL\n${'z'.repeat(8_000)}\nEND-CODEX-SENTINEL  `
+    const run = collect(conversation.runTurn({ prompt: longPrompt }))
     await vi.waitFor(() => {
       expect(
         clients[1].requests.some((request) => request.method === 'turn/start')
@@ -489,6 +579,13 @@ describe('CodexProvider', () => {
     ).toMatchObject({
       params: {
         threadId: 'thread-1',
+        input: [
+          {
+            type: 'text',
+            text: longPrompt,
+            text_elements: []
+          }
+        ],
         model: 'gpt-default',
         effort: 'medium'
       }

@@ -20,6 +20,7 @@ import { createCadMcpServer } from '../cadTools'
 import { CAD_TOOL_NAMES, type CadToolBridge } from '../cadToolSpecs'
 import { createEffortCapabilities } from '../providerCatalog'
 import { SYSTEM_PROMPT } from '../systemPrompt'
+import { recordProviderPromptEvidence } from './acceptanceEvidence'
 import {
   presentBlockedEnvironmentNames,
   redactProviderDiagnostic,
@@ -161,6 +162,11 @@ class ClaudeConversation implements AgentConversation {
     let rateLimitError: string | undefined
     let toolFailure: Error | undefined
     try {
+      await recordProviderPromptEvidence(
+        'claude-code',
+        input.prompt,
+        this.environment
+      )
       activeQuery = this.queryFactory({
         prompt: input.prompt,
         options: {

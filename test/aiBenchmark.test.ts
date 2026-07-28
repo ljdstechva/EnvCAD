@@ -54,7 +54,7 @@ describe('AI benchmark DXF inspection', () => {
     try {
       const stub = path.join(root, 'EnvCAD.exe')
       const oldDirectory = path.join(root, 'app-0.1.1')
-      const currentDirectory = path.join(root, 'app-0.2.0')
+      const currentDirectory = path.join(root, 'app-0.2.1')
       await Promise.all([
         mkdir(path.join(oldDirectory, 'resources'), { recursive: true }),
         mkdir(path.join(currentDirectory, 'resources'), { recursive: true })

@@ -4,10 +4,7 @@ import { ref } from 'vue'
 const props = defineProps<{
   disabled: boolean
   selectionCount: number
-}>()
-
-const emit = defineEmits<{
-  (event: 'send', text: string): void
+  onSend: (text: string) => boolean
 }>()
 
 const text = ref('')
@@ -15,10 +12,9 @@ const textareaEl = ref<HTMLTextAreaElement | null>(null)
 
 function submit() {
   if (props.disabled) return
-  const value = text.value.trim()
-  if (!value) return
-  emit('send', value)
-  text.value = ''
+  const value = text.value
+  if (!value.trim()) return
+  if (props.onSend(value)) text.value = ''
 }
 
 function onKeydown(event: KeyboardEvent) {

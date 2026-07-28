@@ -193,17 +193,10 @@ export function useChatTimeline() {
     }
   })
 
-  function sendMessage(rawText: string) {
-    const text = rawText.trim()
-    if (!text) return
+  function sendMessage(text: string): boolean {
+    if (!text.trim()) return false
     const selectionSnapshot = captureSelectionSnapshot()
     const sheet = captureSheetSnapshot()
-    entries.value.push({
-      id: nextId(),
-      kind: 'user',
-      text,
-      attachedCount: selectionSnapshot.count
-    })
     try {
       agentBridge.sendUserMessage(text, selectionSnapshot, sheet)
     } catch (err) {
@@ -212,7 +205,15 @@ export function useChatTimeline() {
         kind: 'error',
         message: err instanceof Error ? err.message : String(err)
       })
+      return false
     }
+    entries.value.push({
+      id: nextId(),
+      kind: 'user',
+      text,
+      attachedCount: selectionSnapshot.count
+    })
+    return true
   }
 
   function interrupt() {

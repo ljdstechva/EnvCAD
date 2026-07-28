@@ -1,4 +1,5 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
+import { createHash } from 'node:crypto'
 import { WebSocket, WebSocketServer } from 'ws'
 import {
   parseClientMessage,
@@ -18,6 +19,17 @@ let nextCallId = 1
 let userMessageCount = 0
 let toolResultCount = 0
 let completionDelayMs = 0
+let lastPromptEvidence:
+  | {
+      provider: AgentConfiguration['provider']
+      characters: number
+      utf8Bytes: number
+      sha256: string
+      hasBeginSentinel: boolean
+      hasMiddleSentinel: boolean
+      hasEndSentinel: boolean
+    }
+  | undefined
 const readyProviders: ProviderCapability[] = [
   {
     id: 'claude-code' as const,
@@ -192,6 +204,15 @@ async function runScriptedExchange(
   configuration: AgentConfiguration
 ): Promise<void> {
   userMessageCount += 1
+  lastPromptEvidence = {
+    provider: configuration.provider,
+    characters: message.text.length,
+    utf8Bytes: Buffer.byteLength(message.text, 'utf8'),
+    sha256: createHash('sha256').update(message.text, 'utf8').digest('hex'),
+    hasBeginSentinel: message.text.includes('BEGIN-LONG-PROMPT-SENTINEL'),
+    hasMiddleSentinel: message.text.includes('MIDDLE-LONG-PROMPT-SENTINEL'),
+    hasEndSentinel: message.text.includes('END-LONG-PROMPT-SENTINEL')
+  }
   const callId = `fake-call-${nextCallId++}`
   send(socket, { type: 'status', state: 'thinking' })
   send(socket, {
@@ -350,7 +371,8 @@ async function handleControl(
               )
             ? 'both-unavailable'
             : 'codex-missing',
-      completionDelayMs
+      completionDelayMs,
+      lastPromptEvidence
     })
     return
   }
@@ -367,6 +389,7 @@ async function handleControl(
   if (request.method === 'POST' && requestUrl.pathname === '/reset-stats') {
     userMessageCount = 0
     toolResultCount = 0
+    lastPromptEvidence = undefined
     json(response, 200, { ok: true })
     return
   }

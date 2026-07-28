@@ -63,7 +63,7 @@ function userMessage(revision = 1) {
     selectionSnapshot: { ids: [], count: 0, units: 'Meters' },
     sheet: {
       paper: 'A3',
-      orientation: 'landscape',
+      orientation: 'landscape' as const,
       scaleDenominator: 500,
       drawingUnit: 'm'
     }
@@ -415,6 +415,97 @@ describe('buildTurnPrompt', () => {
     ).toContain(
       'Selection attached: 2 entities, ids [a, b]. Units: Meters.\n' +
         'Active sheet: A3 landscape, scale 1:500, drawing unit m, template site-plan.'
+    )
+  })
+
+  it.each(['claude-code', 'openai-codex'] as const)(
+    'preserves a long prompt through WebSocket parsing and the %s provider boundary',
+    async (providerId) => {
+      const { ws, claude, codex, session } = sessionFixture()
+      await session.discoveryReady
+      send(ws, {
+        type: 'set_ai_configuration',
+        revision: 1,
+        configuration: configuration(providerId)
+      })
+      await vi.waitFor(() => {
+        expect(decodedMessages(ws)).toContainEqual(
+          expect.objectContaining({
+            type: 'ai_configuration_applied',
+            revision: 1
+          })
+        )
+      })
+      const text =
+        `  BEGIN-BRIDGE-SENTINEL\r\n${'α🌏\n'.repeat(4_000)}` +
+        `MIDDLE-BRIDGE-SENTINEL\n${'x'.repeat(16_000)}\nEND-BRIDGE-SENTINEL  `
+      const message = { ...userMessage(), text }
+      send(ws, message)
+      const provider = providerId === 'claude-code' ? claude : codex
+
+      await vi.waitFor(() => {
+        expect(provider.conversations[0].prompts).toHaveLength(1)
+      })
+      expect(provider.conversations[0].prompts[0]).toBe(
+        buildTurnPrompt(
+          text,
+          message.selectionSnapshot,
+          message.sheet
+        )
+      )
+      await session.close()
+    }
+  )
+
+  it('surfaces provider context rejection without truncating or retrying the prompt', async () => {
+    const { ws, claude, session } = sessionFixture()
+    await session.discoveryReady
+    claude.nextError = new Error(
+      'Claude context window rejected the complete request.'
+    )
+    send(ws, {
+      type: 'set_ai_configuration',
+      revision: 1,
+      configuration: configuration('claude-code')
+    })
+    await vi.waitFor(() => {
+      expect(decodedMessages(ws)).toContainEqual(
+        expect.objectContaining({
+          type: 'ai_configuration_applied',
+          revision: 1
+        })
+      )
+    })
+    const text = `BEGIN-CONTEXT\n${'x'.repeat(32_000)}\nEND-CONTEXT`
+    send(ws, { ...userMessage(), text })
+
+    await vi.waitFor(() => {
+      expect(decodedMessages(ws)).toContainEqual({
+        type: 'error',
+        message: 'Claude context window rejected the complete request.',
+        provider: 'claude-code'
+      })
+    })
+    expect(claude.conversations).toHaveLength(1)
+    expect(claude.conversations[0].prompts).toEqual([
+      buildTurnPrompt(text, userMessage().selectionSnapshot, userMessage().sheet)
+    ])
+    await session.close()
+  })
+
+  it('preserves the complete multiline Unicode user text before appending context', () => {
+    const text =
+      `  BEGIN-TURN-SENTINEL\r\n${'α🌏\n'.repeat(6_000)}` +
+      `MIDDLE-TURN-SENTINEL\n${'x'.repeat(16_000)}\nEND-TURN-SENTINEL  `
+    const prompt = buildTurnPrompt(text)
+
+    expect(prompt.startsWith(`${text}\n\n<context>\n`)).toBe(true)
+    expect(prompt.indexOf('BEGIN-TURN-SENTINEL')).toBe(2)
+    expect(prompt.indexOf('MIDDLE-TURN-SENTINEL')).toBeGreaterThan(
+      prompt.indexOf('BEGIN-TURN-SENTINEL')
+    )
+    expect(prompt.indexOf('END-TURN-SENTINEL')).toBeGreaterThan(
+      prompt.indexOf('MIDDLE-TURN-SENTINEL')
     )
   })
 })

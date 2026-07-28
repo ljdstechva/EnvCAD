@@ -28,6 +28,44 @@ describe('agent protocol validation', () => {
     })
   })
 
+  it.each([4_000, 4_001, 16_000, 250_000])(
+    'accepts an exact %i-character user prompt without rewriting it',
+    (length) => {
+      const prefix = 'BEGIN-'
+      const suffix = '-END-🧪'
+      const text = `${prefix}${'x'.repeat(
+        length - prefix.length - suffix.length
+      )}${suffix}`
+      expect(text).toHaveLength(length)
+      const parsed = parseClientMessage({ ...validUserMessage, text })
+
+      expect(parsed).toEqual({
+        ok: true,
+        value: { ...validUserMessage, text }
+      })
+      if (parsed.ok && parsed.value.type === 'user_message') {
+        expect(parsed.value.text).toBe(text)
+      }
+    }
+  )
+
+  it('preserves multiline Unicode and rejects empty or whitespace-only prompts', () => {
+    const text = '  first line\r\nikalawang linya 🌏\nfinal line  '
+    expect(parseClientMessage({ ...validUserMessage, text })).toEqual({
+      ok: true,
+      value: { ...validUserMessage, text }
+    })
+    for (const invalid of ['', ' \t\r\n ']) {
+      expect(
+        parseClientMessage({ ...validUserMessage, text: invalid })
+      ).toEqual({
+        ok: false,
+        error:
+          'user_message.text must contain at least one non-whitespace character'
+      })
+    }
+  })
+
   it('rejects a selection count that does not match its ids', () => {
     const parsed = parseClientMessage({
       ...validUserMessage,

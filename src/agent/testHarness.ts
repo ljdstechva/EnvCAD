@@ -148,7 +148,11 @@ export function installAgentTestHarness() {
     testRunning = true
     const selectionSnapshot = captureSelectionSnapshot()
     const sheet = captureSheetSnapshot()
-    console.log('[agentTest] sending user_message:', { text, selectionSnapshot, sheet })
+    console.log('[agentTest] sending user_message:', {
+      promptCharacters: text.length,
+      selectionCount: selectionSnapshot.count,
+      hasSheet: Boolean(sheet)
+    })
 
     try {
       const result = await new Promise<AgentTestResult>((resolve, reject) => {

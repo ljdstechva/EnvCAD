@@ -18,6 +18,9 @@ const SAFE_ENVIRONMENT_NAMES = [
   'WINDIR'
 ] as const
 
+export const ACCEPTANCE_EVIDENCE_ENVIRONMENT_NAME =
+  'ENVCAD_ACCEPTANCE_EVIDENCE_PATH'
+
 export const BLOCKED_SECRET_ENVIRONMENT_NAMES = [
   'OPENAI_API_KEY',
   'CODEX_API_KEY',
@@ -26,6 +29,7 @@ export const BLOCKED_SECRET_ENVIRONMENT_NAMES = [
   'ANTHROPIC_AUTH_TOKEN',
   'CLAUDE_CODE_OAUTH_TOKEN'
 ] as const
+const MAX_PROVIDER_DIAGNOSTIC_LENGTH = 4_000
 
 function getEnvironmentValue(
   environment: NodeJS.ProcessEnv,
@@ -62,7 +66,10 @@ export function presentBlockedEnvironmentNames(
 }
 
 export function redactProviderDiagnostic(value: unknown): string {
-  return String(value)
+  const redacted = String(value)
     .replace(/\bsk-(?:ant|proj|svcacct)-[A-Za-z0-9_-]+\b/g, '[redacted]')
     .replace(/\b(?:Bearer\s+)?eyJ[A-Za-z0-9._-]+\b/gi, '[redacted]')
+  return redacted.length <= MAX_PROVIDER_DIAGNOSTIC_LENGTH
+    ? redacted
+    : `${redacted.slice(0, MAX_PROVIDER_DIAGNOSTIC_LENGTH - 1)}…`
 }

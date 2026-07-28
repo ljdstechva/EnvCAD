@@ -70,7 +70,7 @@ const offlineMessage = computed(
 const canOpenLogs = Boolean(window.envcadDesktop)
 
 function onSend(text: string) {
-  sendMessage(text)
+  return sendMessage(text)
 }
 
 function onNewChat() {
@@ -322,7 +322,7 @@ function openLogs() {
     <ChatInput
       :disabled="inputDisabled"
       :selection-count="props.viewer.selectionCount"
-      @send="onSend"
+      :on-send="onSend"
     />
   </div>
 </template>

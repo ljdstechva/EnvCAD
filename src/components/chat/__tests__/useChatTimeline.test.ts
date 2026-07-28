@@ -52,6 +52,41 @@ describe('useChatTimeline', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     mocks.state.pendingRevision = 7
+    mocks.sendUserMessage.mockImplementation(() => undefined)
+  })
+
+  it('preserves prompt formatting and adds the user turn only after local acceptance', () => {
+    const timeline = useChatTimeline()
+    const text = '  BEGIN\r\nUnicode 🌏\nEND  '
+
+    expect(timeline.sendMessage(text)).toBe(true)
+    expect(mocks.sendUserMessage).toHaveBeenCalledWith(
+      text,
+      { ids: [], count: 0, units: 'Meters' },
+      expect.objectContaining({ paper: 'A3' })
+    )
+    expect(timeline.entries.value).toEqual([
+      expect.objectContaining({ kind: 'user', text })
+    ])
+    timeline.dispose()
+  })
+
+  it('does not add a false user turn when local payload validation rejects the request', () => {
+    mocks.sendUserMessage.mockImplementation(() => {
+      throw new Error(
+        "The complete AI request exceeds EnvCAD's 2 MiB transport capacity."
+      )
+    })
+    const timeline = useChatTimeline()
+
+    expect(timeline.sendMessage('preserve this draft')).toBe(false)
+    expect(timeline.entries.value).toEqual([
+      expect.objectContaining({
+        kind: 'error',
+        message: expect.stringContaining('2 MiB transport capacity')
+      })
+    ])
+    timeline.dispose()
   })
 
   it('retains provider metadata and metrics for a tool-only completion', () => {
