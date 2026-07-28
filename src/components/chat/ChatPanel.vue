@@ -39,7 +39,10 @@ const inputDisabled = computed(
     isOffline.value ||
     isStreaming.value ||
     bridgeState.refreshingCapabilities ||
-    !bridgeState.configurationReady
+    !bridgeState.configurationReady ||
+    !props.viewer.documentOpen ||
+    !props.viewer.editable ||
+    !props.viewer.viewReady
 )
 const providerStatusClass = computed(() => {
   const status = selectedProvider.value?.status
@@ -282,6 +285,12 @@ function openLogs() {
       class="provider-message"
     >
       {{ providerMessage }}
+    </div>
+    <div
+      v-if="!props.viewer.documentOpen || !props.viewer.viewReady"
+      class="provider-message document-message"
+    >
+      No editable drawing is open. Choose New Drawing or Open before sending an AI request.
     </div>
 
     <div class="chat-toolbar">

@@ -1,8 +1,98 @@
 diff --git a/node_modules/@mlightcad/cad-simple-viewer/dist/cad-simple-viewer.js b/node_modules/@mlightcad/cad-simple-viewer/dist/cad-simple-viewer.js
-index 296801d..6a2cb5e 100644
+index 296801d..d2e3537 100644
 --- a/node_modules/@mlightcad/cad-simple-viewer/dist/cad-simple-viewer.js
 +++ b/node_modules/@mlightcad/cad-simple-viewer/dist/cad-simple-viewer.js
-@@ -72242,13 +72242,17 @@ class E {
+@@ -37203,8 +37203,21 @@ class mt {
+   }
+   static shouldRematerializeMaterial(e, t, n) {
+     const i = gt(e);
+-    if (t.color.isForeground)
+-      return i.isForeground !== !0;
++    if (t.color.isForeground) {
++      if (i.isForeground === !0)
++        return !1;
++      if (i.isByLayerColor === !0)
++        return !0;
++      if (i.isByLayerColor == null && i.isForeground == null && i.materialKey == null) {
++        const a = Ml.fromBackgroundColor(n.currentBackgroundColor).resolveSubEntityTraitsRgb({
++          ...wi.createDefaultTraits(),
++          color: t.color,
++          layer: t.layer
++        });
++        return mt.getMaterialDisplayRgb(e) === a;
++      }
++      return !0;
++    }
+     if (i.isByLayerColor === !0 && i.layer != null && i.layer !== t.layer)
+       return !0;
+     const s = n.currentBackgroundColor, o = Ml.fromBackgroundColor(s).resolveSubEntityTraitsRgb({
+@@ -43943,20 +43956,21 @@ class _m extends Re {
+    *   layer color when the entity color is BYLAYER.
+    */
+   refreshTextMaterials(e) {
+-    if (this._colorSettings = mt.buildColorSettingsFromTraits(
++    const t = e != null && e.color && this._entityTraits.color.isByLayer ? {
++      color: e.color,
++      layer: this._entityTraits.layer
++    } : this._entityTraits;
++    this._colorSettings = mt.buildColorSettingsFromTraits(
+       {
+         ...wi.createDefaultTraits(),
+-        color: this._entityTraits.color,
+-        layer: this._entityTraits.layer
++        color: t.color,
++        layer: t.layer
+       },
+       this.renderContext.styleManager.currentBackgroundColor
+-    ), e != null && e.color && this._entityTraits.color.isByLayer) {
+-      const t = e.color.RGB;
+-      typeof t == "number" && (this._colorSettings.byLayerColor = t);
+-    }
++    );
+     mt.rematerializeTextHierarchy(
+       this,
+-      this._entityTraits,
++      t,
+       this.renderContext.styleManager
+     );
+   }
+@@ -44047,12 +44061,22 @@ class _m extends Re {
+    */
+   attachRendered(e) {
+     this.add(e);
+-    const t = O_(e);
++    const t = O_(e), n = this.renderContext.database?.tables.layerTable.getAt(
++      this._entityTraits.layer
++    ), i = this._entityTraits.color.isForeground ? this._entityTraits : this._entityTraits.color.isByLayer && (n == null ? void 0 : n.color.isForeground) ? {
++      color: n.color,
++      layer: this._entityTraits.layer
++    } : void 0;
++    i && mt.rematerializeTextHierarchy(
++      t,
++      i,
++      this.renderContext.styleManager
++    );
+     this.resolveDrawMode() === "unbatch" ? (this.markDrawableUnbatched(t), mt.storeTextEntityTraitsOnDrawable(
+       t,
+       this._entityTraits
+-    )) : this.flatten(), this.removeInvalidGeometryLeaves(), this.traverse((n) => {
+-      Be(n).bboxIntersectionCheck = !0;
++    )) : this.flatten(), this.removeInvalidGeometryLeaves(), this.traverse((s) => {
++      Be(s).bboxIntersectionCheck = !0;
+     }), this.updateSelectionBox(e);
+   }
+   /**
+@@ -72141,7 +72165,8 @@ class E {
+    * - Dark background: use white.
+    */
+   resolveAci7ForBackground() {
+-    return this.curView.backgroundColor === 16777215 ? 0 : 16777215;
++    const e = this.curView.backgroundColor, t = e >> 16 & 255, n = e >> 8 & 255, i = e & 255;
++    return 0.2126 * t + 0.7152 * n + 0.0722 * i >= 128 ? 0 : 16777215;
+   }
+   /**
+    * Gets the list of available fonts that can be loaded.
+@@ -72242,13 +72267,17 @@ class E {
     * ```
     */
    async openDocument(e, t, n) {
@@ -24,7 +114,7 @@ index 296801d..6a2cb5e 100644
    }
    /**
     * Loads a DWG/DXF file as a read-only overlay (base drawing/reference)
-@@ -74934,42 +74938,56 @@ class NP {
+@@ -74934,42 +74963,56 @@ class NP {
     * @param doc - The document containing the drawing database
     */
    constructor(e, t) {
@@ -106,7 +196,7 @@ index 296801d..6a2cb5e 100644
     * Gets the view component that renders the CAD drawing.
     *
 diff --git a/node_modules/@mlightcad/cad-simple-viewer/lib/app/AcApContext.d.ts b/node_modules/@mlightcad/cad-simple-viewer/lib/app/AcApContext.d.ts
-index a79f26a..8e30d68 100644
+index a79f26a..2686e31 100644
 --- a/node_modules/@mlightcad/cad-simple-viewer/lib/app/AcApContext.d.ts
 +++ b/node_modules/@mlightcad/cad-simple-viewer/lib/app/AcApContext.d.ts
 @@ -41,6 +41,14 @@ export declare class AcApContext {
@@ -125,7 +215,7 @@ index a79f26a..8e30d68 100644
       * Gets the view component that renders the CAD drawing.
       *
 diff --git a/node_modules/@mlightcad/cad-simple-viewer/lib/app/AcApContext.js b/node_modules/@mlightcad/cad-simple-viewer/lib/app/AcApContext.js
-index 1ceeab4..5a903a8 100644
+index 1ceeab4..2679aeb 100644
 --- a/node_modules/@mlightcad/cad-simple-viewer/lib/app/AcApContext.js
 +++ b/node_modules/@mlightcad/cad-simple-viewer/lib/app/AcApContext.js
 @@ -43,6 +43,50 @@ var AcApContext = /** @class */ (function () {
@@ -220,10 +310,23 @@ index 1ceeab4..5a903a8 100644
          /**
           * Gets the view component that renders the CAD drawing.
 diff --git a/node_modules/@mlightcad/cad-simple-viewer/lib/app/AcApDocManager.js b/node_modules/@mlightcad/cad-simple-viewer/lib/app/AcApDocManager.js
-index 48e9113..a59a58e 100644
+index 48e9113..59c1fc9 100644
 --- a/node_modules/@mlightcad/cad-simple-viewer/lib/app/AcApDocManager.js
 +++ b/node_modules/@mlightcad/cad-simple-viewer/lib/app/AcApDocManager.js
-@@ -692,17 +692,36 @@ var AcApDocManager = /** @class */ (function () {
+@@ -549,7 +549,11 @@ var AcApDocManager = /** @class */ (function () {
+      */
+     AcApDocManager.prototype.resolveAci7ForBackground = function () {
+         var bg = this.curView.backgroundColor;
+-        return bg === 0xffffff ? 0x000000 : 0xffffff;
++        var red = (bg >> 16) & 0xff;
++        var green = (bg >> 8) & 0xff;
++        var blue = bg & 0xff;
++        var luminance = 0.2126 * red + 0.7152 * green + 0.0722 * blue;
++        return luminance >= 128 ? 0x000000 : 0xffffff;
+     };
+     Object.defineProperty(AcApDocManager.prototype, "avaiableFonts", {
+         /**
+@@ -692,17 +696,36 @@ var AcApDocManager = /** @class */ (function () {
       */
      AcApDocManager.prototype.openDocument = function (fileName, content, options) {
          return __awaiter(this, void 0, void 0, function () {

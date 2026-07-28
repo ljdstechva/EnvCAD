@@ -72,8 +72,17 @@ const specs = [
   ),
   defineTool(
     'get_drawing_context',
-    'Get the current drawing units, the list of layers (with visibility), the current layer, ' +
-      'and the drawing extents (bounding box).',
+    'Get the authoritative document lifecycle, editability, view readiness, active layout, ' +
+      'database and sheet units, visible/entity counts, layers, and drawing extents. This is ' +
+      'safe when no drawing is open and then explicitly reports documentOpen=false.',
+    z.strictObject({})
+  ),
+  defineTool(
+    'get_view_status',
+    'Read the authoritative render state after drawing or fitting: document lifecycle, active ' +
+      'layout, canvas dimensions, entity/visible counts, extents, regeneration, last Fit Drawing ' +
+      'verification, Sheet Preview status and warnings, and database/sheet unit mismatch. This ' +
+      'does not expose drawing text. Use it after a long drawing sequence and after zoom_extents.',
     z.strictObject({})
   ),
   defineTool(
@@ -315,7 +324,9 @@ const specs = [
   ),
   defineTool(
     'zoom_extents',
-    'Zoom and pan the viewport to fit the entire drawing.',
+    'Run the same verified Fit Drawing operation as the toolbar. It requires an active editable ' +
+      'Model view, regenerates visible geometry, rejects invalid extents, fits with padding, and ' +
+      'fails unless the complete extents are proven inside the resulting viewport.',
     z.strictObject({})
   ),
   defineTool(
@@ -432,6 +443,12 @@ const specs = [
         .finite()
         .optional()
         .describe('Denominator of the drawing scale, e.g. 250 for 1:250'),
+      drawingUnit: z
+        .enum(['m', 'mm'])
+        .optional()
+        .describe(
+          'Explicit sheet interpretation unit. Changing this never scales model geometry.'
+        ),
       templateId: z.string().min(1).optional().describe('Id of the title-block template, from get_sheet_setup'),
       fields: z
         .record(z.string(), z.string())

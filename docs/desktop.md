@@ -2,7 +2,7 @@
 
 ## Install and launch
 
-EnvCAD v0.2.1 is packaged for Windows x64 with Electron Forge and Squirrel.
+EnvCAD v0.2.2 is packaged for Windows x64 with Electron Forge and Squirrel.
 
 ```powershell
 npm ci
@@ -12,7 +12,7 @@ npm run desktop:make
 The installer is produced under:
 
 ```text
-out\make\squirrel.windows\x64\EnvCAD-0.2.1 Setup.exe
+out\make\squirrel.windows\x64\EnvCAD-0.2.2 Setup.exe
 ```
 
 Install it, then launch EnvCAD from the Desktop shortcut or Start menu. The

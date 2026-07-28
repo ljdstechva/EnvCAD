@@ -6,7 +6,7 @@ canonical CAD tool → browser executor → drawing database. Each case names th
 tool calls and observable result, so a regression is concrete.
 
 The run log below is the historical Claude Code pass from 2026-07-26. EnvCAD
-v0.2.1 applies the same catalog and schemas to both providers; the installed
+v0.2.2 applies the same catalog and schemas to both providers; the installed
 cross-provider deterministic creation/annotation evidence is recorded in
 `docs/ai-benchmark.md`.
 

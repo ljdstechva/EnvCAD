@@ -39,6 +39,129 @@ const TRUNCATED_DXF = [
   '100',
   '21'
 ].join('\n')
+const ACI7_MTEXT_DXF = [
+  0, 'SECTION',
+  2, 'HEADER',
+  9, '$ACADVER',
+  1, 'AC1018',
+  9, '$INSUNITS',
+  70, 4,
+  9, '$EXTMIN',
+  10, 0,
+  20, 0,
+  30, 0,
+  9, '$EXTMAX',
+  10, 100,
+  20, 60,
+  30, 0,
+  0, 'ENDSEC',
+  0, 'SECTION',
+  2, 'TABLES',
+  0, 'TABLE',
+  2, 'LTYPE',
+  70, 1,
+  0, 'LTYPE',
+  5, '3',
+  100, 'AcDbSymbolTableRecord',
+  100, 'AcDbLinetypeTableRecord',
+  2, 'CONTINUOUS',
+  70, 0,
+  3, 'Solid line',
+  72, 65,
+  73, 0,
+  40, 0,
+  0, 'ENDTAB',
+  0, 'TABLE',
+  2, 'LAYER',
+  70, 2,
+  0, 'LAYER',
+  5, '4',
+  100, 'AcDbSymbolTableRecord',
+  100, 'AcDbLayerTableRecord',
+  2, '0',
+  70, 0,
+  62, 7,
+  6, 'CONTINUOUS',
+  0, 'LAYER',
+  5, '5',
+  100, 'AcDbSymbolTableRecord',
+  100, 'AcDbLayerTableRecord',
+  2, 'ANNOTATION',
+  70, 0,
+  62, 7,
+  6, 'CONTINUOUS',
+  0, 'ENDTAB',
+  0, 'TABLE',
+  2, 'BLOCK_RECORD',
+  5, '2',
+  330, '0',
+  100, 'AcDbSymbolTable',
+  70, 1,
+  0, 'BLOCK_RECORD',
+  5, '10',
+  330, '2',
+  100, 'AcDbSymbolTableRecord',
+  100, 'AcDbBlockTableRecord',
+  2, '*Model_Space',
+  70, 0,
+  280, 1,
+  281, 0,
+  0, 'ENDTAB',
+  0, 'ENDSEC',
+  0, 'SECTION',
+  2, 'BLOCKS',
+  0, 'BLOCK',
+  5, '11',
+  330, '10',
+  100, 'AcDbEntity',
+  8, '0',
+  100, 'AcDbBlockBegin',
+  2, '*Model_Space',
+  70, 0,
+  10, 0,
+  20, 0,
+  30, 0,
+  3, '*Model_Space',
+  1, '',
+  0, 'ENDBLK',
+  5, '12',
+  330, '10',
+  100, 'AcDbEntity',
+  8, '0',
+  100, 'AcDbBlockEnd',
+  0, 'ENDSEC',
+  0, 'SECTION',
+  2, 'ENTITIES',
+  0, 'LINE',
+  5, '20',
+  330, '10',
+  100, 'AcDbEntity',
+  8, 'ANNOTATION',
+  62, 256,
+  100, 'AcDbLine',
+  10, 0,
+  20, 0,
+  30, 0,
+  11, 100,
+  21, 60,
+  31, 0,
+  0, 'MTEXT',
+  5, '21',
+  330, '10',
+  100, 'AcDbEntity',
+  8, 'ANNOTATION',
+  62, 256,
+  100, 'AcDbMText',
+  10, 10,
+  20, 35,
+  30, 0,
+  40, 10,
+  41, 80,
+  71, 1,
+  1, 'ACI-7 BYLAYER MTEXT',
+  0, 'ENDSEC',
+  0, 'EOF'
+].join('\n')
 
 interface TestEntity {
   id: string
@@ -179,6 +302,245 @@ test.describe.serial('EnvCAD preview with scripted fake sidecar', () => {
     expect(anthropicRequests).toEqual([])
   })
 
+  test('starts with an explicit no-document state and rejects edits against the library fallback database', async ({
+    page
+  }) => {
+    await page.goto('/')
+    await expect.poll(() => page.evaluate(() => Boolean(window.__cadTest))).toBe(true)
+
+    await expect(page.getByRole('status')).toContainText('No drawing is open.')
+    await expect(page.getByRole('status')).toContainText(
+      'Choose New Drawing or Open.'
+    )
+    await expect(page.getByRole('button', { name: 'Save DXF' })).toBeDisabled()
+    await expect(page.getByRole('button', { name: 'Fit Drawing' })).toBeDisabled()
+    await expect(page.getByRole('button', { name: 'Layers' })).toBeDisabled()
+    await expect(page.getByRole('button', { name: 'Page Setup' })).toBeDisabled()
+    await expect(page.locator('.status-bar')).toHaveText('No document')
+
+    const result = await page.evaluate(async () => {
+      return {
+        session: window.__cadTest?.session(),
+        entities: window.__cadTest?.entities(),
+        canUndo: window.__cadTest?.canUndo(),
+        context: await window.__cadTest?.callTool('get_drawing_context', {}),
+        edit: await window.__cadTest?.callTool('draw_line', {
+          start: { x: 0, y: 0 },
+          end: { x: 10, y: 10 }
+        })
+      }
+    })
+    expect(result.session).toMatchObject({
+      status: 'no-document',
+      editable: false,
+      viewReady: false,
+      entityCount: 0
+    })
+    expect(result.entities).toEqual([])
+    expect(result.canUndo).toBe(false)
+    expect(result.context).toMatchObject({
+      data: {
+        documentOpen: false,
+        editable: false,
+        viewReady: false,
+        lifecycleStatus: 'no-document'
+      }
+    })
+    expect(result.edit?.error).toContain(
+      'Choose New Drawing or Open before using CAD tools'
+    )
+  })
+
+  test('creates a clean editable drawing, regenerates agent edits, and fits complete extents', async ({
+    page
+  }) => {
+    await page.goto('/')
+    await expect.poll(() => page.evaluate(() => Boolean(window.__cadTest))).toBe(true)
+    await page.getByRole('button', { name: 'New Drawing' }).click()
+    await expect
+      .poll(() =>
+        page.evaluate(
+          () =>
+            (window.__cadTest?.session() as { status?: string } | undefined)
+              ?.status
+        )
+      )
+      .toBe('active')
+    await expect(page.getByRole('button', { name: 'Save DXF' })).toBeEnabled()
+    await expect(page.getByRole('button', { name: 'Fit Drawing' })).toBeDisabled()
+    expect(await page.evaluate(() => window.__cadTest?.entities())).toEqual([])
+
+    const editEvidence = await page.evaluate(async () => {
+      for (let index = 0; index < 5; index += 1) {
+        const result = await window.__cadTest!.callTool('draw_line', {
+          start: { x: index * 10, y: index % 2 === 0 ? 0 : 5 },
+          end: { x: index * 10 + 8, y: index % 2 === 0 ? 6 : 12 }
+        })
+        if (result.error) throw new Error(result.error)
+      }
+      return window.__cadTest!.callTool('get_view_status', {})
+    })
+    expect(editEvidence).toMatchObject({
+      data: {
+        documentOpen: true,
+        editable: true,
+        viewReady: true,
+        entityCount: 5,
+        visibleEntityCount: 5,
+        lastRegeneration: {
+          completed: true
+        }
+      }
+    })
+    await expect
+      .poll(() => page.evaluate(() => window.__cadTest?.renderedEntityIds().length))
+      .toBe(5)
+
+    await page.getByRole('button', { name: 'Fit Drawing' }).click()
+    await expect
+      .poll(() =>
+        page.evaluate(
+          () =>
+            (
+              window.__cadTest?.session() as {
+                lastFit?: { completeExtentsFit?: boolean }
+              }
+            )?.lastFit?.completeExtentsFit
+        )
+      )
+      .toBe(true)
+    const status = await page.evaluate(() =>
+      window.__cadTest?.callTool('get_view_status', {})
+    )
+    expect(status).toMatchObject({
+      data: {
+        activeLayout: 'Model',
+        completeExtentsFit: true,
+        lastFitDrawing: {
+          entityCount: 5,
+          regenerationCompleted: true,
+          completeExtentsFit: true
+        }
+      }
+    })
+
+    const invalidatedStatus = await page.evaluate(async () => {
+      const edit = await window.__cadTest!.callTool('draw_line', {
+        start: { x: 100, y: 100 },
+        end: { x: 120, y: 120 }
+      })
+      if (edit.error) throw new Error(edit.error)
+      return window.__cadTest!.callTool('get_view_status', {})
+    })
+    expect(invalidatedStatus.data).toMatchObject({
+      completeExtentsFit: false,
+      sheetPreview: {
+        status: 'unavailable'
+      }
+    })
+    expect(
+      (invalidatedStatus.data as { lastFitDrawing?: unknown }).lastFitDrawing
+    ).toBeUndefined()
+  })
+
+  test('keeps a large, negative-coordinate drawing framed after Fit Drawing settles', async ({
+    page
+  }) => {
+    await page.goto('/')
+    await expect.poll(() => page.evaluate(() => Boolean(window.__cadTest))).toBe(true)
+    await page.getByRole('button', { name: 'New Drawing' }).click()
+    await expect
+      .poll(() =>
+        page.evaluate(
+          () =>
+            (window.__cadTest?.session() as { status?: string } | undefined)
+              ?.status
+        )
+      )
+      .toBe('active')
+
+    const segments = [
+      [[-50_000, -30_000], [114_200, -30_000]],
+      [[114_200, -30_000], [114_200, 84_800]],
+      [[114_200, 84_800], [-50_000, 84_800]],
+      [[-50_000, 84_800], [-50_000, -30_000]],
+      [[-50_000, -30_000], [114_200, 84_800]],
+      [[-50_000, 84_800], [114_200, -30_000]],
+      [[-25_000, -15_000], [90_000, 70_000]],
+      [[-25_000, 70_000], [90_000, -15_000]],
+      [[0, -30_000], [0, 84_800]],
+      [[60_000, -30_000], [60_000, 84_800]],
+      [[-50_000, 20_000], [114_200, 20_000]],
+      [[-50_000, 55_000], [114_200, 55_000]]
+    ]
+    await page.evaluate(async (inputSegments) => {
+      for (const [start, end] of inputSegments) {
+        const result = await window.__cadTest!.callTool('draw_line', {
+          start: { x: start[0], y: start[1] },
+          end: { x: end[0], y: end[1] }
+        })
+        if (result.error) throw new Error(result.error)
+      }
+    }, segments)
+
+    await page.getByRole('button', { name: 'Fit Drawing' }).click()
+    await expect
+      .poll(() =>
+        page.evaluate(
+          () =>
+            (
+              window.__cadTest?.session() as {
+                lastFit?: { completeExtentsFit?: boolean }
+              }
+            )?.lastFit?.completeExtentsFit
+        )
+      )
+      .toBe(true)
+    await page.waitForTimeout(900)
+
+    const evidence = await page.evaluate(async () => ({
+      status: await window.__cadTest!.callTool('get_view_status', {}),
+      view: window.__cadTest!.viewState()
+    }))
+    expect(evidence.status).toMatchObject({
+      data: {
+        entityCount: 12,
+        visibleEntityCount: 12,
+        renderableGeometryCount: 12,
+        renderedEntityCount: 12,
+        completeExtentsFit: true
+      }
+    })
+    const view = evidence.view as {
+      width: number
+      height: number
+      sceneExtents: { minX: number; minY: number; maxX: number; maxY: number }
+      corners: Array<{ x: number; y: number }>
+      sceneStats: { layoutCount: number; entityCount: number }
+    }
+    expect(view.sceneExtents).toEqual({
+      minX: -50_000,
+      minY: -30_000,
+      maxX: 114_200,
+      maxY: 84_800
+    })
+    expect(view.sceneStats).toMatchObject({ entityCount: 12 })
+    const projectedWidth =
+      Math.max(...view.corners.map((point) => point.x)) -
+      Math.min(...view.corners.map((point) => point.x))
+    const projectedHeight =
+      Math.max(...view.corners.map((point) => point.y)) -
+      Math.min(...view.corners.map((point) => point.y))
+    expect(
+      Math.max(projectedWidth / view.width, projectedHeight / view.height)
+    ).toBeGreaterThanOrEqual(0.75)
+
+    const screenshot = await page.locator('.canvas-host canvas:visible').first().screenshot()
+    const variance = pngPixelVariance(screenshot)
+    expect(variance.uniqueColors).toBeGreaterThan(4)
+    expect(variance.brightnessRange).toBeGreaterThan(20)
+  })
+
   test('loads sample-site.dxf and renders non-blank CAD pixels', async ({ page }) => {
     const entities = await loadFixture(page)
     expect(entities.length).toBeGreaterThan(5)
@@ -189,6 +551,166 @@ test.describe.serial('EnvCAD preview with scripted fake sidecar', () => {
     const variance = pngPixelVariance(screenshot)
     expect(variance.uniqueColors).toBeGreaterThan(4)
     expect(variance.brightnessRange).toBeGreaterThan(20)
+  })
+
+  test('revalidates Fit Drawing after camera, viewport, UI, theme, and history changes', async ({
+    page
+  }) => {
+    const originalEntities = await loadFixture(page)
+    const currentFit = () =>
+      page.evaluate(async () => {
+        const status = await window.__cadTest!.callTool('get_view_status', {})
+        return Boolean(
+          (status.data as { completeExtentsFit?: boolean })
+            .completeExtentsFit
+        )
+      })
+
+    await page.getByRole('button', { name: 'Fit Drawing' }).click()
+    await expect.poll(currentFit).toBe(true)
+
+    await page.locator('.theme-toggle').click()
+    await expect.poll(currentFit).toBe(true)
+    await page.getByRole('button', { name: 'Sheet Preview' }).click()
+    await expect
+      .poll(() =>
+        page.locator('.preview-viewport').getAttribute('data-render-status')
+      )
+      .toMatch(/^(ready|warning)$/)
+    await page.getByRole('button', { name: 'AI Assistant' }).click()
+
+    const canvasHost = page.locator('.canvas-host')
+    const box = await canvasHost.boundingBox()
+    if (!box) throw new Error('Canvas host did not expose a bounding box.')
+    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2)
+    await page.mouse.wheel(0, -2_000)
+    await expect.poll(currentFit).toBe(false)
+
+    await page.keyboard.press('Home')
+    await expect.poll(currentFit).toBe(true)
+
+    await page.locator('.side-toggle').click()
+    await page.setViewportSize({ width: 1040, height: 760 })
+    await page.keyboard.press('Home')
+    await expect.poll(currentFit).toBe(true)
+
+    const editedStatus = await page.evaluate(async () => {
+      const edit = await window.__cadTest!.callTool('draw_line', {
+        start: { x: 150, y: 100 },
+        end: { x: 170, y: 115 }
+      })
+      if (edit.error) throw new Error(edit.error)
+      return window.__cadTest!.callTool('get_view_status', {})
+    })
+    expect(editedStatus.data).toMatchObject({ completeExtentsFit: false })
+    await expect(page.getByRole('button', { name: 'Undo' })).toBeEnabled()
+    await page.getByRole('button', { name: 'Undo' }).click()
+    await expect
+      .poll(() => page.evaluate(() => window.__cadTest!.entities().length))
+      .toBe(originalEntities.length)
+    await page.getByRole('button', { name: 'Redo' }).click()
+    await expect
+      .poll(() => page.evaluate(() => window.__cadTest!.entities().length))
+      .toBe(originalEntities.length + 1)
+    await expect.poll(currentFit).toBe(false)
+
+    await page.keyboard.press('Home')
+    await expect.poll(currentFit).toBe(true)
+    const screenshot = await page
+      .locator('.canvas-host canvas:visible')
+      .first()
+      .screenshot()
+    const variance = pngPixelVariance(screenshot)
+    expect(variance.uniqueColors).toBeGreaterThan(4)
+    expect(variance.brightnessRange).toBeGreaterThan(20)
+  })
+
+  test('reports a 1000x mm/m sheet mismatch, blocks export, and persists sheet state per document', async ({
+    page
+  }, testInfo) => {
+    const millimeterFixture = testInfo.outputPath('millimeter-site.dxf')
+    const source = await fs.readFile(FIXTURE, 'utf8')
+    const converted = source.replace(
+      /(\$INSUNITS\s+70\s+)6/,
+      (_match, prefix: string) => `${prefix}4`
+    )
+    expect(converted).not.toBe(source)
+    await fs.writeFile(millimeterFixture, converted, 'utf8')
+
+    await page.goto('/')
+    await expect.poll(() => page.evaluate(() => Boolean(window.__cadTest))).toBe(true)
+    await page.locator('input[accept=".dxf,.dwg"]').setInputFiles(millimeterFixture)
+    await expect(page.getByRole('button', { name: 'Save DXF' })).toBeEnabled()
+    await expect
+      .poll(() =>
+        page.evaluate(
+          () =>
+            (window.__cadTest?.session() as { databaseUnit?: string })
+              .databaseUnit
+        )
+      )
+      .toBe('mm')
+
+    const entitiesBefore = await page.evaluate(() => window.__cadTest?.entities())
+    const setUnit = await page.evaluate(() =>
+      window.__cadTest?.callTool('set_sheet_definition', {
+        drawingUnit: 'm'
+      })
+    )
+    expect(setUnit).toMatchObject({
+      data: {
+        sheet: {
+          drawingUnit: 'm'
+        },
+        databaseUnit: 'mm',
+        unitMismatch: true,
+        unitMismatchFactor: 1000
+      }
+    })
+    expect(await page.evaluate(() => window.__cadTest?.entities())).toEqual(
+      entitiesBefore
+    )
+
+    await page.getByRole('button', { name: 'Sheet Preview' }).click()
+    await expect(
+      page.locator('.warning-banner', {
+        hasText: 'The interpretation differs by a factor of 1000'
+      })
+    ).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Export PDF' })).toBeDisabled()
+    expect(
+      await page.evaluate(
+        () =>
+          (
+            window.__cadTest?.session() as {
+              sheetPreview?: { unitMismatch?: boolean }
+            }
+          ).sheetPreview?.unitMismatch
+      )
+    ).toBe(true)
+
+    await page.locator('input[accept=".dxf,.dwg"]').setInputFiles(FIXTURE)
+    await expect
+      .poll(() => page.evaluate(() => window.__cadTest?.sheet()))
+      .toMatchObject({ drawingUnit: 'm' })
+    await page.locator('input[accept=".dxf,.dwg"]').setInputFiles(
+      millimeterFixture
+    )
+    await expect
+      .poll(() => page.evaluate(() => window.__cadTest?.sheet()))
+      .toMatchObject({ drawingUnit: 'm' })
+
+    await page
+      .getByRole('button', { name: 'Page Setup', exact: true })
+      .click()
+    const dialog = page.locator('.dialog')
+    await expect(dialog).toContainText('Database unit')
+    await expect(dialog).toContainText('Millimeters')
+    await expect(dialog).toContainText('Mismatch')
+    await dialog.getByRole('button', { name: 'Match database unit' }).click()
+    await expect
+      .poll(() => page.evaluate(() => window.__cadTest?.sheet()))
+      .toMatchObject({ drawingUnit: 'mm' })
   })
 
   test('paints the themed canvas background after opening and when the theme changes', async ({
@@ -204,6 +726,71 @@ test.describe.serial('EnvCAD preview with scripted fake sidecar', () => {
 
     await page.locator('.theme-toggle').click()
     await expect.poll(() => page.evaluate(() => window.__cadTest?.canvasBackground())).toBe(0xf5f5f5)
+  })
+
+  test('keeps ByLayer ACI-7 MTEXT foreground-adaptive on light and dark canvases', async ({
+    page
+  }, testInfo) => {
+    const aci7Fixture = testInfo.outputPath('aci7-mtext.dxf')
+    await fs.writeFile(aci7Fixture, ACI7_MTEXT_DXF, 'utf8')
+
+    await page.goto('/')
+    await expect.poll(() => page.evaluate(() => Boolean(window.__cadTest))).toBe(true)
+    await page.locator('input[accept=".dxf,.dwg"]').setInputFiles(aci7Fixture)
+    await expect
+      .poll(() =>
+        page.evaluate(
+          () => {
+            const session = window.__cadTest?.session() as
+              | {
+                  status?: string
+                  renderedEntityCount?: number
+                  entityCount?: number
+                }
+              | undefined
+            return (
+              session?.status === 'active' &&
+              session.entityCount !== undefined &&
+              session.renderedEntityCount === session.entityCount
+            )
+          }
+        )
+      )
+      .toBe(true)
+
+    const annotationMaterials = async () =>
+      page.evaluate(
+        () =>
+          (
+            window.__cadTest?.textMaterialState() as
+              | Array<{
+                  layer?: string
+                  color?: number
+                  isForeground?: boolean
+                }>
+              | undefined
+          )?.filter((material) => material.layer === 'ANNOTATION') ?? []
+      )
+
+    await expect.poll(annotationMaterials).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ color: 0x000000, isForeground: true })
+      ])
+    )
+    expect((await annotationMaterials()).every((material) => material.color === 0x000000))
+      .toBe(true)
+
+    await page.locator('.theme-toggle').click()
+    await expect
+      .poll(async () => (await annotationMaterials()).map((material) => material.color))
+      .toEqual(expect.arrayContaining([0xffffff]))
+    expect((await annotationMaterials()).every((material) => material.color === 0xffffff))
+      .toBe(true)
+
+    await page.locator('.theme-toggle').click()
+    await expect
+      .poll(async () => (await annotationMaterials()).map((material) => material.color))
+      .toEqual(expect.arrayContaining([0x000000]))
   })
 
   test('sets A4 portrait and renders a 210 by 297 sheet viewBox', async ({ page }) => {
@@ -244,6 +831,11 @@ test.describe.serial('EnvCAD preview with scripted fake sidecar', () => {
   test('exports and reopens the deterministic AI benchmark geometry exactly', async ({
     page
   }, testInfo) => {
+    // Reopening a DXF with text can require the CAD engine to resolve its
+    // named font before the document becomes active. Keep this bounded, but
+    // allow for a cold font-cache fetch instead of treating the opening state
+    // (where entity access is intentionally disabled) as an empty document.
+    test.setTimeout(75_000)
     const cleanPath = testInfo.outputPath('clean-benchmark.dxf')
     const savedPath = testInfo.outputPath('benchmark-saved.dxf')
     const reopenedPath = testInfo.outputPath('benchmark-reopened.dxf')
@@ -255,7 +847,9 @@ test.describe.serial('EnvCAD preview with scripted fake sidecar', () => {
     await page.goto('/')
     await expect.poll(() => page.evaluate(() => Boolean(window.__cadTest))).toBe(true)
     await page.locator('input[accept=".dxf,.dwg"]').setInputFiles(cleanPath)
-    await expect(page.getByRole('button', { name: 'Save DXF' })).toBeEnabled()
+    await expect(page.getByRole('button', { name: 'Save DXF' })).toBeEnabled({
+      timeout: 45_000
+    })
     await expect
       .poll(() => page.evaluate(() => window.__cadTest?.entities().length ?? -1))
       .toBe(0)
@@ -316,8 +910,13 @@ test.describe.serial('EnvCAD preview with scripted fake sidecar', () => {
     await page.getByRole('button', { name: 'Save DXF' }).click()
     await (await download).saveAs(savedPath)
     await page.locator('input[accept=".dxf,.dwg"]').setInputFiles(savedPath)
+    await expect(page.getByRole('button', { name: 'Save DXF' })).toBeEnabled({
+      timeout: 45_000
+    })
     await expect
-      .poll(() => page.evaluate(() => window.__cadTest?.entities().length ?? 0))
+      .poll(() => page.evaluate(() => window.__cadTest?.entities().length ?? 0), {
+        timeout: 10_000
+      })
       .toBe(4)
     download = page.waitForEvent('download')
     await page.getByRole('button', { name: 'Save DXF' }).click()
@@ -463,7 +1062,7 @@ test.describe.serial('EnvCAD preview with scripted fake sidecar', () => {
     page,
     request
   }) => {
-    await page.goto('/')
+    await loadFixture(page)
     await request.post(`${CONTROL_URL}/reset-stats`)
     const input = page.locator('.chat-textarea')
     await expect(input).toBeEnabled()
@@ -526,7 +1125,7 @@ test.describe.serial('EnvCAD preview with scripted fake sidecar', () => {
     page,
     request
   }) => {
-    await page.goto('/')
+    await loadFixture(page)
     await request.post(`${CONTROL_URL}/reset-stats`)
     const input = page.locator('.chat-textarea')
     const oversizedDraft = `BEGIN-OVERSIZED\n${'x'.repeat(
@@ -615,7 +1214,7 @@ test.describe.serial('EnvCAD preview with scripted fake sidecar', () => {
     page,
     request
   }) => {
-    await page.goto('/')
+    await loadFixture(page)
     await request.post(`${CONTROL_URL}/scenario?name=codex-missing`)
     await page
       .getByLabel('AI provider', { exact: true })
@@ -774,9 +1373,9 @@ test.describe.serial('EnvCAD preview with scripted fake sidecar', () => {
     page,
     request
   }) => {
+    await loadFixture(page)
     await request.post(`${CONTROL_URL}/stop`)
     try {
-      await page.goto('/')
       await expect(page.locator('.offline-banner')).toBeVisible()
       await expect(page.locator('.chat-textarea')).toBeDisabled()
 

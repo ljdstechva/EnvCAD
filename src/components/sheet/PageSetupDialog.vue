@@ -1,6 +1,11 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
-import { sheetStore } from '../../sheet/sheetStore'
+import { cadSessionState } from '../../cad/session'
+import {
+  matchSheetToDatabaseUnit,
+  sheetStore,
+  sheetUnitMismatch
+} from '../../sheet/sheetStore'
 import {
   exportTemplateToJson,
   importTemplateFromJson
@@ -48,6 +53,16 @@ watch(customScaleValue, (value) => {
 })
 
 const paperDims = computed(() => PAPER_SIZES[sheetStore.current.paper])
+const unitStatus = computed(() =>
+  sheetUnitMismatch(
+    cadSessionState.databaseUnit,
+    sheetStore.current.drawingUnit
+  )
+)
+
+function matchDatabaseUnit() {
+  matchSheetToDatabaseUnit(cadSessionState.databaseUnit)
+}
 
 function setOrientation(orientation: Orientation) {
   sheetStore.current.orientation = orientation
@@ -195,6 +210,9 @@ function previewSvg(template: TitleBlockTemplate): string {
       </div>
 
       <div class="dialog-body">
+        <div v-if="sheetStore.persistenceError" class="unit-warning blocking">
+          {{ sheetStore.persistenceError }}
+        </div>
         <div class="field-row">
           <label>Paper size</label>
           <select v-model="sheetStore.current.paper">
@@ -239,6 +257,28 @@ function previewSvg(template: TitleBlockTemplate): string {
             <span class="hint">1 :</span>
             <input type="number" min="1" v-model.number="customScaleValue" class="scale-input" />
           </template>
+        </div>
+
+        <div class="field-row">
+          <label>Database unit</label>
+          <strong>{{ cadSessionState.databaseUnitName }}</strong>
+          <span
+            class="unit-status"
+            :class="{ mismatch: unitStatus.mismatch }"
+          >
+            {{ unitStatus.mismatch ? 'Mismatch' : 'Matches sheet' }}
+          </span>
+        </div>
+
+        <div v-if="unitStatus.message" class="unit-warning" :class="{ blocking: unitStatus.mismatch }">
+          <span>{{ unitStatus.message }}</span>
+          <button
+            v-if="unitStatus.mismatch && cadSessionState.databaseUnit !== 'unknown'"
+            type="button"
+            @click="matchDatabaseUnit"
+          >
+            Match database unit
+          </button>
         </div>
 
         <div class="field-row">
@@ -413,6 +453,49 @@ input[type='number'] {
 .hint {
   color: var(--text-muted);
   font-size: 11px;
+}
+
+.unit-status {
+  color: var(--info-text);
+  font-size: 11px;
+}
+
+.unit-status.mismatch {
+  color: var(--error-text);
+}
+
+.unit-warning {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px;
+  border: 1px solid var(--warn-border);
+  border-radius: 3px;
+  background: var(--warn-bg);
+  color: var(--warn-text);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.unit-warning span {
+  flex: 1;
+}
+
+.unit-warning.blocking {
+  border-color: var(--error-border);
+  background: var(--error-bg);
+  color: var(--error-text);
+}
+
+.unit-warning button {
+  flex: none;
+  background: var(--bg-button);
+  color: var(--text-primary);
+  border: 1px solid currentColor;
+  border-radius: 3px;
+  padding: 4px 7px;
+  font-size: 10px;
+  cursor: pointer;
 }
 
 .field-group {

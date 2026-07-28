@@ -27,9 +27,11 @@ describe('startFrontendServer', () => {
 
     const rootResponse = await fetch(handle.url)
     expect(rootResponse.status).toBe(200)
-    expect(rootResponse.headers.get('content-security-policy')).toContain(
-      "connect-src 'self' ws://127.0.0.1:*"
+    const policy = rootResponse.headers.get('content-security-policy')
+    expect(policy).toContain(
+      "connect-src 'self' ws://127.0.0.1:* https://cdn.jsdelivr.net"
     )
+    expect(policy).not.toContain('connect-src https:')
     expect(await rootResponse.text()).toContain('<!doctype html>')
 
     const scriptResponse = await fetch(`${handle.origin}/app.js`)

@@ -69,7 +69,7 @@ describe('paper sizes', () => {
         scaleDenominator,
         viewportCenter: { x: 25, y: -10 }
       }
-      const layout = computeSheetLayout(sheet)
+      const layout = computeSheetLayout(sheet, undefined, drawingUnit)
       const expectedPage =
         orientation === 'portrait'
           ? portrait
@@ -113,12 +113,16 @@ describe('scale conversion', () => {
 
 describe('viewport layout', () => {
   it('centers the viewport on the drawing extents', () => {
-    const layout = computeSheetLayout(BASE_SHEET, {
-      minX: 100,
-      minY: 200,
-      maxX: 110,
-      maxY: 230
-    })
+    const layout = computeSheetLayout(
+      BASE_SHEET,
+      {
+        minX: 100,
+        minY: 200,
+        maxX: 110,
+        maxY: 230
+      },
+      'm'
+    )
 
     expect(layout.viewport.centerX).toBe(105)
     expect(layout.viewport.centerY).toBe(215)
@@ -131,12 +135,16 @@ describe('viewport layout', () => {
   })
 
   it('warns instead of rescaling when the drawing does not fit', () => {
-    const layout = computeSheetLayout(BASE_SHEET, {
-      minX: 0,
-      minY: 0,
-      maxX: 100,
-      maxY: 100
-    })
+    const layout = computeSheetLayout(
+      BASE_SHEET,
+      {
+        minX: 0,
+        minY: 0,
+        maxX: 100,
+        maxY: 100
+      },
+      'm'
+    )
 
     expect(layout.mmPerUnit).toBe(10)
     expect(layout.viewport.width).toBe(19)
@@ -144,5 +152,66 @@ describe('viewport layout', () => {
     expect(layout.warnings).toEqual([
       'Drawing extents do not fit within the printable area at scale 1:100; geometry outside the viewport will be clipped.'
     ])
+  })
+
+  it.each([
+    {
+      unit: 'm' as const,
+      extents: { minX: 2, minY: 2, maxX: 166.2, maxY: 116.8 }
+    },
+    {
+      unit: 'mm' as const,
+      extents: {
+        minX: 2000,
+        minY: 2000,
+        maxX: 166200,
+        maxY: 116800
+      }
+    }
+  ])(
+    'fits the exact A1 landscape 10 mm border in $unit at 1:200',
+    ({ unit, extents }) => {
+      const layout = computeSheetLayout(
+        {
+          ...BASE_SHEET,
+          paper: 'A1',
+          orientation: 'landscape',
+          marginsMm: { top: 10, right: 10, bottom: 10, left: 10 },
+          scaleDenominator: 200,
+          drawingUnit: unit
+        },
+        extents,
+        unit
+      )
+
+      expect(layout.viewport).toMatchObject({
+        left: extents.minX,
+        bottom: extents.minY,
+        right: extents.maxX,
+        top: extents.maxY
+      })
+      expect(layout.unitMismatch).toBe(false)
+      expect(layout.clipping).toBe(false)
+      expect(layout.warnings).toEqual([])
+    }
+  )
+
+  it('blocks a millimetre database interpreted as metres with the exact factor', () => {
+    const layout = computeSheetLayout(
+      {
+        ...BASE_SHEET,
+        paper: 'A1',
+        orientation: 'landscape',
+        scaleDenominator: 200,
+        drawingUnit: 'm'
+      },
+      { minX: 2, minY: 2, maxX: 166.2, maxY: 116.8 },
+      'mm'
+    )
+
+    expect(layout.unitMismatch).toBe(true)
+    expect(layout.conversionFactor).toBe(1000)
+    expect(layout.warnings[0]).toContain('factor of 1000')
+    expect(layout.warnings[0]).toContain('Match database unit')
   })
 })

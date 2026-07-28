@@ -6,6 +6,7 @@ import {
   type EnvCadDesktopApi
 } from './runtimeProtocol'
 import type { AiPreferences } from './aiPreferences'
+import type { SheetDefinition } from '../src/sheet/types'
 
 const api: EnvCadDesktopApi = {
   getRuntimeConfig: () =>
@@ -25,7 +26,18 @@ const api: EnvCadDesktopApi = {
     ipcRenderer.invoke(
       DESKTOP_IPC.saveAiPreferences,
       preferences
-    ) as Promise<AiPreferences>
+    ) as Promise<AiPreferences>,
+  getSheetPreference: (documentName) =>
+    ipcRenderer.invoke(
+      DESKTOP_IPC.getSheetPreference,
+      documentName
+    ) as Promise<SheetDefinition | undefined>,
+  saveSheetPreference: (documentName, sheet) =>
+    ipcRenderer.invoke(
+      DESKTOP_IPC.saveSheetPreference,
+      documentName,
+      sheet
+    ) as Promise<SheetDefinition>
 }
 
 contextBridge.exposeInMainWorld('envcadDesktop', Object.freeze(api))

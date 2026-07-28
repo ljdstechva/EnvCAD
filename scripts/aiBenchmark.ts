@@ -291,7 +291,7 @@ export function resolveBenchmarkLaunchTarget(
   const executable = candidates.find((candidate) => existsSync(candidate))
   if (!executable) {
     throw new Error(
-      'Installed EnvCAD was not found. Install v0.2.1 or pass --executable <EnvCAD.exe>.'
+      'Installed EnvCAD was not found. Install v0.2.2 or pass --executable <EnvCAD.exe>.'
     )
   }
   const requestedExecutable = path.resolve(executable)
@@ -545,6 +545,13 @@ function polylinePoints(record: DxfPair[]): Array<{ x: number; y: number }> {
   return points
 }
 
+function mtextValue(record: DxfPair[]): string {
+  return record
+    .filter((pair) => pair.code === 3 || pair.code === 1)
+    .map((pair) => pair.value)
+    .join('')
+}
+
 export function inspectDxf(text: string): DxfInspection {
   const pairs = dxfPairs(text)
   const header = sectionPairs(pairs, 'HEADER')
@@ -586,13 +593,17 @@ export function inspectDxf(text: string): DxfInspection {
       if (type === 'LWPOLYLINE') {
         entity.points = polylinePoints(record)
         entity.closed = ((numberValue(record, 70) ?? 0) & 1) === 1
+      } else if (type === 'LINE') {
+        const start = pointValue(record, 10, 20)
+        const end = pointValue(record, 11, 21)
+        entity.points = start && end ? [start, end] : undefined
       } else if (type === 'CIRCLE') {
         entity.center = pointValue(record, 10, 20)
         entity.radius = numberValue(record, 40)
       } else if (type === 'TEXT' || type === 'MTEXT') {
         entity.position = pointValue(record, 10, 20)
         entity.height = numberValue(record, 40)
-        entity.text = first(record, 1)
+        entity.text = type === 'MTEXT' ? mtextValue(record) : first(record, 1)
       } else if (type === 'INSERT') {
         entity.position = pointValue(record, 10, 20)
         entity.blockName = first(record, 2)

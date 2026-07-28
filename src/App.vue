@@ -58,7 +58,7 @@ function discardSnapshot() {
 // The CAD view owns global Ctrl/Cmd+Z, Ctrl/Cmd+Y, Delete/Backspace, and
 // Escape (see @mlightcad/cad-simple-viewer's key handler) and is already
 // focus-aware. This listener only covers the shortcuts the library doesn't:
-// Ctrl/Cmd+O, Ctrl/Cmd+S, F2.
+// Ctrl/Cmd+O, Ctrl/Cmd+S, F2, and Home.
 function onGlobalKeydown(event: KeyboardEvent) {
   if (isEditableTarget(event)) return
   const primaryModifier = event.ctrlKey || event.metaKey
@@ -70,18 +70,21 @@ function onGlobalKeydown(event: KeyboardEvent) {
     if (viewer.documentOpen) viewer.saveDxf()
   } else if (event.key === 'F2') {
     event.preventDefault()
-    openPageSetup()
+    if (viewer.documentOpen) openPageSetup()
+  } else if (event.key === 'Home' && viewer.documentOpen) {
+    event.preventDefault()
+    void viewer.fitDrawing()
   }
 }
 
 watch(theme, (mode) => {
-  viewer.setCanvasBackground(CANVAS_BACKGROUND[mode])
+  void viewer.setCanvasBackground(CANVAS_BACKGROUND[mode])
 })
 
 onMounted(() => {
   if (canvasContainer.value) {
     viewer.init(canvasContainer.value)
-    viewer.setCanvasBackground(CANVAS_BACKGROUND[theme.value])
+    void viewer.setCanvasBackground(CANVAS_BACKGROUND[theme.value])
   }
   window.addEventListener('keydown', onGlobalKeydown)
   restoreSnapshot.value = loadAutosaveSnapshot()
@@ -128,6 +131,14 @@ function toggleLayers() {
         <LayersPanel :viewer="viewer" />
       </div>
       <div ref="canvasContainer" class="canvas-host">
+        <div
+          v-if="!viewer.documentOpen"
+          class="canvas-empty-state"
+          role="status"
+        >
+          <strong>No drawing is open.</strong>
+          <span>Choose New Drawing or Open.</span>
+        </div>
         <button class="side-toggle" @click="sidePanelOpen = !sidePanelOpen">
           {{ sidePanelOpen ? '›' : '‹' }}
         </button>
@@ -231,5 +242,24 @@ function toggleLayers() {
   border-right: none;
   cursor: pointer;
   z-index: 2;
+}
+
+.canvas-empty-state {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 6px;
+  pointer-events: none;
+  color: var(--text-muted);
+  font-size: 13px;
+  text-align: center;
+}
+
+.canvas-empty-state strong {
+  color: var(--text-secondary);
+  font-size: 15px;
 }
 </style>

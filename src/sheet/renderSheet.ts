@@ -1,5 +1,6 @@
 import { AcSvgRenderer } from '@mlightcad/cad-svg-plugin'
 import { AcApSettingManager } from '@mlightcad/cad-simple-viewer'
+import { AcDbUnitsValue } from '@mlightcad/data-model'
 
 import {
   computeSheetLayout,
@@ -31,6 +32,13 @@ interface BoxLike {
 
 interface CadEntityLike {
   geometricExtents?: BoxLike
+  visibility?: boolean
+  layer?: string
+  color?: {
+    isByColor?: boolean
+    isByLayer?: boolean
+    RGB?: number
+  }
   worldDraw(renderer: AcSvgRenderer): unknown
 }
 
@@ -41,7 +49,18 @@ interface CadDatabaseLike {
         newIterator(): Iterable<CadEntityLike>
       }
     }
+    layerTable?: {
+      getAt(name: string): {
+        isOff?: boolean
+        isFrozen?: boolean
+        color?: {
+          isByColor?: boolean
+          RGB?: number
+        }
+      } | undefined
+    }
   }
+  insunits?: number
   extents?: BoxLike
   extmin?: PointLike
   extmax?: PointLike
@@ -65,13 +84,54 @@ export class CadSheetRenderer implements SheetRenderer {
     const entities = Array.from(
       cadDoc.database.tables.blockTable.modelSpace.newIterator()
     )
-    const extents = resolveDrawingExtents(cadDoc.database, entities)
-    const layout = computeSheetLayout(sheet, extents)
-    const drawingSvg = await renderModelSpace(cadDoc.database, entities)
+    const visibleEntities = entities.filter((entity) =>
+      isVisibleEntity(cadDoc.database, entity)
+    )
+    const extents = resolveDrawingExtents(cadDoc.database, visibleEntities)
+    const databaseUnit = normalizeDatabaseUnit(cadDoc.database.insunits)
+    const layout = computeSheetLayout(sheet, extents, databaseUnit)
+    const drawingSvg = await renderModelSpace(
+      cadDoc.database,
+      visibleEntities
+    )
+    const drawingBody = extractSvgBody(drawingSvg)
+    const drawableElementCount = countDrawableElements(drawingBody)
+    const trueWhiteEntityCount = visibleEntities.filter((entity) =>
+      isExplicitTrueWhite(cadDoc.database, entity)
+    ).length
+    const warnings = [...layout.warnings]
+    if (trueWhiteEntityCount > 0) {
+      warnings.push(
+        `${trueWhiteEntityCount} visible model-space ${
+          trueWhiteEntityCount === 1 ? 'entity uses' : 'entities use'
+        } explicit true white and may disappear on white paper. Use ACI 7 or a print-safe layer color; stored CAD colors were not changed.`
+      )
+    }
+    if (visibleEntities.length > 0 && drawableElementCount === 0) {
+      throw new Error(
+        `Sheet rendering produced no drawable SVG elements from ${entities.length} database entities ` +
+          `(${visibleEntities.length} visible). Extents: ${formatExtents(extents)}; ` +
+          `unit mismatch: ${layout.unitMismatch ? 'yes' : 'no'}; clipping: ${
+            layout.clipping ? 'yes' : 'no'
+          }.`
+      )
+    }
 
     return {
       svg: composePageSvg(drawingSvg, layout, sheet),
-      warnings: layout.warnings
+      warnings,
+      diagnostics: {
+        entityCount: entities.length,
+        visibleEntityCount: visibleEntities.length,
+        drawableElementCount,
+        drawingExtents: extents,
+        databaseUnit,
+        sheetDrawingUnit: sheet.drawingUnit,
+        unitMismatch: layout.unitMismatch,
+        conversionFactor: layout.conversionFactor,
+        clipping: layout.clipping,
+        trueWhiteEntityCount
+      }
     }
   }
 }
@@ -214,11 +274,6 @@ function resolveDrawingExtents(
   database: CadDatabaseLike,
   entities: CadEntityLike[]
 ): DrawingExtents | undefined {
-  const databaseExtents =
-    boxToDrawingExtents(database.extents) ??
-    pointsToDrawingExtents(database.extmin, database.extmax)
-  if (databaseExtents) return databaseExtents
-
   let combined: DrawingExtents | undefined
   for (const entity of entities) {
     const entityExtents = boxToDrawingExtents(entity.geometricExtents)
@@ -232,7 +287,55 @@ function resolveDrawingExtents(
         }
       : entityExtents
   }
-  return combined
+  return (
+    combined ??
+    boxToDrawingExtents(database.extents) ??
+    pointsToDrawingExtents(database.extmin, database.extmax)
+  )
+}
+
+function isVisibleEntity(
+  database: CadDatabaseLike,
+  entity: CadEntityLike
+): boolean {
+  if (entity.visibility === false) return false
+  if (!entity.layer) return true
+  const layer = database.tables.layerTable?.getAt(entity.layer)
+  return !layer?.isOff && !layer?.isFrozen
+}
+
+function isExplicitTrueWhite(
+  database: CadDatabaseLike,
+  entity: CadEntityLike
+): boolean {
+  if (entity.color?.isByColor && entity.color.RGB === 0xffffff) return true
+  if (!entity.color?.isByLayer || !entity.layer) return false
+  const layerColor = database.tables.layerTable?.getAt(entity.layer)?.color
+  return Boolean(layerColor?.isByColor && layerColor.RGB === 0xffffff)
+}
+
+function normalizeDatabaseUnit(
+  insunits: number | undefined
+): 'm' | 'mm' | 'unknown' {
+  if (insunits === undefined) return 'unknown'
+  const name = AcDbUnitsValue[insunits as AcDbUnitsValue]?.toLowerCase()
+  if (name === 'meters' || name === 'meter') return 'm'
+  if (name === 'millimeters' || name === 'millimeter') return 'mm'
+  return 'unknown'
+}
+
+function countDrawableElements(svgBody: string): number {
+  return (
+    svgBody.match(
+      /<(?:path|line|polyline|polygon|circle|ellipse|rect|text|image)\b/gi
+    )?.length ?? 0
+  )
+}
+
+function formatExtents(extents: DrawingExtents | undefined): string {
+  return extents
+    ? `(${extents.minX},${extents.minY})-(${extents.maxX},${extents.maxY})`
+    : 'unavailable'
 }
 
 function boxToDrawingExtents(

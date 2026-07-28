@@ -48,6 +48,25 @@ export interface SheetDefinition {
 export interface SheetRenderResult {
   svg: string
   warnings: string[]
+  diagnostics: SheetRenderDiagnostics
+}
+
+export interface SheetRenderDiagnostics {
+  entityCount: number
+  visibleEntityCount: number
+  drawableElementCount: number
+  drawingExtents?: {
+    minX: number
+    minY: number
+    maxX: number
+    maxY: number
+  }
+  databaseUnit: 'm' | 'mm' | 'unknown'
+  sheetDrawingUnit: 'm' | 'mm'
+  unitMismatch: boolean
+  conversionFactor?: number
+  clipping: boolean
+  trueWhiteEntityCount: number
 }
 
 export interface SheetRenderer {

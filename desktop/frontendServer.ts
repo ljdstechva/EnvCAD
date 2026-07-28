@@ -15,7 +15,10 @@ const CONTENT_SECURITY_POLICY = [
   "font-src 'self' data:",
   "worker-src 'self' blob:",
   "child-src 'self' blob:",
-  "connect-src 'self' ws://127.0.0.1:*",
+  // The pinned CAD viewer loads its font catalogue, font files, and ISO new-
+  // drawing template from this origin. Keep the exception origin-specific:
+  // arbitrary HTTPS endpoints remain unavailable to the renderer.
+  "connect-src 'self' ws://127.0.0.1:* https://cdn.jsdelivr.net",
   "media-src 'none'"
 ].join('; ')
 

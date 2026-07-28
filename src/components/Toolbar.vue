@@ -31,13 +31,31 @@ function onOpenClick() {
   fileInput.value?.click()
 }
 
-function onFileChosen(e: Event) {
+async function onFileChosen(e: Event) {
   const input = e.target as HTMLInputElement
   const file = input.files?.[0]
-  if (file) {
-    props.viewer.openFile(file)
+  if (
+    file &&
+    (!props.viewer.isDirty ||
+      window.confirm(
+        'Open another drawing? Unsaved changes in the current drawing will be replaced after a recovery snapshot is captured.'
+      ))
+  ) {
+    await props.viewer.openFile(file)
   }
   input.value = ''
+}
+
+async function onNewDrawing() {
+  if (
+    props.viewer.isDirty &&
+    !window.confirm(
+      'Create a new drawing? Unsaved changes in the current drawing will be replaced after a recovery snapshot is captured.'
+    )
+  ) {
+    return
+  }
+  await props.viewer.newDrawing()
 }
 
 defineExpose({ triggerOpen: onOpenClick })
@@ -80,6 +98,7 @@ async function onImportChosen(kind: 'csv' | 'geojson', event: Event) {
       style="display: none"
       @change="onFileChosen"
     />
+    <button @click="onNewDrawing">New Drawing</button>
     <button @click="onOpenClick">Open</button>
     <details ref="recentMenu" class="import-menu" @toggle="onRecentMenuToggle">
       <summary>Recent</summary>
@@ -119,11 +138,29 @@ async function onImportChosen(kind: 'csv' | 'geojson', event: Event) {
     <button @click="viewer.undo()" :disabled="!viewer.canUndo">Undo</button>
     <button @click="viewer.redo()" :disabled="!viewer.canRedo">Redo</button>
     <span class="sep"></span>
-    <button @click="viewer.zoomExtents()" :disabled="!viewer.documentOpen">Zoom Extents</button>
+    <button
+      @click="viewer.fitDrawing()"
+      :disabled="!viewer.documentOpen || !viewer.viewReady || !viewer.hasRenderableGeometry"
+      :title="
+        !viewer.documentOpen
+          ? 'Open or create a drawing first'
+          : !viewer.hasRenderableGeometry
+            ? 'Fit Drawing is unavailable because the drawing has no visible geometry'
+            : 'Fit all drawing entities in the model viewport'
+      "
+    >
+      Fit Drawing
+    </button>
     <span class="sep"></span>
-    <button :class="{ active: layersOpen }" @click="emit('toggle-layers')">Layers</button>
+    <button
+      :class="{ active: layersOpen }"
+      :disabled="!viewer.documentOpen"
+      @click="emit('toggle-layers')"
+    >
+      Layers
+    </button>
     <span class="sep"></span>
-    <button @click="openPageSetup">Page Setup</button>
+    <button :disabled="!viewer.documentOpen" @click="openPageSetup">Page Setup</button>
     <span class="grow"></span>
     <button
       class="theme-toggle"

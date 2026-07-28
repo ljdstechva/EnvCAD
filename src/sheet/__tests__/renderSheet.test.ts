@@ -68,6 +68,7 @@ describe('renderSheet', () => {
             }
           }
         },
+        insunits: 6,
         extents: {
           min: { x: 0, y: 0 },
           max: { x: 10, y: 10 }
@@ -129,6 +130,7 @@ describe('renderSheet', () => {
             }
           }
         },
+        insunits: 6,
         extents: {
           min: { x: 0, y: 0 },
           max: { x: 1, y: 1 }
@@ -143,5 +145,60 @@ describe('renderSheet', () => {
       'image/second'
     ])
     expect(svgRendererMock.exportAsync).toHaveBeenCalledTimes(3)
+  })
+
+  it('frames the visible entities instead of stale database or hidden geometry extents', async () => {
+    const visibleWorldDraw = vi.fn()
+    const hiddenWorldDraw = vi.fn()
+    const doc = {
+      database: {
+        tables: {
+          blockTable: {
+            modelSpace: {
+              newIterator: () => [
+                {
+                  visibility: true,
+                  layer: 'VISIBLE',
+                  geometricExtents: {
+                    min: { x: 0, y: 0 },
+                    max: { x: 10, y: 10 }
+                  },
+                  worldDraw: visibleWorldDraw
+                },
+                {
+                  visibility: false,
+                  layer: 'HIDDEN',
+                  geometricExtents: {
+                    min: { x: 1_000_000, y: 1_000_000 },
+                    max: { x: 2_000_000, y: 2_000_000 }
+                  },
+                  worldDraw: hiddenWorldDraw
+                }
+              ]
+            }
+          },
+          layerTable: {
+            getAt: () => undefined
+          }
+        },
+        insunits: 6,
+        extents: {
+          min: { x: -5_000_000, y: -5_000_000 },
+          max: { x: 5_000_000, y: 5_000_000 }
+        }
+      }
+    }
+
+    const result = await renderSheet(doc, SHEET)
+
+    expect(visibleWorldDraw).toHaveBeenCalledOnce()
+    expect(hiddenWorldDraw).not.toHaveBeenCalled()
+    expect(result.diagnostics.drawingExtents).toEqual({
+      minX: 0,
+      minY: 0,
+      maxX: 10,
+      maxY: 10
+    })
+    expect(result.svg).toContain('viewBox="-8.85 -14.5 27.7 19"')
   })
 })

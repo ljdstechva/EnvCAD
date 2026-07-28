@@ -4,6 +4,11 @@ import { agentBridge } from './bridge'
 import { captureSelectionSnapshot, captureSheetSnapshot } from './context'
 import { executeCadTool } from './handlers'
 import type { CadToolName, ToolResult } from './protocol'
+import {
+  activeCadLayoutHasEntity,
+  getCadSessionSnapshot,
+  requireEditableCadSession
+} from '../cad/session'
 
 export interface AgentTestResult {
   assistantText: string
@@ -32,8 +37,12 @@ export interface CadTestApi {
   fileName(): string
   isDirty(): boolean
   sheet(): unknown
+  session(): unknown
+  viewState(): unknown
+  textMaterialState(): unknown
   canUndo(): boolean
   canRedo(): boolean
+  newDrawing(): Promise<boolean>
   openTextFile(name: string, text: string): Promise<boolean>
   /** Painted canvas background as a 24-bit RGB number, for theme checks. */
   canvasBackground(): number
@@ -49,7 +58,12 @@ declare global {
 
 function installCadTestApi() {
   const listEntities = (): CadTestEntity[] => {
-    const db = AcApDocManager.instance.curDocument.database
+    let db
+    try {
+      db = requireEditableCadSession().database
+    } catch {
+      return []
+    }
     return Array.from(db.tables.blockTable.modelSpace.newIterator()).map((entity) => {
       const extents = entity.geometricExtents
       return {
@@ -71,13 +85,23 @@ function installCadTestApi() {
   window.__cadTest = {
     entities: listEntities,
     renderedEntityIds() {
-      const view = AcApDocManager.instance.curView
+      let view
+      try {
+        view = requireEditableCadSession().view
+      } catch {
+        return []
+      }
       return listEntities()
-        .filter((entity) => view.hasEntity(entity.id))
+        .filter((entity) => activeCadLayoutHasEntity(view, entity.id))
         .map((entity) => entity.id)
     },
     select(ids) {
-      const selectionSet = AcApDocManager.instance.curView.selectionSet
+      let selectionSet
+      try {
+        selectionSet = requireEditableCadSession().view.selectionSet
+      } catch {
+        return 0
+      }
       selectionSet.clear()
       selectionSet.add(ids)
       return selectionSet.count
@@ -90,10 +114,18 @@ function installCadTestApi() {
       return ids
     },
     clearSelection() {
-      AcApDocManager.instance.curView.selectionSet.clear()
+      try {
+        requireEditableCadSession().view.selectionSet.clear()
+      } catch {
+        // Clearing an absent selection is already satisfied.
+      }
     },
     selection() {
-      return [...AcApDocManager.instance.curView.selectionSet.ids]
+      try {
+        return [...requireEditableCadSession().view.selectionSet.ids]
+      } catch {
+        return []
+      }
     },
     fileName() {
       throw new Error('CAD viewer state is not ready')
@@ -104,11 +136,194 @@ function installCadTestApi() {
     sheet() {
       return JSON.parse(JSON.stringify(sheetStore.current))
     },
+    session() {
+      return getCadSessionSnapshot()
+    },
+    viewState() {
+      const { database, view } = requireEditableCadSession()
+      const entities = Array.from(
+        database.tables.blockTable.modelSpace.newIterator()
+      ).filter((entity) => !entity.geometricExtents.isEmpty())
+      const extents = entities.reduce(
+        (combined, entity) => ({
+          minX: Math.min(combined.minX, entity.geometricExtents.min.x),
+          minY: Math.min(combined.minY, entity.geometricExtents.min.y),
+          maxX: Math.max(combined.maxX, entity.geometricExtents.max.x),
+          maxY: Math.max(combined.maxY, entity.geometricExtents.max.y)
+        }),
+        {
+          minX: Number.POSITIVE_INFINITY,
+          minY: Number.POSITIVE_INFINITY,
+          maxX: Number.NEGATIVE_INFINITY,
+          maxY: Number.NEGATIVE_INFINITY
+        }
+      )
+      const camera = view.internalCamera
+      const sceneBox = view.cadScene.box
+      const corners = Number.isFinite(extents.minX)
+        ? [
+            { x: extents.minX, y: extents.minY },
+            { x: extents.minX, y: extents.maxY },
+            { x: extents.maxX, y: extents.minY },
+            { x: extents.maxX, y: extents.maxY }
+          ].map((point) => view.worldToScreen(point))
+        : []
+      return {
+        width: view.width,
+        height: view.height,
+        extents,
+        sceneExtents:
+          sceneBox && !sceneBox.isEmpty()
+            ? {
+                minX: sceneBox.min.x,
+                minY: sceneBox.min.y,
+                maxX: sceneBox.max.x,
+                maxY: sceneBox.max.y
+              }
+            : null,
+        sceneStats: {
+          layoutCount: view.stats.summary.layoutCount,
+          entityCount: view.stats.summary.entityCount,
+          sceneLayoutIds: Array.from(view.cadScene.layouts.keys()),
+          layouts: view.stats.layouts.map((layout, index) => ({
+            id: Array.from(view.cadScene.layouts.keys())[index],
+            entityCount: layout.summary.entityCount,
+            nonEmptyLayers: layout.layers
+              .filter((layer) => layer.summary.entityCount > 0)
+              .map((layer) => ({
+                name: layer.name,
+                entityCount: layer.summary.entityCount
+              }))
+          }))
+        },
+        databaseLayouts: Array.from(database.objects.layout.newIterator()).map(
+          (layout) => ({
+            id: layout.objectId,
+            name: layout.layoutName,
+            blockTableRecordId: layout.blockTableRecordId
+          })
+        ),
+        spaces: {
+          modelSpaceId: database.tables.blockTable.modelSpace.objectId,
+          currentSpaceId: database.currentSpaceId,
+          entityOwnerCounts: Array.from(
+            entities.reduce((counts, entity) => {
+              counts.set(entity.ownerId, (counts.get(entity.ownerId) ?? 0) + 1)
+              return counts
+            }, new Map<string, number>())
+          )
+        },
+        layers: Array.from(database.tables.layerTable.newIterator()).map(
+          (layer) => ({
+            name: layer.name,
+            color: layer.color.toString(),
+            cssColor: layer.color.cssColor
+          })
+        ),
+        corners,
+        camera: {
+          x: camera?.position.x,
+          y: camera?.position.y,
+          zoom: camera?.zoom,
+          left: camera?.left,
+          right: camera?.right,
+          top: camera?.top,
+          bottom: camera?.bottom
+        }
+      }
+    },
+    textMaterialState() {
+      const { view } = requireEditableCadSession()
+      const materials: Array<{
+        objectType: string
+        objectLayer?: string
+        objectId?: string
+        materialType: string
+        color?: number
+        uniformColor?: number
+        layer?: string
+        isForeground?: boolean
+        isByLayerColor?: boolean
+        materialKey?: string
+      }> = []
+
+      view.internalScene.traverse((object: {
+        type: string
+        userData: Record<string, unknown>
+      }) => {
+        const drawable = object as typeof object & {
+          material?: {
+            type?: string
+            color?: { getHex(): number }
+            uniforms?: { u_color?: { value?: { getHex?(): number } } }
+            userData?: Record<string, unknown>
+          } | Array<{
+            type?: string
+            color?: { getHex(): number }
+            uniforms?: { u_color?: { value?: { getHex?(): number } } }
+            userData?: Record<string, unknown>
+          }>
+        }
+        if (!drawable.material) return
+
+        const objectData = object.userData as Record<string, unknown>
+        for (const material of Array.isArray(drawable.material)
+          ? drawable.material
+          : [drawable.material]) {
+          const metadata = material.userData ?? {}
+          const uniformValue = material.uniforms?.u_color?.value
+          materials.push({
+            objectType: object.type,
+            objectLayer:
+              typeof objectData.layerName === 'string'
+                ? objectData.layerName
+                : undefined,
+            objectId:
+              typeof objectData.objectId === 'string'
+                ? objectData.objectId
+                : undefined,
+            materialType: material.type ?? 'unknown',
+            color: material.color?.getHex(),
+            uniformColor:
+              typeof uniformValue?.getHex === 'function'
+                ? uniformValue.getHex()
+                : undefined,
+            layer:
+              typeof metadata.layer === 'string' ? metadata.layer : undefined,
+            isForeground:
+              typeof metadata.isForeground === 'boolean'
+                ? metadata.isForeground
+                : undefined,
+            isByLayerColor:
+              typeof metadata.isByLayerColor === 'boolean'
+                ? metadata.isByLayerColor
+                : undefined,
+            materialKey:
+              typeof metadata.materialKey === 'string'
+                ? metadata.materialKey
+                : undefined
+          })
+        }
+      })
+
+      return materials
+    },
     canUndo() {
-      return AcApDocManager.instance.curDocument.database.transactionManager.canUndo()
+      try {
+        return requireEditableCadSession().database.transactionManager.canUndo()
+      } catch {
+        return false
+      }
     },
     canRedo() {
-      return AcApDocManager.instance.curDocument.database.transactionManager.canRedo()
+      try {
+        return requireEditableCadSession().database.transactionManager.canRedo()
+      } catch {
+        return false
+      }
+    },
+    newDrawing() {
+      return Promise.reject(new Error('CAD viewer state is not ready'))
     },
     openTextFile() {
       return Promise.reject(new Error('CAD viewer state is not ready'))

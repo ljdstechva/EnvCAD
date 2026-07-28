@@ -22,6 +22,7 @@ import {
 } from './runtimeProtocol'
 import { SidecarProcess, type UtilityProcessLike } from './sidecarProcess'
 import { AiPreferencesStore } from './aiPreferences'
+import { SheetPreferencesStore } from './sheetPreferences'
 import { handleSquirrelStartup } from './squirrelStartup'
 import { focusExistingWindow } from './windowLifecycle'
 
@@ -35,6 +36,7 @@ let mainWindow: BrowserWindow | null = null
 let frontendServer: FrontendServerHandle | undefined
 let sidecarProcess: SidecarProcess | undefined
 let aiPreferencesStore: AiPreferencesStore | undefined
+let sheetPreferencesStore: SheetPreferencesStore | undefined
 let aiRuntimeDirectory = ''
 let rendererOrigin = ''
 let shuttingDown = false
@@ -113,6 +115,26 @@ function installIpcHandlers(): void {
     if (!aiPreferencesStore) throw new Error('AI preferences are not initialized')
     return aiPreferencesStore.save(preferences)
   })
+  ipcMain.handle(
+    DESKTOP_IPC.getSheetPreference,
+    async (event, documentName: unknown) => {
+      if (!trustedSender(event)) throw new Error('Untrusted renderer IPC request')
+      if (!sheetPreferencesStore) {
+        throw new Error('Sheet preferences are not initialized')
+      }
+      return sheetPreferencesStore.load(documentName)
+    }
+  )
+  ipcMain.handle(
+    DESKTOP_IPC.saveSheetPreference,
+    async (event, documentName: unknown, sheet: unknown) => {
+      if (!trustedSender(event)) throw new Error('Untrusted renderer IPC request')
+      if (!sheetPreferencesStore) {
+        throw new Error('Sheet preferences are not initialized')
+      }
+      return sheetPreferencesStore.save(documentName, sheet)
+    }
+  )
 }
 
 function isTrustedApplicationUrl(target: string): boolean {
@@ -273,6 +295,10 @@ async function startDesktop(): Promise<void> {
   configureSessionSecurity()
   aiPreferencesStore = new AiPreferencesStore(
     path.join(app.getPath('userData'), 'ai-preferences.json'),
+    desktopLogger
+  )
+  sheetPreferencesStore = new SheetPreferencesStore(
+    path.join(app.getPath('userData'), 'sheet-preferences.json'),
     desktopLogger
   )
   const localAppData = process.env.LOCALAPPDATA

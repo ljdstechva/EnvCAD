@@ -14,11 +14,18 @@ function countGroupPairs(content: string, code8Value: string) {
 describe('sample-site.dxf fixture', () => {
   const content = readFileSync(fixturePath, 'utf-8')
 
-  it('is well-formed DXF with a HEADER, LAYER table, and ENTITIES section', () => {
+  it('is well-formed DXF with a Model layout and owned entities', () => {
     expect(content).toMatch(/0\nSECTION\n2\nHEADER/)
     expect(content).toMatch(/0\nTABLE\n2\nLAYER/)
+    expect(content).toMatch(/0\nTABLE\n2\nBLOCK_RECORD/)
+    expect(content).toMatch(/0\nSECTION\n2\nBLOCKS/)
+    expect(content).toMatch(/0\nBLOCK_RECORD\n5\n10[\s\S]*2\n\*Model_Space/)
     expect(content).toMatch(/0\nSECTION\n2\nENTITIES/)
     expect(content.trim().endsWith('0\nEOF')).toBe(true)
+    const entities = content.match(
+      /0\nSECTION\n2\nENTITIES\n([\s\S]*?)0\nENDSEC/
+    )?.[1]
+    expect((entities?.match(/\n330\n10\n/g) ?? []).length).toBe(7)
   })
 
   it('declares the four expected layers', () => {

@@ -5,10 +5,13 @@ export const DESKTOP_IPC = {
   sidecarStatus: 'envcad:sidecar-status',
   openLogFolder: 'envcad:open-log-folder',
   getAiPreferences: 'envcad:get-ai-preferences',
-  saveAiPreferences: 'envcad:save-ai-preferences'
+  saveAiPreferences: 'envcad:save-ai-preferences',
+  getSheetPreference: 'envcad:get-sheet-preference',
+  saveSheetPreference: 'envcad:save-sheet-preference'
 } as const
 
 import type { AiPreferences } from './aiPreferences'
+import type { SheetDefinition } from '../src/sheet/types'
 
 export type SidecarStatusType =
   | 'starting'
@@ -67,6 +70,11 @@ export interface EnvCadDesktopApi {
   openLogFolder(): Promise<{ ok: boolean; error?: string }>
   getAiPreferences(): Promise<AiPreferences>
   saveAiPreferences(preferences: AiPreferences): Promise<AiPreferences>
+  getSheetPreference(documentName: string): Promise<SheetDefinition | undefined>
+  saveSheetPreference(
+    documentName: string,
+    sheet: SheetDefinition
+  ): Promise<SheetDefinition>
 }
 
 export function sessionTokenProtocol(token: string): string {

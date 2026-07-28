@@ -31,6 +31,7 @@ import {
   type AcDbDatabase
 } from '@mlightcad/data-model'
 import { sheetStore } from '../sheet/sheetStore'
+import { sheetUnitMismatch } from '../sheet/sheetStore'
 import { listTemplates } from '../sheet/templates/registry'
 import { PAPER_SIZES, type PaperSizeId, type SheetDefinition } from '../sheet/types'
 import { agentBridge, type ToolHandler } from './bridge'
@@ -68,6 +69,17 @@ import {
   symbolNameFromBlock,
   type SymbolName
 } from '../symbols/library'
+import {
+  awaitCadSessionRegeneration,
+  cadSessionState,
+  getCadSessionSnapshot,
+  markCadSessionDatabaseEdited,
+  requireEditableCadSession
+} from '../cad/session'
+import {
+  fitDrawingToScreen,
+  verifyCurrentCadExtentsFit
+} from '../cad/fitDrawing'
 
 type InputRecord = Record<string, unknown>
 
@@ -138,7 +150,7 @@ function entityIds(value: unknown): string[] {
 }
 
 function currentDatabase(): AcDbDatabase {
-  return testDatabaseOverride ?? AcApDocManager.instance.curDocument.database
+  return testDatabaseOverride ?? requireEditableCadSession().database
 }
 
 /**
@@ -161,6 +173,7 @@ function runEdit<T>(label: string, callback: () => T): T {
   acapRunDatabaseEdit(db, label, () => {
     result = callback()
   })
+  if (!testDatabaseOverride) markCadSessionDatabaseEdited()
   return result
 }
 
@@ -442,6 +455,33 @@ function getSelectedEntities(rawInput: unknown): ToolResult {
 
 /** Reads units, layers, current layer, and extents from the live database. */
 function getDrawingContext(): ToolResult {
+  if (!testDatabaseOverride && cadSessionState.status !== 'active') {
+    const snapshot = getCadSessionSnapshot()
+    return {
+      data: {
+        entityIds: [],
+        documentOpen: false,
+        documentName: snapshot.documentName,
+        editable: false,
+        viewReady: false,
+        activeLayout: snapshot.activeLayout,
+        entityCount: 0,
+        visibleEntityCount: 0,
+        databaseUnit: 'unknown',
+        units: 'Unknown',
+        currentLayer: null,
+        layers: [],
+        drawingExtents: null,
+        extents: null,
+        sheetDrawingUnit: sheetStore.current.drawingUnit,
+        sheetScaleDenominator: sheetStore.current.scaleDenominator,
+        unitMismatch: false,
+        lifecycleStatus: snapshot.status,
+        error: snapshot.error
+      }
+    }
+  }
+
   const db = currentDatabase()
   const layers: { name: string; colorCss: string; isOff: boolean }[] = []
   for (const layer of db.tables.layerTable.newIterator()) {
@@ -476,12 +516,44 @@ function getDrawingContext(): ToolResult {
             min: { x: storedExtents.min.x, y: storedExtents.min.y, z: storedExtents.min.z },
             max: { x: storedExtents.max.x, y: storedExtents.max.y, z: storedExtents.max.z }
           }
+  const snapshot = testDatabaseOverride
+    ? undefined
+    : getCadSessionSnapshot()
+  const mismatch = sheetUnitMismatch(
+    snapshot?.databaseUnit ?? 'unknown',
+    sheetStore.current.drawingUnit
+  )
+  const normalizedExtents = extents
+    ? {
+        minX: extents.min.x,
+        minY: extents.min.y,
+        maxX: extents.max.x,
+        maxY: extents.max.y
+      }
+    : null
   return {
     data: {
+      entityIds: [],
+      documentOpen: snapshot ? snapshot.status === 'active' : true,
+      documentName: snapshot?.documentName,
+      editable: snapshot?.editable ?? true,
+      viewReady: snapshot?.viewReady ?? false,
+      activeLayout: snapshot?.activeLayout,
+      entityCount:
+        snapshot?.entityCount ??
+        Array.from(db.tables.blockTable.modelSpace.newIterator()).length,
+      visibleEntityCount: snapshot?.visibleEntityCount,
+      databaseUnit: snapshot?.databaseUnit ?? drawingUnits(db),
       units: drawingUnits(db),
       currentLayer: db.clayer,
       layers,
-      extents
+      drawingExtents: normalizedExtents,
+      extents,
+      sheetDrawingUnit: sheetStore.current.drawingUnit,
+      sheetScaleDenominator: sheetStore.current.scaleDenominator,
+      unitMismatch: mismatch.mismatch,
+      unitMismatchFactor: mismatch.factor,
+      lifecycleStatus: snapshot?.status ?? 'active'
     }
   }
 }
@@ -493,8 +565,11 @@ function moveEntities(rawInput: unknown): ToolResult {
   const dy = finiteNumber(input.dy, 'dy')
   const db = currentDatabase()
   const entities = resolveEntities(ids, db)
+  const documentManager = testDatabaseOverride
+    ? AcApDocManager.instance
+    : requireEditableCadSession().manager
   runEdit('Agent: move_entities', () => {
-    const count = AcApDocManager.instance.curDocument.entityService.translateEntities(entities, {
+    const count = documentManager.curDocument.entityService.translateEntities(entities, {
       x: dx,
       y: dy,
       z: 0
@@ -510,8 +585,11 @@ function copyEntities(rawInput: unknown): ToolResult {
   const dx = finiteNumber(input.dx, 'dx')
   const dy = finiteNumber(input.dy, 'dy')
   const entities = resolveEntities(ids)
+  const documentManager = testDatabaseOverride
+    ? AcApDocManager.instance
+    : requireEditableCadSession().manager
   const copies = runEdit('Agent: copy_entities', () =>
-    AcApDocManager.instance.curDocument.entityService.cloneAndTransform(
+    documentManager.curDocument.entityService.cloneAndTransform(
       entities,
       new AcGeMatrix3d().makeTranslation(dx, dy, 0)
     )
@@ -526,9 +604,12 @@ function rotateEntities(rawInput: unknown): ToolResult {
   const ids = entityIds(input.entityIds)
   const angleDeg = finiteNumber(input.angleDeg, 'angleDeg')
   const entities = resolveEntities(ids)
+  const documentManager = testDatabaseOverride
+    ? AcApDocManager.instance
+    : requireEditableCadSession().manager
   const center = input.center === undefined ? commonCenter(entities) : point2D(input.center, 'center')
   runEdit('Agent: rotate_entities', () => {
-    const count = AcApDocManager.instance.curDocument.entityService.rotateEntities(
+    const count = documentManager.curDocument.entityService.rotateEntities(
       entities,
       { ...center, z: 0 },
       (angleDeg * Math.PI) / 180
@@ -543,13 +624,16 @@ function scaleEntities(rawInput: unknown): ToolResult {
   const ids = entityIds(input.entityIds)
   const factor = positiveNumber(input.factor, 'factor')
   const entities = resolveEntities(ids)
+  const documentManager = testDatabaseOverride
+    ? AcApDocManager.instance
+    : requireEditableCadSession().manager
   const center = input.center === undefined ? commonCenter(entities) : point2D(input.center, 'center')
   const matrix = new AcGeMatrix3d()
     .makeTranslation(center.x, center.y, 0)
     .multiply(new AcGeMatrix3d().makeScale(factor, factor, factor))
     .multiply(new AcGeMatrix3d().makeTranslation(-center.x, -center.y, 0))
   runEdit('Agent: scale_entities', () => {
-    const count = AcApDocManager.instance.curDocument.entityService.transformEntities(entities, matrix)
+    const count = documentManager.curDocument.entityService.transformEntities(entities, matrix)
     if (count !== entities.length) throw new Error('Not every entity could be opened for scaling')
   })
   return { data: { entityIds: ids, factor, center } }
@@ -559,8 +643,11 @@ function deleteEntities(rawInput: unknown): ToolResult {
   const input = asRecord(rawInput, 'delete_entities')
   const ids = entityIds(input.entityIds)
   resolveEntities(ids)
+  const documentManager = testDatabaseOverride
+    ? AcApDocManager.instance
+    : requireEditableCadSession().manager
   runEdit('Agent: delete_entities', () => {
-    const count = AcApDocManager.instance.curDocument.entityService.eraseEntities(ids)
+    const count = documentManager.curDocument.entityService.eraseEntities(ids)
     if (count !== ids.length) throw new Error('Not every entity could be deleted')
   })
   return { data: { entityIds: ids } }
@@ -1066,21 +1153,48 @@ function createLayer(rawInput: unknown): ToolResult {
 function setCurrentLayer(rawInput: unknown): ToolResult {
   const input = asRecord(rawInput, 'set_current_layer')
   const name = nonEmptyString(input.name, 'name')
-  const changed = AcApDocManager.instance.curDocument.layerService.setCurrentLayer(name)
+  const { manager } = requireEditableCadSession()
+  const changed = manager.curDocument.layerService.setCurrentLayer(name)
   if (!changed) throw new Error(`Layer not found: ${name}`)
   return { data: { entityIds: [], name } }
 }
 
-function zoomExtents(): ToolResult {
-  AcApDocManager.instance.curView.zoomToFitDrawing()
-  return { data: { zoomed: true } }
+async function zoomExtents(): Promise<ToolResult> {
+  const result = await fitDrawingToScreen()
+  return {
+    data: {
+      entityIds: [],
+      zoomed: result.completeExtentsFit,
+      fittedExtents: result.extents,
+      entityCount: result.entityCount,
+      activeLayout: result.activeLayout,
+      viewport: {
+        width: result.viewportWidth,
+        height: result.viewportHeight
+      },
+      regenerationCompleted: result.regenerationCompleted,
+      completeExtentsFit: result.completeExtentsFit
+    }
+  }
 }
 
 /** Current sheet, plus every paper size, template, and field key the agent may name. */
 function getSheetSetup(): ToolResult {
+  const mismatch = sheetUnitMismatch(
+    cadSessionState.databaseUnit,
+    sheetStore.current.drawingUnit
+  )
   return {
     data: {
       entityIds: [],
+      documentOpen:
+        cadSessionState.status === 'active' && cadSessionState.editable,
+      documentName: cadSessionState.documentName,
+      databaseUnit: cadSessionState.databaseUnit,
+      databaseUnitName: cadSessionState.databaseUnitName,
+      unitMismatch: mismatch.mismatch,
+      unitMismatchFactor: mismatch.factor,
+      unitWarning: mismatch.message,
       current: { ...sheetStore.current },
       paperSizes: Object.entries(PAPER_SIZES).map(([id, size]) => ({
         id,
@@ -1120,6 +1234,7 @@ function unknownFieldKeys(fields: Record<string, string>, templateId: string | u
 }
 
 function setSheetDefinition(rawInput: unknown): ToolResult {
+  requireEditableCadSession()
   const input = asRecord(rawInput, 'set_sheet_definition')
   const update: Partial<SheetDefinition> = {}
   if (input.paper !== undefined) {
@@ -1140,6 +1255,12 @@ function setSheetDefinition(rawInput: unknown): ToolResult {
   if (input.scaleDenominator !== undefined) {
     update.scaleDenominator = positiveNumber(input.scaleDenominator, 'scaleDenominator')
   }
+  if (input.drawingUnit !== undefined) {
+    if (input.drawingUnit !== 'm' && input.drawingUnit !== 'mm') {
+      throw new Error('drawingUnit must be m or mm')
+    }
+    update.drawingUnit = input.drawingUnit
+  }
   if (input.templateId !== undefined) {
     update.templateId = resolveTemplateId(input.templateId)
   }
@@ -1157,10 +1278,25 @@ function setSheetDefinition(rawInput: unknown): ToolResult {
     update.fields = { ...(sheetStore.current.fields ?? {}), ...(fields as Record<string, string>) }
   }
   sheetStore.current = { ...sheetStore.current, ...update }
-  return { data: { entityIds: [], sheet: { ...sheetStore.current }, ignoredFieldKeys } }
+  const mismatch = sheetUnitMismatch(
+    cadSessionState.databaseUnit,
+    sheetStore.current.drawingUnit
+  )
+  return {
+    data: {
+      entityIds: [],
+      sheet: { ...sheetStore.current },
+      databaseUnit: cadSessionState.databaseUnit,
+      unitMismatch: mismatch.mismatch,
+      unitMismatchFactor: mismatch.factor,
+      geometryScaled: false,
+      ignoredFieldKeys
+    }
+  }
 }
 
 function setTitleBlockFields(rawInput: unknown): ToolResult {
+  requireEditableCadSession()
   const input = asRecord(rawInput, 'set_title_block_fields')
   const fields = asRecord(input.fields, 'fields')
   if (!Object.values(fields).every((value) => typeof value === 'string')) {
@@ -1175,6 +1311,55 @@ function setTitleBlockFields(rawInput: unknown): ToolResult {
     fields: { ...(sheetStore.current.fields ?? {}), ...(fields as Record<string, string>) }
   }
   return { data: { entityIds: [], fields: { ...sheetStore.current.fields }, ignoredFieldKeys } }
+}
+
+async function getViewStatus(): Promise<ToolResult> {
+  await awaitCadSessionRegeneration()
+  const snapshot = getCadSessionSnapshot()
+  const currentFit = verifyCurrentCadExtentsFit()
+  const mismatch = sheetUnitMismatch(
+    snapshot.databaseUnit,
+    sheetStore.current.drawingUnit
+  )
+  return {
+    data: {
+      entityIds: [],
+      lifecycleStatus: snapshot.status,
+      documentOpen: snapshot.status === 'active',
+      documentName: snapshot.documentName,
+      editable: snapshot.editable,
+      viewReady: snapshot.viewReady,
+      activeLayout: snapshot.activeLayout,
+      canvas: getCanvasDimensions(),
+      entityCount: snapshot.entityCount,
+      visibleEntityCount: snapshot.visibleEntityCount,
+      renderableGeometryCount: snapshot.renderableGeometryCount,
+      renderedEntityCount: snapshot.renderedEntityCount,
+      drawingExtents: snapshot.drawingExtents,
+      databaseUnit: snapshot.databaseUnit,
+      lastRegeneration: snapshot.lastRegeneration,
+      lastFitDrawing: snapshot.lastFit,
+      currentFitVerification: currentFit,
+      completeExtentsFit: currentFit.complete,
+      sheetPreview: snapshot.sheetPreview,
+      sheetWarnings: snapshot.sheetPreview.warnings,
+      sheetDrawingUnit: sheetStore.current.drawingUnit,
+      unitMismatch: mismatch.mismatch,
+      unitMismatchFactor: mismatch.factor
+    }
+  }
+}
+
+function getCanvasDimensions(): { width: number; height: number } {
+  if (
+    cadSessionState.status !== 'active' ||
+    !cadSessionState.editable ||
+    !cadSessionState.viewReady
+  ) {
+    return { width: 0, height: 0 }
+  }
+  const { view } = requireEditableCadSession()
+  return { width: view.width, height: view.height }
 }
 
 interface ExtractedGeometry {
@@ -1650,6 +1835,7 @@ function insertSymbol(rawInput: unknown): ToolResult {
 const REAL_HANDLERS: Record<(typeof CAD_TOOL_NAMES)[number], ToolHandler> = {
   get_selected_entities: (input) => getSelectedEntities(input),
   get_drawing_context: () => getDrawingContext(),
+  get_view_status: () => getViewStatus(),
   move_entities: (input) => moveEntities(input),
   copy_entities: (input) => copyEntities(input),
   rotate_entities: (input) => rotateEntities(input),

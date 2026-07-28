@@ -77,4 +77,20 @@ describe('canonical CAD tool catalog', () => {
       { ids: ['entity-1', 'entity-2'] }
     )
   })
+
+  it('exposes view evidence and an explicit sheet drawing-unit selector', () => {
+    expect(CAD_TOOL_NAMES).toContain('get_view_status')
+    const sheetSpec = CAD_TOOL_SPECS.find(
+      (spec) => spec.name === 'set_sheet_definition'
+    )
+    expect(sheetSpec?.jsonSchema).toMatchObject({
+      type: 'object',
+      properties: {
+        drawingUnit: {
+          type: 'string',
+          enum: ['m', 'mm']
+        }
+      }
+    })
+  })
 })

@@ -8,11 +8,14 @@ defineProps<{
 
 <template>
   <div class="status-bar">
-    <span>Units: {{ viewer.drawingUnit }}</span>
-    <span class="sep"></span>
-    <span>Layer: {{ viewer.currentLayer }}</span>
-    <span class="sep"></span>
-    <span>{{ viewer.selectionCount }} selected</span>
+    <template v-if="viewer.documentOpen">
+      <span>Units: {{ viewer.drawingUnit }}</span>
+      <span class="sep"></span>
+      <span>Layer: {{ viewer.currentLayer }}</span>
+      <span class="sep"></span>
+      <span>{{ viewer.selectionCount }} selected</span>
+    </template>
+    <span v-else>No document</span>
   </div>
 </template>
 

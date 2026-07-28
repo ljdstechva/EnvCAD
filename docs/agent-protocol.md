@@ -1,6 +1,6 @@
 # EnvCAD AI Assistant protocol
 
-This document describes the v0.2.1 renderer-to-sidecar contract. The protocol is
+This document describes the v0.2.2 renderer-to-sidecar contract. The protocol is
 provider-neutral: Claude Code and OpenAI Codex share configuration, lifecycle,
 streaming, metrics, and CAD tool messages.
 

@@ -12,10 +12,16 @@ the renderer.
 
 ## Windows installation
 
-EnvCAD v0.2.1 targets Windows 11 x64. Install the generated Squirrel
-`EnvCAD-0.2.1 Setup.exe`, then launch **EnvCAD** from the Desktop shortcut or
+EnvCAD v0.2.2 targets Windows 11 x64. Install the generated Squirrel
+`EnvCAD-0.2.2 Setup.exe`, then launch **EnvCAD** from the Desktop shortcut or
 Start menu. The installer is currently unsigned, so Windows may show a
 SmartScreen warning.
+
+Version 0.2.2 makes the document lifecycle explicit: the canvas starts without
+a drawing, **New Drawing** creates a clean editable Model space, and **Fit
+Drawing** regenerates then frames every visible entity. Sheet setup is stored
+per drawing with explicit drawing units, and export reports unit mismatch or
+clipping instead of producing a misleading page.
 
 The AI Assistant requires whichever local provider you intend to use:
 
@@ -38,7 +44,8 @@ new conversation; there is no provider-to-provider fallback.
 ## Core CAD features
 
 - Open ASCII DXF and supported DWG files.
-- Render, pan, zoom, select, inspect layers, and use Zoom Extents.
+- Start a clean document with **New Drawing**, then render, pan, zoom, select,
+  inspect layers, and use deterministic **Fit Drawing**.
 - Draw and transform lines, polylines, rectangles, circles, arcs, text, hatches,
   dimensions, leaders, and environmental symbols.
 - Measure area, length, overlap, containment, and clearance using drawing

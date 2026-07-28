@@ -1,5 +1,5 @@
-import { AcApDocManager } from '@mlightcad/cad-simple-viewer'
 import { AcDbUnitsValue } from '@mlightcad/data-model'
+import { requireEditableCadSession } from '../cad/session'
 import { sheetStore } from '../sheet/sheetStore'
 import type { SelectionSnapshot, SheetSnapshot } from './protocol'
 
@@ -10,7 +10,7 @@ import type { SelectionSnapshot, SheetSnapshot } from './protocol'
  */
 export function captureSelectionSnapshot(): SelectionSnapshot {
   try {
-    const manager = AcApDocManager.instance
+    const manager = requireEditableCadSession().manager
     const ids = [...manager.curView.selectionSet.ids]
     const units = AcDbUnitsValue[manager.curDocument.database.insunits] ?? 'Unknown'
     return { ids, count: ids.length, units }

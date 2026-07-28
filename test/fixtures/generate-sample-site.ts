@@ -2,9 +2,9 @@ import { writeFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 
-// Minimal but well-formed ASCII DXF (AC1015 / AutoCAD 2000 format) with a
-// LAYER table so layer color/visibility round-trips, plus a handful of
-// entities spread across layers for exercising open/select/save.
+// Compact, structurally complete ASCII DXF (AC1015 / AutoCAD 2000 format)
+// with a real Model-space block record. Entity handles intentionally remain
+// stable because selection and undo tests refer to them.
 
 interface Layer {
   name: string
@@ -57,6 +57,46 @@ for (const layer of layers) {
   push(6, 'CONTINUOUS')
 }
 push(0, 'ENDTAB')
+push(0, 'TABLE')
+push(2, 'BLOCK_RECORD')
+push(5, '2')
+push(330, '0')
+push(100, 'AcDbSymbolTable')
+push(70, 1)
+push(0, 'BLOCK_RECORD')
+push(5, '10')
+push(330, '2')
+push(100, 'AcDbSymbolTableRecord')
+push(100, 'AcDbBlockTableRecord')
+push(2, '*Model_Space')
+push(70, 0)
+push(280, 1)
+push(281, 0)
+push(0, 'ENDTAB')
+push(0, 'ENDSEC')
+
+// ---- BLOCKS (authoritative Model-space layout) ----
+push(0, 'SECTION')
+push(2, 'BLOCKS')
+push(0, 'BLOCK')
+push(5, '11')
+push(330, '10')
+push(100, 'AcDbEntity')
+push(8, '0')
+push(100, 'AcDbBlockBegin')
+push(2, '*Model_Space')
+push(70, 0)
+push(10, 0)
+push(20, 0)
+push(30, 0)
+push(3, '*Model_Space')
+push(1, '')
+push(0, 'ENDBLK')
+push(5, '12')
+push(330, '10')
+push(100, 'AcDbEntity')
+push(8, '0')
+push(100, 'AcDbBlockEnd')
 push(0, 'ENDSEC')
 
 // ---- ENTITIES ----
@@ -66,6 +106,7 @@ push(2, 'ENTITIES')
 function lwpolyline(layer: string, points: [number, number][], closed: boolean) {
   push(0, 'LWPOLYLINE')
   push(5, nextHandle())
+  push(330, '10')
   push(100, 'AcDbEntity')
   push(8, layer)
   push(100, 'AcDbPolyline')
@@ -80,6 +121,7 @@ function lwpolyline(layer: string, points: [number, number][], closed: boolean) 
 function mtext(layer: string, x: number, y: number, height: number, text: string) {
   push(0, 'MTEXT')
   push(5, nextHandle())
+  push(330, '10')
   push(100, 'AcDbEntity')
   push(8, layer)
   push(100, 'AcDbMText')
@@ -94,6 +136,7 @@ function mtext(layer: string, x: number, y: number, height: number, text: string
 function circle(layer: string, cx: number, cy: number, radius: number) {
   push(0, 'CIRCLE')
   push(5, nextHandle())
+  push(330, '10')
   push(100, 'AcDbEntity')
   push(8, layer)
   push(100, 'AcDbCircle')

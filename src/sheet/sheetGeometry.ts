@@ -42,6 +42,10 @@ export interface SheetLayout {
   mmPerUnit: number
   viewport: ModelViewport
   warnings: string[]
+  databaseUnit: 'm' | 'mm' | 'unknown'
+  unitMismatch: boolean
+  conversionFactor?: number
+  clipping: boolean
 }
 
 const FIT_EPSILON = 1e-9
@@ -89,7 +93,8 @@ export function getPrintableArea(
 
 export function computeSheetLayout(
   sheet: SheetDefinition,
-  drawingExtents?: DrawingExtents
+  drawingExtents?: DrawingExtents,
+  databaseUnit: 'm' | 'mm' | 'unknown' = 'unknown'
 ): SheetLayout {
   const page = getPaperDimensions(sheet.paper, sheet.orientation)
   const printableArea = getPrintableArea(page, sheet.marginsMm)
@@ -102,6 +107,26 @@ export function computeSheetLayout(
     : undefined
 
   const warnings: string[] = []
+  const unitMismatch =
+    databaseUnit !== 'unknown' && databaseUnit !== sheet.drawingUnit
+  const conversionFactor = unitMismatch
+    ? databaseUnit === 'mm' && sheet.drawingUnit === 'm'
+      ? 1000
+      : 0.001
+    : undefined
+  if (unitMismatch) {
+    warnings.push(
+      `Database units are ${databaseUnit}; Sheet Preview is configured as ${
+        sheet.drawingUnit
+      }. The interpretation differs by a factor of ${formatNumber(
+        conversionFactor!
+      )}. Use Match database unit before previewing or exporting.`
+    )
+  } else if (databaseUnit === 'unknown') {
+    warnings.push(
+      'Database units are unknown; verify units before relying on sheet scale.'
+    )
+  }
   let centerX: number
   let centerY: number
 
@@ -136,7 +161,8 @@ export function computeSheetLayout(
     centerY
   }
 
-  if (extents && !containsExtents(viewport, extents)) {
+  const clipping = Boolean(extents && !containsExtents(viewport, extents))
+  if (clipping) {
     warnings.push(
       `Drawing extents do not fit within the printable area at scale 1:${formatNumber(
         sheet.scaleDenominator
@@ -149,7 +175,11 @@ export function computeSheetLayout(
     printableArea,
     mmPerUnit,
     viewport,
-    warnings
+    warnings,
+    databaseUnit,
+    unitMismatch,
+    conversionFactor,
+    clipping
   }
 }
 

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { AcApDocManager } from '@mlightcad/cad-simple-viewer'
+import { cadSessionState } from '../../cad/session'
 import { sheetStore } from '../../sheet/sheetStore'
 import { PAPER_SIZES } from '../../sheet/types'
 import { openPageSetup } from './pageSetupUiStore'
@@ -10,7 +10,8 @@ import { pushToast } from '../../toast/toastStore'
 
 const PX_PER_MM = 96 / 25.4
 
-const { svg, warnings, rendering, renderError, refresh } = useSheetRender()
+const { svg, warnings, rendering, renderError, diagnostics, refresh } =
+  useSheetRender()
 
 type ZoomMode = 'fit' | '100'
 const zoomMode = ref<ZoomMode>('fit')
@@ -41,6 +42,21 @@ const activeScale = computed(() => (zoomMode.value === 'fit' ? fitScale.value : 
 const visibleWarnings = computed(() =>
   warnings.value.filter((w) => !dismissedWarnings.value.has(w))
 )
+const documentReady = computed(
+  () =>
+    cadSessionState.status === 'active' &&
+    cadSessionState.editable &&
+    cadSessionState.viewReady
+)
+const canExport = computed(
+  () =>
+    documentReady.value &&
+    Boolean(svg.value) &&
+    !exporting.value &&
+    diagnostics.value !== null &&
+    diagnostics.value.drawableElementCount > 0 &&
+    !diagnostics.value.unitMismatch
+)
 
 function dismissWarning(warning: string) {
   dismissedWarnings.value = new Set(dismissedWarnings.value).add(warning)
@@ -63,20 +79,31 @@ watch(svg, () => {
   nextTick(recomputeFitScale)
 })
 
-onMounted(() => {
-  if (viewportEl.value) {
+function observeViewport(element: HTMLDivElement | null) {
+  resizeObserver?.disconnect()
+  resizeObserver = null
+  if (element) {
     resizeObserver = new ResizeObserver(() => recomputeFitScale())
-    resizeObserver.observe(viewportEl.value)
+    resizeObserver.observe(element)
+    nextTick(recomputeFitScale)
   }
-  recomputeFitScale()
-})
+}
+
+watch(viewportEl, observeViewport, { flush: 'post' })
+
+onMounted(recomputeFitScale)
 
 onBeforeUnmount(() => {
   resizeObserver?.disconnect()
 })
 
 async function onExportPdf() {
-  if (!svg.value || exporting.value) return
+  if (!canExport.value) {
+    if (diagnostics.value?.unitMismatch) {
+      pushToast('PDF export is blocked until the sheet drawing unit matches the database unit.')
+    }
+    return
+  }
   exporting.value = true
   exportError.value = null
   try {
@@ -91,13 +118,10 @@ async function onExportPdf() {
 }
 
 function getDrawingName(): string {
-  try {
-    const fileName = AcApDocManager.instance.curDocument?.fileName
-    if (fileName) return fileName.replace(/\.[^./\\]+$/, '')
-  } catch {
-    // no active document manager yet
-  }
-  return 'drawing'
+  return (cadSessionState.documentName ?? 'drawing').replace(
+    /\.[^./\\]+$/,
+    ''
+  )
 }
 </script>
 
@@ -111,7 +135,16 @@ function getDrawingName(): string {
       <span class="sep"></span>
       <button @click="refresh" :disabled="rendering">{{ rendering ? 'Rendering…' : 'Refresh' }}</button>
       <span class="grow"></span>
-      <button class="export-btn" :disabled="!svg || exporting" @click="onExportPdf">
+      <button
+        class="export-btn"
+        :disabled="!canExport"
+        :title="
+          diagnostics?.unitMismatch
+            ? 'Export is blocked until the sheet unit matches the database unit'
+            : 'Export the visible vector sheet as PDF'
+        "
+        @click="onExportPdf"
+      >
         {{ exporting ? 'Exporting…' : 'Export PDF' }}
       </button>
     </div>
@@ -130,8 +163,23 @@ function getDrawingName(): string {
       <button class="dismiss" @click="exportError = null">×</button>
     </div>
 
-    <div ref="viewportEl" class="preview-viewport">
+    <div
+      v-if="!documentReady"
+      class="preview-empty"
+      role="status"
+    >
+      No drawing is open. Choose New Drawing or Open before using Sheet Preview.
+    </div>
+    <div
+      v-else
+      ref="viewportEl"
+      class="preview-viewport"
+      :data-render-status="cadSessionState.sheetPreview.status"
+      :data-drawable-elements="diagnostics?.drawableElementCount ?? 0"
+      :data-unit-mismatch="diagnostics?.unitMismatch ?? false"
+    >
       <div
+        v-if="svg"
         class="paper"
         :style="{
           width: paperPx.width + 'px',
@@ -245,6 +293,17 @@ function getDrawingName(): string {
   justify-content: center;
   padding: 12px;
   background: var(--bg-canvas);
+}
+
+.preview-empty {
+  flex: 1;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.5;
+  text-align: center;
 }
 
 .paper {

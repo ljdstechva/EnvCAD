@@ -119,6 +119,16 @@ test('packaged EnvCAD opens, edits without a browser, authenticates its sidecar,
       'undefined'
     )
 
+    // Packaged New Drawing needs the same narrowly allowed CAD-data origin as
+    // Model-space fonts. Exercise it here because the Vite dev server does not
+    // apply the packaged renderer's Content Security Policy.
+    await page.getByRole('button', { name: 'New Drawing', exact: true }).click()
+    await expect(page.getByRole('button', { name: 'Save DXF' })).toBeEnabled({
+      timeout: 60_000
+    })
+    await expect(page.locator('.status-bar')).toContainText('Units: Millimeters')
+    await expect(page.locator('.toast[role="alert"]')).toHaveCount(0)
+
     await page.locator('input[accept=".dxf,.dwg"]').setInputFiles(FIXTURE)
     await expect(page.getByRole('button', { name: 'Save DXF' })).toBeEnabled()
     await expect(page.locator('.canvas-host canvas:visible').first()).toBeVisible()
@@ -143,7 +153,7 @@ test('packaged EnvCAD opens, edits without a browser, authenticates its sidecar,
       .toBeGreaterThan(100)
     await page.locator('input[accept=".dxf,.dwg"]').setInputFiles(savedDxf)
     await expect(page.locator('.canvas-host canvas:visible').first()).toBeVisible()
-    await page.getByRole('button', { name: 'Zoom Extents' }).click()
+    await page.getByRole('button', { name: 'Fit Drawing' }).click()
     await page.getByRole('button', { name: 'Layers', exact: true }).click()
     await expect(page.locator('.layers-dock')).toBeVisible()
     await page.getByRole('button', { name: 'Page Setup', exact: true }).click()
@@ -217,7 +227,9 @@ test('packaged EnvCAD keeps CAD available when API-key authentication is present
   try {
     const page = await application.firstWindow()
     await expect(page.getByRole('button', { name: 'Open', exact: true })).toBeVisible()
-    await expect(page.locator('.provider-message')).toContainText('ANTHROPIC_API_KEY')
+    await expect(
+      page.locator('.provider-message:not(.document-message)')
+    ).toContainText('ANTHROPIC_API_KEY')
     await expect(page.locator('.readiness-badge')).toHaveText('failed')
     await page.locator('input[accept=".dxf,.dwg"]').setInputFiles(FIXTURE)
     await expect(page.getByRole('button', { name: 'Save DXF' })).toBeEnabled()
@@ -251,12 +263,16 @@ test('packaged EnvCAD keeps CAD available when both provider CLIs are missing', 
   try {
     const page = await application.firstWindow()
     await expect(page.getByRole('button', { name: 'Open', exact: true })).toBeVisible()
-    await expect(page.locator('.provider-message')).toContainText('Claude Code was not found')
+    await expect(
+      page.locator('.provider-message:not(.document-message)')
+    ).toContainText('Claude Code was not found')
     await expect(page.locator('.readiness-badge')).toHaveText('missing')
     await page
       .getByLabel('AI provider', { exact: true })
       .selectOption('openai-codex')
-    await expect(page.locator('.provider-message')).toContainText('Codex CLI was not found')
+    await expect(
+      page.locator('.provider-message:not(.document-message)')
+    ).toContainText('Codex CLI was not found')
     await expect(page.locator('.readiness-badge')).toHaveText('missing')
     await page.locator('input[accept=".dxf,.dwg"]').setInputFiles(FIXTURE)
     await expect(page.getByRole('button', { name: 'Save DXF' })).toBeEnabled()

@@ -26,6 +26,9 @@ interface CliOptions {
   live: boolean
   executable?: string
   outputDirectory?: string
+  provider?: ProviderId
+  model?: string
+  effort?: string
 }
 
 interface PromptEvidence {
@@ -52,6 +55,7 @@ interface ProviderAcceptance {
   provider: ProviderId
   version: string
   model: string
+  resolvedModel?: string
   effort?: string
   discoveryMs?: number
   promptCharacters: number
@@ -81,11 +85,36 @@ function parseArgs(argv: string[]): CliOptions {
     } else if (argument === '--output') options.outputDirectory = argv[++index]
     else if (argument.startsWith('--output=')) {
       options.outputDirectory = argument.slice('--output='.length)
+    } else if (argument === '--provider') {
+      options.provider = parseProviderId(argv[++index])
+    } else if (argument.startsWith('--provider=')) {
+      options.provider = parseProviderId(argument.slice('--provider='.length))
+    } else if (argument === '--model') {
+      options.model = argv[++index]
+    } else if (argument.startsWith('--model=')) {
+      options.model = argument.slice('--model='.length)
+    } else if (argument === '--effort') {
+      options.effort = argv[++index]
+    } else if (argument.startsWith('--effort=')) {
+      options.effort = argument.slice('--effort='.length)
     } else {
       throw new Error(`Unknown installed acceptance argument: ${argument}`)
     }
   }
+  if ((options.model || options.effort) && !options.provider) {
+    throw new Error('--model and --effort require one explicit --provider.')
+  }
   return options
+}
+
+function parseProviderId(value: string | undefined): ProviderId {
+  if (!value || !PROVIDERS.includes(value as ProviderId)) {
+    throw new Error(
+      `Unsupported installed acceptance provider: ${value ?? '(missing)'}. ` +
+        `Choose ${PROVIDERS.join(' or ')}.`
+    )
+  }
+  return value as ProviderId
 }
 
 function cleanEnvironment(evidencePath: string): Record<string, string> {
@@ -143,6 +172,7 @@ function buildLongPrompt(provider: ProviderId): {
     `Create a layer named ${layer} with color #00a86b.`,
     `On ${layer}, draw exactly one closed axis-aligned rectangle from corner (0, 0) to corner (10, 6).`,
     'Use the CAD measurement tool to calculate the rectangle area, then zoom to extents.',
+    'After zooming, call get_view_status and use its render and fit evidence in your report.',
     'Report the created entity ID, dimensions, exact area, and drawing units. Do not create anything else.',
     'END-LONG-PROMPT-SENTINEL'
   ].join('\n')
@@ -253,7 +283,68 @@ async function openDrawing(page: Page, filePath: string): Promise<void> {
     undefined,
     { timeout: 30_000 }
   )
-  await page.getByRole('button', { name: 'Zoom Extents', exact: true }).click()
+  const fitDrawing = page.getByRole('button', {
+    name: 'Fit Drawing',
+    exact: true
+  })
+  if (await fitDrawing.isEnabled()) await fitDrawing.click()
+}
+
+async function selectProviderConfiguration(
+  page: Page,
+  provider: ProviderId,
+  requestedModel?: string,
+  requestedEffort?: string
+): Promise<void> {
+  if (!requestedModel && !requestedEffort) return
+
+  const modelSelect = page.getByLabel('AI model', { exact: true })
+  if (requestedModel) {
+    const selected = await modelSelect.selectOption(requestedModel)
+    if (selected.length !== 1 || selected[0] !== requestedModel) {
+      throw new Error(
+        `${provider} did not advertise requested model "${requestedModel}".`
+      )
+    }
+    await page.waitForFunction(
+      (model) => {
+        const select = document.querySelector(
+          'select[aria-label="AI model"]'
+        ) as HTMLSelectElement | null
+        return (
+          select?.value === model &&
+          document.querySelector('.status-text')?.textContent?.trim() ===
+            'Idle'
+        )
+      },
+      requestedModel,
+      { timeout: 90_000 }
+    )
+  }
+
+  if (requestedEffort) {
+    const effortSelect = page.getByLabel('Reasoning effort', { exact: true })
+    const selected = await effortSelect.selectOption(requestedEffort)
+    if (selected.length !== 1 || selected[0] !== requestedEffort) {
+      throw new Error(
+        `${provider} model "${await modelSelect.inputValue()}" does not advertise effort "${requestedEffort}".`
+      )
+    }
+    await page.waitForFunction(
+      (effort) => {
+        const select = document.querySelector(
+          'select[aria-label="Reasoning effort"]'
+        ) as HTMLSelectElement | null
+        return (
+          select?.value === effort &&
+          document.querySelector('.status-text')?.textContent?.trim() ===
+            'Idle'
+        )
+      },
+      requestedEffort,
+      { timeout: 90_000 }
+    )
+  }
 }
 
 async function saveDrawing(
@@ -324,10 +415,18 @@ async function runProviderAcceptance(
   page: Page,
   provider: ProviderId,
   cleanDrawing: string,
-  outputRoot: string
+  outputRoot: string,
+  requestedModel?: string,
+  requestedEffort?: string
 ): Promise<ProviderAcceptance> {
-  await waitForProviderReady(page, provider)
   await openDrawing(page, cleanDrawing)
+  await waitForProviderReady(page, provider)
+  await selectProviderConfiguration(
+    page,
+    provider,
+    requestedModel,
+    requestedEffort
+  )
   await resetConversation(page)
 
   const { prompt, layer } = buildLongPrompt(provider)
@@ -373,11 +472,31 @@ async function runProviderAcceptance(
     'create_layer',
     'draw_rectangle',
     'calculate_area',
-    'zoom_extents'
+    'zoom_extents',
+    'get_view_status'
   ]) {
     if (!tools.some((tool) => tool.name === required)) {
       throw new Error(`${provider} did not call required CAD tool ${required}.`)
     }
+  }
+  const viewStatus = tools.find((tool) => tool.name === 'get_view_status')
+    ?.result.data as
+    | {
+        viewReady?: boolean
+        renderedEntityCount?: number
+        completeExtentsFit?: boolean
+        lastRegeneration?: { completed?: boolean }
+      }
+    | undefined
+  if (
+    viewStatus?.viewReady !== true ||
+    !viewStatus.renderedEntityCount ||
+    viewStatus.completeExtentsFit !== true ||
+    viewStatus.lastRegeneration?.completed !== true
+  ) {
+    throw new Error(
+      `${provider} get_view_status did not prove completed regeneration, rendered geometry, and complete fitted extents.`
+    )
   }
 
   const screenshot = path.join(outputRoot, `${provider}-long-prompt.png`)
@@ -408,11 +527,17 @@ async function runProviderAcceptance(
   const providerOption = page.locator(
     `select[aria-label="AI provider"] option[value="${provider}"]`
   )
+  const selectedModelOption = page.locator(
+    'select[aria-label="AI model"] option:checked'
+  )
   const metrics = page.locator('.turn-metrics').last()
   return {
     provider,
     version: (await providerOption.getAttribute('data-version')) ?? 'unknown',
     model: await page.getByLabel('AI model').inputValue(),
+    resolvedModel:
+      (await selectedModelOption.getAttribute('data-resolved-model')) ||
+      undefined,
     effort: (await page.getByLabel('Reasoning effort').inputValue()) || undefined,
     discoveryMs: numberAttribute(
       await providerOption.getAttribute('data-discovery-ms')
@@ -437,7 +562,8 @@ async function runProviderAcceptance(
 
 async function verifyOversizedRejection(
   page: Page,
-  outputRoot: string
+  outputRoot: string,
+  provider: ProviderId
 ): Promise<{
   promptCharacters: number
   promptUtf8Bytes: number
@@ -446,7 +572,7 @@ async function verifyOversizedRejection(
   connectionPreserved: boolean
   screenshot: string
 }> {
-  await waitForProviderReady(page, 'openai-codex')
+  await waitForProviderReady(page, provider)
   await resetConversation(page)
   const oversized =
     'BEGIN-OVERSIZED-PROMPT\n' +
@@ -582,6 +708,7 @@ async function main(): Promise<void> {
   )
   await writeFile(cleanDrawing, cleanBenchmarkDxf(fixture), 'utf8')
   const environment = cleanEnvironment(evidencePath)
+  const providers = options.provider ? [options.provider] : PROVIDERS
   const results: ProviderAcceptance[] = []
   const ports: number[] = []
   const applicationProcessIds: number[] = []
@@ -602,18 +729,24 @@ async function main(): Promise<void> {
     const runtime = await waitForReadyRuntime(page)
     ports.push(Number(new URL(runtime.sidecar.connection.url).port))
     await refreshProviders(page)
-    for (const provider of PROVIDERS) {
+    for (const provider of providers) {
       results.push(
         await runProviderAcceptance(
           application,
           page,
           provider,
           cleanDrawing,
-          outputRoot
+          outputRoot,
+          options.model,
+          options.effort
         )
       )
     }
-    const oversized = await verifyOversizedRejection(page, outputRoot)
+    const oversized = await verifyOversizedRejection(
+      page,
+      outputRoot,
+      providers[0]
+    )
     await application.close()
     application = undefined
     if (await canConnect(ports[0])) {
@@ -633,11 +766,11 @@ async function main(): Promise<void> {
     applicationProcessIds.push(secondApplicationPid)
     const secondRuntime = await waitForReadyRuntime(relaunched.page)
     ports.push(Number(new URL(secondRuntime.sidecar.connection.url).port))
-    await waitForProviderReady(relaunched.page, 'openai-codex')
     await openDrawing(
       relaunched.page,
-      results.find((result) => result.provider === 'openai-codex')!.savedDrawing
+      results[0].savedDrawing
     )
+    await waitForProviderReady(relaunched.page, results[0].provider)
     await relaunched.page.locator('.toast[role="alert"]').waitFor({
       state: 'detached',
       timeout: 10_000
@@ -651,9 +784,9 @@ async function main(): Promise<void> {
     }
 
     const evidence = await readEvidence(evidencePath)
-    if (evidence.length !== PROVIDERS.length) {
+    if (evidence.length !== providers.length) {
       throw new Error(
-        `Expected ${PROVIDERS.length} provider prompt evidence rows; found ${evidence.length}.`
+        `Expected ${providers.length} provider prompt evidence rows; found ${evidence.length}.`
       )
     }
     for (const result of results) {
@@ -694,6 +827,8 @@ async function main(): Promise<void> {
           provider: result.provider,
           version: result.version,
           model: result.model,
+          resolvedModel: result.resolvedModel,
+          effort: result.effort,
           promptCharacters: result.promptCharacters,
           promptUtf8Bytes: result.promptUtf8Bytes,
           promptSha256: result.promptSha256,

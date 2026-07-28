@@ -1,9 +1,17 @@
 import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { AcApDocManager } from '@mlightcad/cad-simple-viewer'
 import type { AcDbDatabase } from '@mlightcad/data-model'
+import {
+  cadSessionState,
+  recordSheetPreview,
+  requireEditableCadSession
+} from '../../cad/session'
 import { sheetRenderer } from '../../sheet/renderSheet'
 import { sheetStore } from '../../sheet/sheetStore'
-import type { SheetRenderResult } from '../../sheet/types'
+import type {
+  SheetRenderDiagnostics,
+  SheetRenderResult
+} from '../../sheet/types'
 
 const RENDER_DEBOUNCE_MS = 500
 const MANAGER_POLL_MS = 300
@@ -13,6 +21,7 @@ export function useSheetRender() {
   const warnings = ref<string[]>([])
   const rendering = ref(false)
   const renderError = ref<string | null>(null)
+  const diagnostics = ref<SheetRenderDiagnostics | null>(null)
 
   let debounceHandle: ReturnType<typeof setTimeout> | null = null
   let pollHandle: ReturnType<typeof setInterval> | null = null
@@ -28,7 +37,7 @@ export function useSheetRender() {
 
   function getCurrentDatabase(): AcDbDatabase | null {
     try {
-      return AcApDocManager.instance.curDocument?.database ?? null
+      return requireEditableCadSession().database
     } catch {
       return null
     }
@@ -36,7 +45,7 @@ export function useSheetRender() {
 
   function getCurrentDocument(): unknown {
     try {
-      return AcApDocManager.instance.curDocument ?? null
+      return requireEditableCadSession().manager.curDocument
     } catch {
       return null
     }
@@ -90,6 +99,35 @@ export function useSheetRender() {
     const token = ++renderToken
     rendering.value = true
     renderError.value = null
+    if (
+      cadSessionState.status !== 'active' ||
+      !cadSessionState.editable ||
+      !cadSessionState.viewReady
+    ) {
+      svg.value = ''
+      warnings.value = []
+      diagnostics.value = null
+      rendering.value = false
+      recordSheetPreview({
+        status: 'unavailable',
+        entityCount: 0,
+        visibleEntityCount: 0,
+        drawableElementCount: 0,
+        warnings: [],
+        unitMismatch: false,
+        clipping: false
+      })
+      return
+    }
+    recordSheetPreview({
+      status: 'rendering',
+      entityCount: cadSessionState.entityCount,
+      visibleEntityCount: cadSessionState.visibleEntityCount,
+      drawableElementCount: 0,
+      warnings: [],
+      unitMismatch: false,
+      clipping: false
+    })
     try {
       const doc = getCurrentDocument()
       const result: SheetRenderResult = await sheetRenderer.render(
@@ -99,15 +137,52 @@ export function useSheetRender() {
       if (token !== renderToken) return
       svg.value = result.svg
       warnings.value = result.warnings
+      diagnostics.value = result.diagnostics
+      recordSheetPreview({
+        status: result.warnings.length > 0 ? 'warning' : 'ready',
+        entityCount: result.diagnostics.entityCount,
+        visibleEntityCount: result.diagnostics.visibleEntityCount,
+        drawableElementCount: result.diagnostics.drawableElementCount,
+        warnings: result.warnings,
+        unitMismatch: result.diagnostics.unitMismatch,
+        clipping: result.diagnostics.clipping
+      })
     } catch (err) {
       if (token !== renderToken) return
       renderError.value = err instanceof Error ? err.message : String(err)
+      diagnostics.value = null
+      recordSheetPreview({
+        status: 'error',
+        entityCount: cadSessionState.entityCount,
+        visibleEntityCount: cadSessionState.visibleEntityCount,
+        drawableElementCount: 0,
+        warnings: [],
+        unitMismatch:
+          cadSessionState.databaseUnit !== 'unknown' &&
+          cadSessionState.databaseUnit !== sheetStore.current.drawingUnit,
+        clipping: false,
+        error: renderError.value
+      })
     } finally {
       if (token === renderToken) rendering.value = false
     }
   }
 
-  const stopWatch = watch(() => sheetStore.current, scheduleRender, { deep: true })
+  const stopSheetWatch = watch(() => sheetStore.current, scheduleRender, {
+    deep: true
+  })
+  const stopSessionWatch = watch(
+    () => [
+      cadSessionState.status,
+      cadSessionState.documentName,
+      cadSessionState.entityCount,
+      cadSessionState.visibleEntityCount
+    ],
+    () => {
+      bindDatabaseEvents(getCurrentDatabase())
+      scheduleRender()
+    }
+  )
 
   onMounted(() => {
     if (!tryAttachManagerEvents()) {
@@ -125,7 +200,8 @@ export function useSheetRender() {
   })
 
   onBeforeUnmount(() => {
-    stopWatch()
+    stopSheetWatch()
+    stopSessionWatch()
     if (debounceHandle) clearTimeout(debounceHandle)
     if (pollHandle) clearInterval(pollHandle)
     bindDatabaseEvents(null)
@@ -140,5 +216,12 @@ export function useSheetRender() {
     }
   })
 
-  return { svg, warnings, rendering, renderError, refresh: scheduleRender }
+  return {
+    svg,
+    warnings,
+    rendering,
+    renderError,
+    diagnostics,
+    refresh: scheduleRender
+  }
 }
