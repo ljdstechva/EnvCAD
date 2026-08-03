@@ -1,5 +1,17 @@
+import { randomUUID } from 'node:crypto'
 import type { MessageEvent } from 'electron'
-import type { SidecarWorkerCommand, SidecarWorkerEvent } from './runtimeProtocol'
+import {
+  turnJournalCommandSchema,
+  turnJournalResultSchema,
+  type TurnJournalCommand,
+  type TurnJournalPort,
+  type TurnJournalResult
+} from '../shared/agent-contracts'
+import type {
+  SidecarWorkerCommand,
+  SidecarWorkerEvent,
+  SidecarWorkerTurnJournalResponse
+} from './runtimeProtocol'
 import { isSidecarWorkerCommand } from './runtimeProtocol'
 import { startSidecar, type SidecarHandle } from '../sidecar/src/server'
 
@@ -12,6 +24,15 @@ let handle: SidecarHandle | undefined
 let started = false
 let stopping = false
 let sessionToken = ''
+const pendingJournalRequests = new Map<
+  string,
+  {
+    resolve(result: TurnJournalResult): void
+    reject(error: Error): void
+    timer: ReturnType<typeof setTimeout>
+  }
+>()
+const TURN_JOURNAL_REQUEST_TIMEOUT_MS = 10_000
 
 function redact(message: string): string {
   let redacted = message
@@ -44,12 +65,68 @@ const logger = {
   }
 }
 
+const turnJournal: TurnJournalPort = {
+  execute(command: TurnJournalCommand): Promise<TurnJournalResult> {
+    const parsed = turnJournalCommandSchema.parse(command)
+    const requestId = randomUUID()
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pendingJournalRequests.delete(requestId)
+        reject(new Error('Durable turn journal request timed out.'))
+      }, TURN_JOURNAL_REQUEST_TIMEOUT_MS)
+      timer.unref()
+      pendingJournalRequests.set(requestId, { resolve, reject, timer })
+      try {
+        post({
+          type: 'turn-journal-request',
+          requestId,
+          command: parsed
+        })
+      } catch (error) {
+        clearTimeout(timer)
+        pendingJournalRequests.delete(requestId)
+        reject(
+          error instanceof Error
+            ? error
+            : new Error('Could not send durable turn journal request.')
+        )
+      }
+    })
+  }
+}
+
+function resolveTurnJournalRequest(
+  response: SidecarWorkerTurnJournalResponse
+): void {
+  const pending = pendingJournalRequests.get(response.requestId)
+  if (!pending) {
+    logger.error('AI Assistant received an unknown turn-journal response.')
+    return
+  }
+  clearTimeout(pending.timer)
+  pendingJournalRequests.delete(response.requestId)
+  if (response.ok) {
+    pending.resolve(turnJournalResultSchema.parse(response.result))
+  } else {
+    pending.reject(new Error(`${response.error.code}: ${response.error.message}`))
+  }
+}
+
+function rejectPendingJournalRequests(message: string): void {
+  for (const pending of pendingJournalRequests.values()) {
+    clearTimeout(pending.timer)
+    pending.reject(new Error(message))
+  }
+  pendingJournalRequests.clear()
+}
+
 async function shutdown(): Promise<void> {
   if (stopping) return
   stopping = true
   try {
     await handle?.close()
   } finally {
+    rejectPendingJournalRequests('AI Assistant stopped before journaling completed.')
     post({ type: 'stopped', message: 'AI Assistant stopped.' })
     setImmediate(() => process.exit(0))
   }
@@ -76,6 +153,8 @@ async function start(
       permittedOrigin: command.permittedOrigin,
       sessionToken: command.sessionToken,
       runtimeDirectory: command.runtimeDirectory,
+      inputStoreDirectory: command.inputStoreDirectory,
+      turnJournal,
       environment: process.env,
       logger
     })
@@ -113,8 +192,13 @@ parentPort.on('message', (event: MessageEvent) => {
     })
     return
   }
-  if (command.type === 'shutdown') void shutdown()
-  else void start(command)
+  if (command.type === 'turn-journal-response') {
+    resolveTurnJournalRequest(command)
+  } else if (command.type === 'shutdown') {
+    void shutdown()
+  } else {
+    void start(command)
+  }
 })
 
 process.once('SIGTERM', () => void shutdown())

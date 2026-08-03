@@ -79,7 +79,7 @@ describe('ProviderManager', () => {
       [claude, new FakeProvider('openai-codex')],
       logger()
     )
-    await manager.discover()
+    await manager.discover(undefined, { force: true })
 
     await expect(
       manager.applyConfiguration(
@@ -151,7 +151,7 @@ describe('ProviderManager', () => {
       statusMessage: 'Claude Code signed out.',
       models: []
     }
-    await manager.discover()
+    await manager.discover(undefined, { force: true })
 
     expect(conversation.closed).toBe(true)
     expect(manager.conversation).toBeUndefined()

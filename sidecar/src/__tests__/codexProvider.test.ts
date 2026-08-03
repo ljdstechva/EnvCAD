@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { CAD_TOOL_NAMES } from '../cadToolSpecs'
+import { PROVIDER_TOOL_NAMES } from '../providerToolSpecs'
 import {
   CodexProvider,
   toCodexDynamicToolResult,
@@ -242,9 +242,15 @@ function options(clients: FakeCodexClient[]): CodexProviderOptions {
 
 async function discoveredProvider() {
   const clients: FakeCodexClient[] = []
-  const provider = new CodexProvider(options(clients))
+  const providerOptions = options(clients)
+  const provider = new CodexProvider(providerOptions)
   const capability = await provider.discover()
-  return { provider, clients, capability }
+  return {
+    provider,
+    clients,
+    capability,
+    logger: providerOptions.logger!
+  }
 }
 
 async function collect<T>(events: AsyncIterable<T>): Promise<T[]> {
@@ -439,7 +445,9 @@ describe('CodexProvider', () => {
         dynamicTools: Array<{ name: string; inputSchema: unknown }>
       }
     ).dynamicTools
-    expect(dynamicTools.map((tool) => tool.name)).toEqual([...CAD_TOOL_NAMES])
+    expect(dynamicTools.map((tool) => tool.name)).toEqual([
+      ...PROVIDER_TOOL_NAMES
+    ])
     expect(dynamicTools.every((tool) => tool.inputSchema)).toBe(true)
   })
 
@@ -464,11 +472,11 @@ describe('CodexProvider', () => {
       contentItems: [
         {
           type: 'inputText',
-          text: JSON.stringify(
-            { kind: 'sheet-preview', width: 1_400, height: 990 },
-            null,
-            2
-          )
+          text: JSON.stringify({
+            kind: 'sheet-preview',
+            width: 1_400,
+            height: 990
+          })
         },
         {
           type: 'inputImage',
@@ -483,11 +491,71 @@ describe('CodexProvider', () => {
       contentItems: [
         {
           type: 'inputText',
-          text: JSON.stringify({ entityIds: ['line-1'] }, null, 2)
+          text: JSON.stringify({ entityIds: ['line-1'] })
         }
       ],
       success: true
     })
+  })
+
+  it('fails closed before forwarding oversized ordinary CAD metadata', () => {
+    const forwarded = toCodexDynamicToolResult({
+      data: { content: 'x'.repeat(32_001) }
+    })
+
+    expect(forwarded).toEqual({
+      contentItems: [
+        {
+          type: 'inputText',
+          text:
+            'CAD tool metadata exceeded its bounded page size. Retry the read with its continuation cursor.'
+        }
+      ],
+      success: false
+    })
+    expect(JSON.stringify(forwarded)).not.toContain('x'.repeat(1_000))
+  })
+
+  it('enforces canonical output limits in UTF-8 bytes', () => {
+    const content = 'é'.repeat(16_000)
+    expect(JSON.stringify({ content }).length).toBeLessThan(32_000)
+
+    const forwarded = toCodexDynamicToolResult(
+      { data: { content } },
+      'list_entities'
+    )
+    expect(forwarded.success).toBe(false)
+    expect(JSON.stringify(forwarded)).not.toContain(content.slice(0, 1_000))
+  })
+
+  it('keeps an oversized successful mutation successful with compact metadata', () => {
+    const forwarded = toCodexDynamicToolResult(
+      {
+        data: {
+          entityIds: ['line-1'],
+          unexpectedMetadata: 'x'.repeat(32_001)
+        }
+      },
+      'move_entities',
+      { entityIds: ['line-1'], dx: 1, dy: 0 }
+    )
+    const metadata = JSON.parse(
+      (
+        forwarded.contentItems[0] as {
+          type: 'inputText'
+          text: string
+        }
+      ).text
+    )
+
+    expect(forwarded.success).toBe(true)
+    expect(metadata).toMatchObject({
+      mutationSucceeded: true,
+      metadataCompacted: true,
+      affectedEntityCount: 1,
+      entityIdsPreview: ['line-1']
+    })
+    expect(JSON.stringify(forwarded)).not.toContain('x'.repeat(1_000))
   })
 
   it('keeps text-only models usable while omitting only visual inspection', async () => {
@@ -528,7 +596,9 @@ describe('CodexProvider', () => {
     const params = threadStart?.params as {
       dynamicTools: Array<{ name: string }>
       developerInstructions: string
+      baseInstructions?: string
     }
+    expect(params).not.toHaveProperty('baseInstructions')
     expect(params.dynamicTools.map((tool) => tool.name)).not.toContain(
       'inspect_sheet_preview'
     )
@@ -742,7 +812,7 @@ describe('CodexProvider', () => {
       }
     } as CodexServerRequest)
     expect(toolResult).toEqual({
-      contentItems: [{ type: 'inputText', text: '{\n  "entityId": "line-1"\n}' }],
+      contentItems: [{ type: 'inputText', text: '{"entityId":"line-1"}' }],
       success: true
     })
     clients[1].emit({
@@ -795,6 +865,181 @@ describe('CodexProvider', () => {
       { type: 'token_usage', inputTokens: 12, outputTokens: 3 }
     ])
     expect(bridge.callTool).toHaveBeenCalledWith('zoom_extents', {})
+  })
+
+  it('returns a CAD domain failure to Codex so the same turn can repair it', async () => {
+    const { provider, clients } = await discoveredProvider()
+    const bridge = {
+      callTool: vi.fn(async () => ({
+        error: 'Layer not found: AI_BENCHMARK'
+      })),
+      getSelectionSnapshot: () => undefined
+    }
+    const conversation = await provider.createConversation(
+      {
+        provider: 'openai-codex',
+        model: 'gpt-default',
+        effort: 'medium'
+      },
+      bridge
+    )
+    const run = collect(conversation.runTurn({ prompt: 'draw' }))
+    await vi.waitFor(() => {
+      expect(
+        clients[1].requests.some((request) => request.method === 'turn/start')
+      ).toBe(true)
+    })
+    clients[1].emit(threadSettings())
+
+    await expect(
+      clients[1].serverRequestHandler?.({
+        id: 10,
+        method: 'item/tool/call',
+        params: {
+          callId: 'call-domain-error',
+          threadId: 'thread-1',
+          turnId: 'turn-1',
+          tool: 'draw_line',
+          arguments: {
+            start: { x: 0, y: 0 },
+            end: { x: 1, y: 0 }
+          }
+        }
+      } as CodexServerRequest)
+    ).resolves.toEqual({
+      contentItems: [
+        { type: 'inputText', text: 'Layer not found: AI_BENCHMARK' }
+      ],
+      success: false
+    })
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    expect(clients[1].closed).toBe(false)
+    expect(
+      clients[1].requests.some((request) => request.method === 'turn/interrupt')
+    ).toBe(false)
+
+    clients[1].emit({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-1',
+        turn: { id: 'turn-1', status: 'completed' }
+      }
+    })
+    await expect(run).resolves.toEqual([])
+    expect(bridge.callTool).toHaveBeenCalledWith('draw_line', {
+      start: { x: 0, y: 0 },
+      end: { x: 1, y: 0 }
+    })
+  })
+
+  it('fails and interrupts only the active turn on a generic app-server error', async () => {
+    const { provider, clients } = await discoveredProvider()
+    const conversation = await provider.createConversation(
+      {
+        provider: 'openai-codex',
+        model: 'gpt-default',
+        effort: 'medium'
+      },
+      {
+        callTool: vi.fn(async () => ({ data: null })),
+        getSelectionSnapshot: () => undefined
+      }
+    )
+    const failedTurn = collect(
+      conversation.runTurn({ prompt: 'first attempt' })
+    )
+    await vi.waitFor(() => {
+      expect(
+        clients[1].requests.filter(
+          (request) => request.method === 'turn/start'
+        )
+      ).toHaveLength(1)
+    })
+
+    clients[1].emit({
+      method: 'error',
+      params: { message: 'temporary provider failure' }
+    })
+
+    await expect(failedTurn).rejects.toThrow(
+      'Codex app-server error: temporary provider failure'
+    )
+    await vi.waitFor(() => {
+      expect(
+        clients[1].requests.some(
+          (request) => request.method === 'turn/interrupt'
+        )
+      ).toBe(true)
+    })
+    expect(clients[1].closed).toBe(false)
+    expect(clients[1].serverRequestHandler).toBeDefined()
+
+    const recoveredTurn = collect(
+      conversation.runTurn({ prompt: 'retry after provider recovery' })
+    )
+    await vi.waitFor(() => {
+      expect(
+        clients[1].requests.filter(
+          (request) => request.method === 'turn/start'
+        )
+      ).toHaveLength(2)
+    })
+    clients[1].emit({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-1',
+        turn: { id: 'turn-1', status: 'completed' }
+      }
+    })
+
+    await expect(recoveredTurn).resolves.toEqual([])
+    expect(clients[1].closed).toBe(false)
+  })
+
+  it('quarantines an unrecognized passive notification without ending the turn', async () => {
+    const { provider, clients, logger } = await discoveredProvider()
+    const conversation = await provider.createConversation(
+      {
+        provider: 'openai-codex',
+        model: 'gpt-default',
+        effort: 'medium'
+      },
+      {
+        callTool: vi.fn(async () => ({ data: null })),
+        getSelectionSnapshot: () => undefined
+      }
+    )
+    const run = collect(conversation.runTurn({ prompt: 'draw' }))
+    await vi.waitFor(() => {
+      expect(
+        clients[1].requests.some(
+          (request) => request.method === 'turn/start'
+        )
+      ).toBe(true)
+    })
+
+    clients[1].emit({
+      method: 'telemetry/futureEvent',
+      params: { opaque: true }
+    })
+    clients[1].emit({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-1',
+        turn: { id: 'turn-1', status: 'completed' }
+      }
+    })
+
+    await expect(run).resolves.toEqual([])
+    expect(clients[1].closed).toBe(false)
+    expect(
+      clients[1].requests.some(
+        (request) => request.method === 'turn/interrupt'
+      )
+    ).toBe(false)
+    expect(logger.log).toHaveBeenCalledWith(
+      '[sidecar] Codex quarantined unrecognized passive event "telemetry/futureEvent".'
+    )
   })
 
   it('fails closed when Codex reports weakened runtime settings', async () => {

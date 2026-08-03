@@ -31,6 +31,10 @@ async function main(): Promise<void> {
     permittedOrigin: DEVELOPMENT_ORIGIN,
     sessionToken: DEVELOPMENT_SESSION_TOKEN,
     runtimeDirectory,
+    inputStoreDirectory: path.join(
+      path.dirname(path.dirname(runtimeDirectory)),
+      'input-store-development'
+    ),
     environment: process.env
   })
   const address = await sidecar.ready

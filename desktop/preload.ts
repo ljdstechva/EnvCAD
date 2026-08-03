@@ -37,7 +37,44 @@ const api: EnvCadDesktopApi = {
       DESKTOP_IPC.saveSheetPreference,
       documentName,
       sheet
-    ) as Promise<SheetDefinition>
+    ) as Promise<SheetDefinition>,
+  getOperationReceipt: (operationId) =>
+    ipcRenderer.invoke(
+      DESKTOP_IPC.getOperationReceipt,
+      operationId
+    ),
+  getOperationReceiptByKey: (idempotencyKey) =>
+    ipcRenderer.invoke(
+      DESKTOP_IPC.getOperationReceiptByKey,
+      idempotencyKey
+    ),
+  listUnresolvedOperations: () =>
+    ipcRenderer.invoke(DESKTOP_IPC.listUnresolvedOperations),
+  createPendingOperation: (receipt) =>
+    ipcRenderer.invoke(DESKTOP_IPC.createPendingOperation, receipt),
+  saveOperationReceipt: (receipt) =>
+    ipcRenderer.invoke(DESKTOP_IPC.saveOperationReceipt, receipt),
+  writeOperationResult: (result) =>
+    ipcRenderer.invoke(DESKTOP_IPC.writeOperationResult, result),
+  readOperationResult: (reference) =>
+    ipcRenderer.invoke(DESKTOP_IPC.readOperationResult, reference),
+  loadAgentState: (key) => {
+    const result = ipcRenderer.sendSync(DESKTOP_IPC.loadAgentState, key) as
+      | { ok: true; value: string | null }
+      | { ok: false; message: string }
+    if (!result.ok) throw new Error(result.message)
+    return result.value
+  },
+  saveAgentState: (key, value) =>
+    ipcRenderer.invoke(DESKTOP_IPC.saveAgentState, key, value) as Promise<void>,
+  saveAgentStateSync: (key, value) => {
+    const result = ipcRenderer.sendSync(
+      DESKTOP_IPC.saveAgentStateSync,
+      key,
+      value
+    ) as { ok: true } | { ok: false; message: string }
+    if (!result.ok) throw new Error(result.message)
+  }
 }
 
 contextBridge.exposeInMainWorld('envcadDesktop', Object.freeze(api))

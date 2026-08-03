@@ -1,9 +1,13 @@
 import { createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk'
 import type { ToolResult } from '../../src/agent/protocol'
 import {
-  CAD_TOOL_SPECS,
+  cadToolMayMutate,
+  compactMutationResultText,
+  maximumProviderToolOutputBytes,
+  utf8ByteLength,
   type CadToolBridge
 } from './cadToolSpecs'
+import { PROVIDER_TOOL_SPECS } from './providerToolSpecs'
 
 interface ForwardedCallToolResult {
   [key: string]: unknown
@@ -14,19 +18,37 @@ interface ForwardedCallToolResult {
   isError?: boolean
 }
 
-const MAX_VISUAL_METADATA_CHARACTERS = 32_000
-
 export function toClaudeCallToolResult(
-  result: ToolResult
+  result: ToolResult,
+  toolName?: string,
+  input?: unknown
 ): ForwardedCallToolResult {
   if (result.error) {
     return { content: [{ type: 'text', text: result.error }], isError: true }
   }
   const text =
-    typeof result.data === 'string' ? result.data : JSON.stringify(result.data ?? null, null, 2)
+    typeof result.data === 'string'
+      ? result.data
+      : JSON.stringify(result.data ?? null)
+  if (utf8ByteLength(text) > maximumProviderToolOutputBytes(toolName)) {
+    if (toolName && cadToolMayMutate(toolName, input)) {
+      return {
+        content: [{ type: 'text', text: compactMutationResultText(result) }]
+      }
+    }
+    return {
+      content: [
+        {
+          type: 'text',
+          text:
+            'CAD tool metadata exceeded its bounded page size. Retry the read with its continuation cursor.'
+        }
+      ],
+      isError: true
+    }
+  }
   if (!result.image) return { content: [{ type: 'text', text }] }
   if (
-    text.length > MAX_VISUAL_METADATA_CHARACTERS ||
     text.includes(result.image.base64)
   ) {
     return {
@@ -57,15 +79,17 @@ export function toClaudeCallToolResult(
  */
 export function createCadMcpServer(
   bridge: CadToolBridge,
-  onToolFailure?: (error: Error) => void,
   onVisualResult?: (result: ToolResult) => void | Promise<void>
 ) {
+  const permitted = bridge.permittedToolNames?.()
+  const permittedNames = permitted ? new Set(permitted) : undefined
   const server = createSdkMcpServer({
     name: 'cad',
     version: '2.0.0',
     tools: []
   })
-  for (const spec of CAD_TOOL_SPECS) {
+  for (const spec of PROVIDER_TOOL_SPECS) {
+    if (permittedNames && !permittedNames.has(spec.name)) continue
     server.instance.registerTool(
       spec.name,
       {
@@ -74,12 +98,7 @@ export function createCadMcpServer(
       },
       async (input) => {
         const result = await spec.execute(bridge, input)
-        if (result.error) {
-          onToolFailure?.(
-            new Error(`Claude CAD tool ${spec.name} failed: ${result.error}`)
-          )
-        }
-        const forwarded = toClaudeCallToolResult(result)
+        const forwarded = toClaudeCallToolResult(result, spec.name, input)
         if (result.image && !forwarded.isError) {
           await onVisualResult?.(result)
         }

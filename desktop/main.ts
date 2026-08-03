@@ -7,6 +7,7 @@ import {
   dialog,
   ipcMain,
   Menu,
+  safeStorage,
   session,
   shell,
   utilityProcess,
@@ -16,6 +17,7 @@ import log from 'electron-log/main'
 import { startFrontendServer, type FrontendServerHandle } from './frontendServer'
 import {
   DESKTOP_IPC,
+  isDurableAgentStateKey,
   type DesktopRuntimeConfig,
   type SidecarStatus
 } from './runtimeProtocol'
@@ -26,6 +28,13 @@ import { handleSquirrelStartup } from './squirrelStartup'
 import { focusExistingWindow } from './windowLifecycle'
 import { removeRuntimeDirectoryWithRetry } from './runtimeDirectoryCleanup'
 import { removeLegacyEnvCadClaudeTranscripts } from './claudeTranscriptCleanup'
+import { PersistentOperationLedger } from './agentJournal/PersistentOperationLedger'
+import { PersistentOperationResultStore } from './agentJournal/PersistentOperationResultStore'
+import { reconcileAbandonedOperations } from './agentJournal/AbandonedOperationReconciler'
+import { PersistentTurnJournal } from './agentJournal/PersistentTurnJournal'
+import { reconcileAbandonedTurns } from './agentJournal/AbandonedTurnReconciler'
+import { installOperationJournalIpc } from './operationJournalIpc'
+import { PersistentRendererAgentState } from './agentJournal/PersistentRendererAgentState'
 
 declare const MAIN_WINDOW_VITE_DEV_SERVER_URL: string | undefined
 
@@ -38,6 +47,11 @@ let frontendServer: FrontendServerHandle | undefined
 let sidecarProcess: SidecarProcess | undefined
 let aiPreferencesStore: AiPreferencesStore | undefined
 let sheetPreferencesStore: SheetPreferencesStore | undefined
+let operationLedger: PersistentOperationLedger | undefined
+let operationResultStore: PersistentOperationResultStore | undefined
+let turnJournal: PersistentTurnJournal | undefined
+let rendererAgentState: PersistentRendererAgentState | undefined
+let turnJournalReady = false
 let aiRuntimeDirectory = ''
 let rendererOrigin = ''
 let shuttingDown = false
@@ -85,11 +99,33 @@ function publishSidecarStatus(status: SidecarStatus): void {
   }
 }
 
-function trustedSender(event: IpcMainInvokeEvent): boolean {
-  if (!mainWindow || event.sender !== mainWindow.webContents || !rendererOrigin) return false
+function trustedSender(
+  event: Pick<
+    IpcMainInvokeEvent,
+    'sender' | 'senderFrame' | 'frameId' | 'processId'
+  >
+): boolean {
+  const mainFrame = mainWindow?.webContents.mainFrame
+  if (
+    !mainWindow ||
+    !mainFrame ||
+    event.sender !== mainWindow.webContents ||
+    event.processId !== mainFrame.processId ||
+    event.frameId !== mainFrame.routingId ||
+    !rendererOrigin
+  ) {
+    return false
+  }
   try {
-    const senderUrl = event.senderFrame?.url
-    if (!senderUrl) return false
+    const senderFrame = event.senderFrame
+    if (
+      !senderFrame ||
+      senderFrame.processId !== mainFrame.processId ||
+      senderFrame.routingId !== mainFrame.routingId
+    ) {
+      return false
+    }
+    const senderUrl = senderFrame.url
     return new URL(senderUrl).origin === rendererOrigin
   } catch {
     return false
@@ -136,6 +172,86 @@ function installIpcHandlers(): void {
       return sheetPreferencesStore.save(documentName, sheet)
     }
   )
+  ipcMain.on(DESKTOP_IPC.loadAgentState, (event, key: unknown) => {
+    let result:
+      | { ok: true; value: string | null }
+      | { ok: false; message: string }
+    if (
+      !trustedSender(event) ||
+      !rendererAgentState ||
+      !isDurableAgentStateKey(key)
+    ) {
+      result = {
+        ok: false,
+        message: 'Assistant recovery state is unavailable.'
+      }
+    } else {
+      try {
+        result = { ok: true, value: rendererAgentState.load(key) }
+      } catch {
+        result = {
+          ok: false,
+          message:
+            'EnvCAD could not restore protected assistant recovery state.'
+        }
+      }
+    }
+    // Electron resolves sendSync on the first returnValue assignment.
+    event.returnValue = result
+  })
+  ipcMain.on(
+    DESKTOP_IPC.saveAgentStateSync,
+    (event, key: unknown, value: unknown) => {
+      let result: { ok: true } | { ok: false; message: string }
+      if (
+        !trustedSender(event) ||
+        !rendererAgentState ||
+        !isDurableAgentStateKey(key) ||
+        typeof value !== 'string'
+      ) {
+        result = {
+          ok: false,
+          message: 'Assistant recovery state was not saved.'
+        }
+      } else {
+        try {
+          rendererAgentState.saveSync(key, value)
+          result = { ok: true }
+        } catch {
+          result = {
+            ok: false,
+            message:
+              'EnvCAD could not save protected assistant recovery state.'
+          }
+        }
+      }
+      // Electron resolves sendSync on the first returnValue assignment.
+      event.returnValue = result
+    }
+  )
+  ipcMain.handle(
+    DESKTOP_IPC.saveAgentState,
+    async (event, key: unknown, value: unknown) => {
+      if (!trustedSender(event)) throw new Error('Untrusted renderer IPC request')
+      if (
+        !rendererAgentState ||
+        !isDurableAgentStateKey(key) ||
+        typeof value !== 'string'
+      ) {
+        throw new Error('Assistant recovery state is invalid.')
+      }
+      await rendererAgentState.save(key, value)
+    }
+  )
+  if (!operationLedger || !operationResultStore) {
+    throw new Error('Operation journal is not initialized')
+  }
+  installOperationJournalIpc({
+    ipcMain,
+    trustedSender,
+    ledger: operationLedger,
+    results: operationResultStore
+  })
 }
 
 function isTrustedApplicationUrl(target: string): boolean {
@@ -302,6 +418,61 @@ async function startDesktop(): Promise<void> {
     path.join(app.getPath('userData'), 'sheet-preferences.json'),
     desktopLogger
   )
+  const agentJournalDirectory = path.join(
+    app.getPath('userData'),
+    'agent-journal-v2'
+  )
+  rendererAgentState = new PersistentRendererAgentState(
+    path.join(agentJournalDirectory, 'renderer'),
+    safeStorage
+  )
+  operationLedger = new PersistentOperationLedger(agentJournalDirectory)
+  try {
+    const operationReconciliation =
+      await reconcileAbandonedOperations(operationLedger)
+    if (operationReconciliation.pendingMarkedUnknown > 0) {
+      desktopLogger.warn(
+        `Marked ${operationReconciliation.pendingMarkedUnknown} interrupted CAD operation(s) unknown; AI writes remain blocked pending reconciliation.`
+      )
+    }
+  } catch (error) {
+    desktopLogger.error(
+      `Durable operation startup reconciliation failed: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    )
+    publishSidecarStatus({
+      type: 'failed',
+      message:
+        'AI CAD mutation recovery failed. Manual CAD editing remains available; review the diagnostic log before using AI edits.'
+    })
+  }
+  turnJournal = new PersistentTurnJournal(
+    path.join(agentJournalDirectory, 'turns')
+  )
+  try {
+    const reconciliation = await reconcileAbandonedTurns(turnJournal)
+    turnJournalReady = true
+    if (reconciliation.reconciled > 0) {
+      desktopLogger.warn(
+        `Moved ${reconciliation.reconciled} interrupted AI turn(s) to a safe needs-input outcome without replay.`
+      )
+    }
+  } catch (error) {
+    desktopLogger.error(
+      `Durable turn startup reconciliation failed: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    )
+    publishSidecarStatus({
+      type: 'failed',
+      message:
+        'AI Assistant durable recovery failed. CAD editing remains available; review the diagnostic log before starting another AI turn.'
+    })
+  }
+  operationResultStore = new PersistentOperationResultStore(
+    path.join(agentJournalDirectory, 'results')
+  )
   const localAppData = process.env.LOCALAPPDATA
   if (!localAppData) {
     throw new Error('LOCALAPPDATA is unavailable; cannot create the isolated AI runtime.')
@@ -344,11 +515,14 @@ async function startDesktop(): Promise<void> {
   createApplicationMenu()
   await createWindow(rendererUrl)
 
+  if (!turnJournalReady) return
   sidecarProcess = new SidecarProcess({
     workerPath: path.join(__dirname, 'sidecarWorker.cjs'),
     permittedOrigin: rendererOrigin,
     sessionToken,
+    sessionTokenFactory: () => randomBytes(32).toString('base64url'),
     runtimeDirectory: aiRuntimeDirectory,
+    inputStoreDirectory: path.join(agentJournalDirectory, 'inputs'),
     fork(modulePath, options): UtilityProcessLike {
       return utilityProcess.fork(modulePath, [], {
         env: options.env,
@@ -357,7 +531,8 @@ async function startDesktop(): Promise<void> {
       }) as UtilityProcessLike
     },
     onStatus: publishSidecarStatus,
-    logger: desktopLogger
+    logger: desktopLogger,
+    turnJournal
   })
   void sidecarProcess.start()
 }
@@ -371,6 +546,24 @@ async function shutdown(): Promise<void> {
   } catch (error) {
     desktopLogger.error(
       `AI Assistant shutdown failed: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    )
+  }
+  try {
+    await operationLedger?.close()
+  } catch (error) {
+    desktopLogger.error(
+      `Operation journal shutdown failed: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    )
+  }
+  try {
+    await turnJournal?.close()
+  } catch (error) {
+    desktopLogger.error(
+      `Turn journal shutdown failed: ${
         error instanceof Error ? error.message : String(error)
       }`
     )

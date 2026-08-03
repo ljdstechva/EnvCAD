@@ -2,7 +2,7 @@
 
 ## Install and launch
 
-EnvCAD v0.2.3 is packaged for Windows x64 with Electron Forge and Squirrel.
+EnvCAD v0.2.4 is packaged for Windows x64 with Electron Forge and Squirrel.
 
 ```powershell
 npm ci
@@ -12,7 +12,7 @@ npm run desktop:make
 The installer is produced under:
 
 ```text
-out\make\squirrel.windows\x64\EnvCAD-0.2.3 Setup.exe
+out\make\squirrel.windows\x64\EnvCAD-0.2.4 Setup.exe
 ```
 
 Install it, then launch EnvCAD from the Desktop shortcut or Start menu. The
@@ -44,6 +44,14 @@ or failed providers remain visible with provider-specific recovery instructions.
 EnvCAD rejects provider API-key/token environment variables. It does not copy,
 read, log, or package provider auth files.
 
+The packaged app includes the exact MIT-licensed CAD and DXF `SKILL.md` files
+from `earthtojake/text-to-cad` v0.3.9. The sidecar verifies and compiles their
+pinned manifests at startup, then deterministically activates `cad-core` and
+`dxf-core` before each accepted turn. It rechecks integrity before AI mutation
+without repeatedly injecting the full files. It does not install the upstream
+Python dependencies or expand provider filesystem, shell, external-viewer, or
+plugin permissions. See `THIRD_PARTY_NOTICES.md`.
+
 ## Process architecture
 
 ```text
@@ -66,6 +74,11 @@ Codex uses it as its working directory. The directory is removed during normal
 shutdown. The sidecar, provider subprocesses, WebSocket server, and embedded
 renderer server are closed before Electron exits.
 
+The AI utility process is supervised. Unexpected exits use bounded exponential
+backoff with jitter, a restart-window circuit breaker, and fresh loopback
+credentials. Turn and operation journals live separately under Electron
+`userData` and are never deleted with the disposable provider runtime.
+
 Provider discovery is asynchronous and independent. The utility process and
 main window start even if both providers are unavailable.
 
@@ -81,17 +94,20 @@ Desktop:
 - untrusted navigation and windows blocked;
 - external navigation restricted to HTTPS;
 - IPC sender origin and `webContents` identity verified;
-- preload exposes only runtime status, log-folder open, and strict AI
-  preference get/save methods.
+- preload exposes only runtime status, log-folder open, strict preferences,
+  fixed-key protected agent state, and operation-journal methods;
+- active turn state and assistant drafts use two fixed allowlisted files,
+  atomic replacement, and Windows `safeStorage` encryption.
 
 Sidecar:
 
 - binds loopback only on an operating-system-selected port;
 - requires exact renderer origin, protocol version, and per-launch token;
-- limits complete serialized WebSocket messages to 2 MiB and rejects oversized
-  requests in the renderer before `send`, preserving the draft and connection;
+- bounds every serialized WebSocket frame; instructions above the 128 KiB
+  inline budget stream as independently hashed 256 KiB local-input chunks;
 - strictly validates every message and CAD tool name;
-- serializes CAD calls and enforces timeouts;
+- serializes mutations through a durable idempotency ledger, reconciles unknown
+  status before retry, and uses canonical per-tool timeouts;
 - redacts provider diagnostics before logs or UI.
 
 Claude:
@@ -134,6 +150,12 @@ They contain only schema version, provider/model/effort identifiers, and optiona
 benchmark recommendations. Writes are strict, bounded, secret-rejecting, and
 atomic. A corrupt file falls back to Claude Code for existing users.
 
+Turn cursors and composer/queue state live under
+`userData/agent-journal-v2/renderer`. Their fixed files are encrypted with
+Windows protected storage. Operation receipts, results, turn events, and large
+input references use sibling journal directories with independent integrity
+checks and quotas.
+
 Logs live at:
 
 ```text
@@ -172,7 +194,8 @@ npm run desktop:make
 `test:desktop` packages the application and drives the production ASAR without a
 browser or Vite server. It checks launch, CAD open/render/zoom/layers/page setup,
 sidecar authentication, invalid-token rejection, single-instance behavior,
-provider failure states, secret redaction, and shutdown cleanup.
+provider failure states, protected draft recovery across a full restart, secret
+redaction, and shutdown cleanup.
 
 The explicit live benchmark is:
 
@@ -187,7 +210,7 @@ The installed visual-provider acceptance is opt-in because it makes real Claude
 and Codex subscription turns:
 
 ```powershell
-npm run acceptance:visual-installed -- --live --scope=full --drawing "C:\path\to\M-01.dxf" --output "$env:LOCALAPPDATA\EnvCAD-Acceptance\v0.2.3"
+npm run acceptance:visual-installed -- --live --scope=full --drawing "C:\path\to\M-01.dxf" --output "$env:LOCALAPPDATA\EnvCAD-Acceptance\v0.2.4"
 ```
 
 It verifies two undisclosed marker layouts, a blank sheet, a visibly

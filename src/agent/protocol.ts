@@ -4,8 +4,17 @@
  */
 import {
   CAD_TOOL_NAMES,
+  toolCallMayMutate,
   type CadToolName
-} from '../../sidecar/src/cadToolSpecs'
+} from '../../shared/agent-contracts/tool-manifest'
+import {
+  cadOperationRequestSchema,
+  operationReceiptSchema,
+  operationStatusResultSchema,
+  type CadOperationRequest,
+  type OperationStatusResult,
+  type OperationReceipt
+} from '../../shared/agent-contracts/operation'
 
 export { CAD_TOOL_NAMES, type CadToolName }
 
@@ -64,6 +73,11 @@ export interface AgentConfiguration {
   effort?: string
 }
 
+export interface CadSessionRevisionSnapshot {
+  documentRevision: number
+  contentRevision: number
+}
+
 export interface TurnMetrics {
   providerReadyMs?: number
   conversationStartupMs?: number
@@ -80,6 +94,18 @@ export interface SelectionSnapshot {
   ids: string[]
   count: number
   units: string
+  revision: CadSessionRevisionSnapshot
+}
+
+/**
+ * Selection metadata carried over the WebSocket. Exact entity IDs remain
+ * frozen in the renderer and are injected only when get_selected_entities is
+ * executed, so selection size does not consume prompt transport capacity.
+ */
+export interface SelectionContext {
+  count: number
+  units: string
+  revision: CadSessionRevisionSnapshot
 }
 
 export interface SheetSnapshot {
@@ -101,8 +127,14 @@ export type ToolImageMimeType = (typeof TOOL_IMAGE_MIME_TYPES)[number]
 export const MAX_TOOL_IMAGE_BYTES = 1_179_648
 export const MAX_TOOL_IMAGE_DIMENSION = 4_096
 export const MAX_TOOL_IMAGE_PIXELS = 16_777_216
+export const ENVCAD_TURN_REVISION_FIELD = '__envcadTurnRevision'
 export const IMAGE_CAPABLE_CAD_TOOL_NAMES = [
-  'inspect_sheet_preview'
+  'inspect_sheet_preview',
+  'inspect_model_view',
+  'inspect_region',
+  'inspect_selection',
+  'compare_before_after',
+  'render_analysis_overlay'
 ] as const satisfies readonly CadToolName[]
 
 export interface ToolImagePayload {
@@ -127,11 +159,21 @@ export type ClientMessage =
   | {
       type: 'user_message'
       text: string
-      selectionSnapshot: SelectionSnapshot
+      selectionSnapshot: SelectionContext
       sheet: SheetSnapshot
       configurationRevision: number
     }
-  | { type: 'tool_result'; callId: string; result: ToolResult }
+  | {
+      type: 'tool_result'
+      callId: string
+      result: ToolResult
+      operationReceipt?: OperationReceipt
+    }
+  | {
+      type: 'operation_status'
+      requestId: string
+      result: OperationStatusResult
+    }
   | { type: 'interrupt' }
   | { type: 'reset'; revision: number }
   | { type: 'refresh_ai_capabilities' }
@@ -153,7 +195,20 @@ export type ServerMessage =
       effort?: string
       metrics: TurnMetrics
     }
-  | { type: 'tool_call'; callId: string; name: CadToolName; input: unknown }
+  | {
+      type: 'tool_call'
+      callId: string
+      name: CadToolName
+      input: unknown
+      turnId?: string
+      operation?: CadOperationRequest
+    }
+  | {
+      type: 'get_operation_status'
+      turnId: string
+      requestId: string
+      operationId: string
+    }
   | { type: 'status'; state: AgentStatusState }
   | { type: 'error'; message: string; provider?: ProviderId }
   | {
@@ -192,7 +247,6 @@ const PROVIDER_STATUS_SET = new Set<string>([
 const CAD_TOOL_NAME_SET = new Set<string>(CAD_TOOL_NAMES)
 const MAX_IDENTIFIER_LENGTH = 200
 const MAX_DESCRIPTION_LENGTH = 4_000
-const MAX_SELECTION_IDS = 10_000
 const MAX_MODELS_PER_PROVIDER = 100
 const MAX_EFFORTS_PER_MODEL = 10
 const INPUT_MODALITY_SET = new Set<InputModality>(['text', 'image', 'audio'])
@@ -246,28 +300,45 @@ function isNonNegativeFinite(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0
 }
 
-function parseSelectionSnapshot(value: unknown): ProtocolParseResult<SelectionSnapshot> {
-  if (!isRecord(value)) return failure('selectionSnapshot must be an object')
-  if (!hasOnlyKeys(value, ['ids', 'count', 'units'])) {
-    return failure('selectionSnapshot contains unsupported fields')
+function parseCadSessionRevision(
+  value: unknown
+): ProtocolParseResult<CadSessionRevisionSnapshot> {
+  if (!isRecord(value)) return failure('revision must be an object')
+  if (!hasOnlyKeys(value, ['documentRevision', 'contentRevision'])) {
+    return failure('revision contains unsupported fields')
   }
   if (
-    !Array.isArray(value.ids) ||
-    value.ids.length > MAX_SELECTION_IDS ||
-    !value.ids.every((id) => isNonEmptyString(id, MAX_IDENTIFIER_LENGTH))
+    !Number.isSafeInteger(value.documentRevision) ||
+    (value.documentRevision as number) < 0
   ) {
-    return failure('selectionSnapshot.ids must be an array of bounded non-empty strings')
+    return failure('revision.documentRevision must be a non-negative safe integer')
   }
-  if (!Number.isInteger(value.count) || (value.count as number) < 0) {
-    return failure('selectionSnapshot.count must be a non-negative integer')
+  if (
+    !Number.isSafeInteger(value.contentRevision) ||
+    (value.contentRevision as number) < 0
+  ) {
+    return failure('revision.contentRevision must be a non-negative safe integer')
   }
-  if (value.count !== value.ids.length) {
-    return failure('selectionSnapshot.count must equal selectionSnapshot.ids.length')
+  return {
+    ok: true,
+    value: value as unknown as CadSessionRevisionSnapshot
+  }
+}
+
+function parseSelectionSnapshot(value: unknown): ProtocolParseResult<SelectionContext> {
+  if (!isRecord(value)) return failure('selectionSnapshot must be an object')
+  if (!hasOnlyKeys(value, ['count', 'units', 'revision'])) {
+    return failure('selectionSnapshot contains unsupported fields')
+  }
+  if (!Number.isSafeInteger(value.count) || (value.count as number) < 0) {
+    return failure('selectionSnapshot.count must be a non-negative safe integer')
   }
   if (!isNonEmptyString(value.units, MAX_IDENTIFIER_LENGTH)) {
     return failure('selectionSnapshot.units must be a non-empty string')
   }
-  return { ok: true, value: value as unknown as SelectionSnapshot }
+  const revision = parseCadSessionRevision(value.revision)
+  if (!revision.ok) return failure(`selectionSnapshot.${revision.error}`)
+  return { ok: true, value: value as unknown as SelectionContext }
 }
 
 function parseSheetSnapshot(value: unknown): ProtocolParseResult<SheetSnapshot> {
@@ -866,7 +937,14 @@ export function parseClientMessage(value: unknown): ProtocolParseResult<ClientMe
       return { ok: true, value: value as unknown as ClientMessage }
     }
     case 'tool_result': {
-      if (!hasOnlyKeys(value, ['type', 'callId', 'result'])) {
+      if (
+        !hasOnlyKeys(value, [
+          'type',
+          'callId',
+          'result',
+          'operationReceipt'
+        ])
+      ) {
         return failure('tool_result contains unsupported fields')
       }
       if (!isNonEmptyString(value.callId, MAX_IDENTIFIER_LENGTH)) {
@@ -874,6 +952,24 @@ export function parseClientMessage(value: unknown): ProtocolParseResult<ClientMe
       }
       const result = parseToolResult(value.result)
       if (!result.ok) return failure(result.error)
+      if (
+        value.operationReceipt !== undefined &&
+        !operationReceiptSchema.safeParse(value.operationReceipt).success
+      ) {
+        return failure('tool_result.operationReceipt must be a valid receipt')
+      }
+      return { ok: true, value: value as unknown as ClientMessage }
+    }
+    case 'operation_status': {
+      if (!hasOnlyKeys(value, ['type', 'requestId', 'result'])) {
+        return failure('operation_status contains unsupported fields')
+      }
+      if (!isNonEmptyString(value.requestId, MAX_IDENTIFIER_LENGTH)) {
+        return failure('operation_status.requestId must be a bounded non-empty string')
+      }
+      if (!operationStatusResultSchema.safeParse(value.result).success) {
+        return failure('operation_status.result must be a valid operation status')
+      }
       return { ok: true, value: value as unknown as ClientMessage }
     }
     case 'interrupt':
@@ -947,7 +1043,16 @@ export function parseServerMessage(value: unknown): ProtocolParseResult<ServerMe
       return { ok: true, value: value as unknown as ServerMessage }
     }
     case 'tool_call':
-      if (!hasOnlyKeys(value, ['type', 'callId', 'name', 'input'])) {
+      if (
+        !hasOnlyKeys(value, [
+          'type',
+          'callId',
+          'name',
+          'input',
+          'turnId',
+          'operation'
+        ])
+      ) {
         return failure('tool_call contains unsupported fields')
       }
       if (!isNonEmptyString(value.callId, MAX_IDENTIFIER_LENGTH)) {
@@ -955,6 +1060,49 @@ export function parseServerMessage(value: unknown): ProtocolParseResult<ServerMe
       }
       if (!isNonEmptyString(value.name, MAX_IDENTIFIER_LENGTH) || !CAD_TOOL_NAME_SET.has(value.name)) {
         return failure(`tool_call.name is not a registered CAD tool: ${String(value.name)}`)
+      }
+      if (
+        value.turnId !== undefined &&
+        !isNonEmptyString(value.turnId, MAX_IDENTIFIER_LENGTH)
+      ) {
+        return failure('tool_call.turnId must be a bounded non-empty string')
+      }
+      if (value.operation !== undefined) {
+        const operation = cadOperationRequestSchema.safeParse(value.operation)
+        if (!operation.success) {
+          return failure('tool_call.operation must be a valid CAD operation')
+        }
+        if (
+          !value.turnId ||
+          operation.data.turnId !== value.turnId ||
+          operation.data.toolName !== value.name
+        ) {
+          return failure('tool_call.operation identity must match its turn and tool')
+        }
+        if (!toolCallMayMutate(value.name, value.input)) {
+          return failure('read-only tool_call must not carry operation metadata')
+        }
+      }
+      return { ok: true, value: value as unknown as ServerMessage }
+    case 'get_operation_status':
+      if (
+        !hasOnlyKeys(value, [
+          'type',
+          'turnId',
+          'requestId',
+          'operationId'
+        ])
+      ) {
+        return failure('get_operation_status contains unsupported fields')
+      }
+      if (
+        !isNonEmptyString(value.turnId, MAX_IDENTIFIER_LENGTH) ||
+        !isNonEmptyString(value.requestId, MAX_IDENTIFIER_LENGTH) ||
+        !isNonEmptyString(value.operationId, MAX_IDENTIFIER_LENGTH)
+      ) {
+        return failure(
+          'get_operation_status identifiers must be bounded non-empty strings'
+        )
       }
       return { ok: true, value: value as unknown as ServerMessage }
     case 'status':

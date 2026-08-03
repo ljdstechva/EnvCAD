@@ -4,8 +4,27 @@ import {
   DEFAULT_BROWSER_CONNECTION,
   type AgentBridgeEvent
 } from '../bridge'
-import { MAX_WEBSOCKET_PAYLOAD_BYTES } from '../protocol'
+import {
+  ENVCAD_TURN_REVISION_FIELD,
+  MAX_WEBSOCKET_PAYLOAD_BYTES,
+  type SelectionSnapshot
+} from '../protocol'
+import {
+  beginCadDocumentOpen,
+  getCadSessionRevision,
+  getWorkspaceRevision,
+  setNoCadDocument
+} from '../../cad/session'
 import type { AiPreferences } from '../../../desktop/aiPreferences'
+import {
+  AGENT_PROTOCOL_VERSION,
+  MAX_INPUT_CHUNK_BYTES,
+  MAX_INLINE_TURN_TEXT_UTF8_BYTES
+} from '../../../shared/agent-contracts'
+import {
+  DurableTurnSession,
+  type KeyValueStorage
+} from '../runtime/DurableTurnSession'
 
 const providerCatalog = [
   {
@@ -76,6 +95,22 @@ const providerCatalog = [
   }
 ]
 
+function selection(ids: string[] = []): SelectionSnapshot {
+  return {
+    ids,
+    count: ids.length,
+    units: 'Meters',
+    revision: getCadSessionRevision()
+  }
+}
+
+function turnBound(input: Record<string, unknown>): Record<string, unknown> {
+  return {
+    ...input,
+    [ENVCAD_TURN_REVISION_FIELD]: getCadSessionRevision()
+  }
+}
+
 type Listener = (event: { data?: string }) => void
 
 class FakeBrowserWebSocket {
@@ -87,6 +122,7 @@ class FakeBrowserWebSocket {
 
   readyState = FakeBrowserWebSocket.CONNECTING
   sent: string[] = []
+  onSend: ((message: unknown) => void) | undefined
   private listeners = new Map<string, Listener[]>()
 
   constructor(
@@ -108,6 +144,7 @@ class FakeBrowserWebSocket {
 
   send(data: string) {
     this.sent.push(String(data))
+    this.onSend?.(JSON.parse(String(data)) as unknown)
   }
 
   close() {
@@ -124,8 +161,21 @@ class FakeBrowserWebSocket {
   }
 }
 
-async function configuredBridge() {
-  const bridge = new AgentBridge()
+class ControllableStorage implements KeyValueStorage {
+  readonly values = new Map<string, string>()
+  failWrites = false
+
+  getItem(key: string): string | null {
+    return this.values.get(key) ?? null
+  }
+
+  setItem(key: string, value: string): void {
+    if (this.failWrites) throw new Error('Injected browser storage failure.')
+    this.values.set(key, value)
+  }
+}
+
+async function configuredBridge(bridge = new AgentBridge()) {
   bridge.initializePreferences()
   bridge.connect()
   await vi.waitFor(() => expect(bridge.state.connectionState).toBe('online'))
@@ -150,6 +200,7 @@ async function configuredBridge() {
 describe('AgentBridge', () => {
   beforeEach(() => {
     FakeBrowserWebSocket.instances = []
+    localStorage.clear()
     vi.stubGlobal('WebSocket', FakeBrowserWebSocket)
     vi.spyOn(console, 'debug').mockImplementation(() => undefined)
   })
@@ -173,14 +224,22 @@ describe('AgentBridge', () => {
       type: 'tool_call',
       callId: 'call-1',
       name: 'draw_line',
-      input: { start: { x: 0, y: 0 }, end: { x: 20, y: 0 } }
+      input: turnBound({
+        start: { x: 0, y: 0 },
+        end: { x: 20, y: 0 }
+      })
     })
 
     await vi.waitFor(() => expect(socket.sent).toHaveLength(1))
     expect(JSON.parse(socket.sent[0])).toEqual({
       type: 'tool_result',
       callId: 'call-1',
-      result: { data: { entityId: 'line-1' } }
+      result: {
+        data: {
+          entityId: 'line-1',
+          revision: getWorkspaceRevision()
+        }
+      }
     })
     expect(events).toEqual([
       {
@@ -193,11 +252,131 @@ describe('AgentBridge', () => {
         type: 'tool_result',
         callId: 'call-1',
         name: 'draw_line',
-        result: { data: { entityId: 'line-1' } }
+        result: {
+          data: {
+            entityId: 'line-1',
+            revision: getWorkspaceRevision()
+          }
+        }
       }
     ])
 
     bridge.disconnect()
+  })
+
+  it('keeps the exact turn selection frozen in the browser and hides its ids from the wire', async () => {
+    const { bridge, socket } = await configuredBridge()
+    const ids = ['selected-a', 'selected-b']
+    const snapshot = selection(ids)
+    const handler = vi.fn(() => ({
+      data: { entities: [], count: snapshot.count }
+    }))
+    const events: AgentBridgeEvent[] = []
+    bridge.registerHandler('get_selected_entities', handler)
+    bridge.subscribe((event) => events.push(event))
+
+    bridge.sendUserMessage('inspect my selection', snapshot, {
+      paper: 'A3',
+      orientation: 'landscape',
+      scaleDenominator: 500,
+      drawingUnit: 'm'
+    })
+    expect(
+      bridge.sendUserMessage('replace the active turn', selection(['wrong']), {
+        paper: 'A3',
+        orientation: 'landscape',
+        scaleDenominator: 500,
+        drawingUnit: 'm'
+      })
+    ).toBe('replace the active turn')
+    expect(bridge.state.queuedMessages).toEqual([
+      expect.objectContaining({
+        text: 'replace the active turn',
+        status: 'queued'
+      })
+    ])
+    expect(socket.sent).toHaveLength(1)
+    ids.splice(0, ids.length, 'changed-after-send')
+    snapshot.ids.splice(0, snapshot.ids.length, 'also-changed')
+
+    expect(socket.sent[0]).not.toContain('selected-a')
+    expect(socket.sent[0]).not.toContain('selected-b')
+    socket.sent = []
+    socket.receive({
+      type: 'tool_call',
+      callId: 'selection-call',
+      name: 'get_selected_entities',
+      input: {
+        cursor: 0,
+        pageSize: 20,
+        [ENVCAD_TURN_REVISION_FIELD]: snapshot.revision
+      }
+    })
+
+    await vi.waitFor(() => expect(socket.sent).toHaveLength(1))
+    expect(handler).toHaveBeenCalledWith({
+      cursor: 0,
+      pageSize: 20,
+      ids: ['selected-a', 'selected-b']
+    })
+    expect(events).toContainEqual({
+      type: 'tool_call',
+      callId: 'selection-call',
+      name: 'get_selected_entities',
+      input: { cursor: 0, pageSize: 20 }
+    })
+    expect(JSON.parse(socket.sent[0])).toEqual({
+      type: 'tool_result',
+      callId: 'selection-call',
+      result: {
+        data: {
+          entities: [],
+          count: 2,
+          revision: getWorkspaceRevision()
+        }
+      }
+    })
+    bridge.disconnect()
+  })
+
+  it('rejects stale tool calls after a different drawing is opened', async () => {
+    const { bridge, socket } = await configuredBridge()
+    const snapshot = selection()
+    const handler = vi.fn(() => ({ data: { entities: [] } }))
+    bridge.registerHandler('list_entities', handler)
+    bridge.sendUserMessage('inspect the drawing', snapshot, {
+      paper: 'A3',
+      orientation: 'landscape',
+      scaleDenominator: 500,
+      drawingUnit: 'm'
+    })
+    socket.sent = []
+
+    beginCadDocumentOpen('replacement.dxf')
+    socket.receive({
+      type: 'tool_call',
+      callId: 'stale-call',
+      name: 'list_entities',
+      input: {
+        cursor: 0,
+        [ENVCAD_TURN_REVISION_FIELD]: snapshot.revision
+      }
+    })
+
+    await vi.waitFor(() => expect(socket.sent).toHaveLength(1))
+    expect(handler).not.toHaveBeenCalled()
+    expect(JSON.parse(socket.sent[0])).toEqual({
+      type: 'tool_result',
+      callId: 'stale-call',
+      result: {
+        error: expect.stringContaining(
+          'the drawing changed since this AI turn began'
+        )
+      }
+    })
+    expect(socket.sent[0]).toContain('No CAD change was made')
+    bridge.disconnect()
+    setNoCadDocument()
   })
 
   it('logs only bounded transport evidence for visual results', async () => {
@@ -232,7 +411,7 @@ describe('AgentBridge', () => {
       type: 'tool_call',
       callId: 'visual-1',
       name: 'inspect_sheet_preview',
-      input: { view: 'full' }
+      input: turnBound({ view: 'full' })
     })
     await vi.waitFor(() => expect(socket.sent).toHaveLength(1))
 
@@ -271,7 +450,7 @@ describe('AgentBridge', () => {
       type: 'tool_call',
       callId: 'visual-spoofed',
       name: 'inspect_sheet_preview',
-      input: { view: 'full' }
+      input: turnBound({ view: 'full' })
     })
     await vi.waitFor(() => expect(socket.sent).toHaveLength(1))
 
@@ -325,7 +504,7 @@ describe('AgentBridge', () => {
       expect(bridge.state.connectionState).toBe('online')
 
       FakeBrowserWebSocket.instances[0].close()
-      expect(bridge.state.connectionState).toBe('offline')
+      expect(bridge.state.connectionState).toBe('reconnecting')
       await vi.advanceTimersByTimeAsync(500)
       await Promise.resolve()
 
@@ -363,7 +542,10 @@ describe('AgentBridge', () => {
         type: 'tool_call',
         callId: 'stale-call',
         name: 'draw_line',
-        input: { start: { x: 0, y: 0 }, end: { x: 1, y: 0 } }
+        input: turnBound({
+          start: { x: 0, y: 0 },
+          end: { x: 1, y: 0 }
+        })
       })
       await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1))
 
@@ -371,11 +553,9 @@ describe('AgentBridge', () => {
       expect(bridge.state.status).toBe('idle')
       expect(bridge.state.streamingText).toBe('')
       expect(bridge.state.pendingToolCalls).toEqual([])
-      expect(events.at(-1)).toEqual({
-        type: 'connection_reset',
-        message:
-          'AI Assistant disconnected during the active turn. The incomplete response was not carried into the replacement conversation.'
-      })
+      expect(
+        events.some((event) => event.type === 'connection_reset')
+      ).toBe(false)
 
       await vi.advanceTimersByTimeAsync(500)
       await Promise.resolve()
@@ -417,8 +597,18 @@ describe('AgentBridge', () => {
 
     // Both arrive before either has finished, as they would from one
     // assistant turn that emits parallel tool calls.
-    socket.receive({ type: 'tool_call', callId: 'call-1', name: 'move_entities', input: {} })
-    socket.receive({ type: 'tool_call', callId: 'call-2', name: 'copy_entities', input: {} })
+    socket.receive({
+      type: 'tool_call',
+      callId: 'call-1',
+      name: 'move_entities',
+      input: turnBound({})
+    })
+    socket.receive({
+      type: 'tool_call',
+      callId: 'call-2',
+      name: 'copy_entities',
+      input: turnBound({})
+    })
 
     await vi.waitFor(() => expect(release).toHaveLength(1))
     expect(running).toEqual(['move_entities'])
@@ -555,10 +745,10 @@ describe('AgentBridge', () => {
       newConversation: true
     })
     expect(bridge.state.configurationReady).toBe(false)
-    expect(() =>
+    expect(
       bridge.sendUserMessage(
         'draw',
-        { ids: [], count: 0, units: 'Meters' },
+        selection(),
         {
           paper: 'A3',
           orientation: 'landscape',
@@ -566,7 +756,8 @@ describe('AgentBridge', () => {
           drawingUnit: 'm'
         }
       )
-    ).toThrow('Wait for the selected provider')
+    ).toBe('draw')
+    expect(bridge.state.queuedMessages).toHaveLength(1)
 
     socket.receive({
       type: 'ai_configuration_applied',
@@ -575,19 +766,13 @@ describe('AgentBridge', () => {
       newConversation: true
     })
     expect(bridge.state.configurationReady).toBe(true)
-    bridge.sendUserMessage(
-      'draw',
-      { ids: [], count: 0, units: 'Meters' },
-      {
-        paper: 'A3',
-        orientation: 'landscape',
-        scaleDenominator: 500,
-        drawingUnit: 'm'
-      }
-    )
+    await vi.waitFor(() => expect(bridge.state.queuedMessages).toHaveLength(0))
     expect(JSON.parse(socket.sent.at(-1)!)).toMatchObject({
-      type: 'user_message',
-      configurationRevision: latest.revision
+      protocolVersion: 2,
+      payload: {
+        type: 'submit_turn',
+        configurationRevision: latest.revision
+      }
     })
     bridge.disconnect()
   })
@@ -600,7 +785,7 @@ describe('AgentBridge', () => {
 
     bridge.sendUserMessage(
       text,
-      { ids: [], count: 0, units: 'Meters' },
+      selection(),
       {
         paper: 'A3',
         orientation: 'landscape',
@@ -610,16 +795,18 @@ describe('AgentBridge', () => {
     )
 
     expect(socket.sent).toHaveLength(1)
-    expect(JSON.parse(socket.sent[0]).text).toBe(text)
-    expect(bridge.state.messages).toEqual([{ role: 'user', text }])
+    expect(JSON.parse(socket.sent[0]).payload.text).toBe(text)
+    expect(bridge.state.messages).toEqual([
+      expect.objectContaining({ role: 'user', text })
+    ])
     expect(
       JSON.stringify(vi.mocked(console.debug).mock.calls)
     ).not.toContain('BEGIN-SENTINEL')
     bridge.disconnect()
   })
 
-  it('enforces the complete serialized 2 MiB request boundary without disconnecting', async () => {
-    const selectionSnapshot = { ids: [], count: 0, units: 'Meters' }
+  it('keeps boundary text inline and ingests larger text by local reference', async () => {
+    const selectionSnapshot = selection()
     const sheet = {
       paper: 'A3' as const,
       orientation: 'landscape' as const,
@@ -627,93 +814,235 @@ describe('AgentBridge', () => {
       drawingUnit: 'm'
     }
     const accepted = await configuredBridge()
-    const emptyMessage = {
-      type: 'user_message',
-      text: '',
-      selectionSnapshot,
-      sheet,
-      configurationRevision: accepted.revision
-    }
-    const overheadBytes = new TextEncoder().encode(
-      JSON.stringify(emptyMessage)
-    ).byteLength
-    const exactBoundaryText = 'x'.repeat(
-      MAX_WEBSOCKET_PAYLOAD_BYTES - overheadBytes
-    )
+    const exactBoundaryText = 'x'.repeat(MAX_INLINE_TURN_TEXT_UTF8_BYTES)
 
     accepted.bridge.sendUserMessage(
       exactBoundaryText,
       selectionSnapshot,
       sheet
     )
-    expect(new TextEncoder().encode(accepted.socket.sent[0]).byteLength).toBe(
-      MAX_WEBSOCKET_PAYLOAD_BYTES
+    expect(JSON.parse(accepted.socket.sent[0]).payload.text).toBe(
+      exactBoundaryText
     )
+    expect(
+      new TextEncoder().encode(accepted.socket.sent[0]).byteLength
+    ).toBeLessThan(MAX_WEBSOCKET_PAYLOAD_BYTES)
     expect(accepted.socket.readyState).toBe(FakeBrowserWebSocket.OPEN)
     accepted.bridge.disconnect()
+    localStorage.clear()
 
-    const rejected = await configuredBridge()
-    const consoleError = vi
-      .spyOn(console, 'error')
-      .mockImplementation(() => undefined)
-    expect(() =>
-      rejected.bridge.sendUserMessage(
-        `${exactBoundaryText}x`,
+    const referenced = await configuredBridge()
+    let serverSequence = 0
+    let receivedBytes = 0
+    let receivedChunks = 0
+    let committedSha = ''
+    referenced.socket.onSend = (message) => {
+      if (
+        !message ||
+        typeof message !== 'object' ||
+        !('payload' in message)
+      ) {
+        return
+      }
+      const envelope = message as {
+        sessionId: string
+        payload: Record<string, unknown>
+      }
+      const payload = envelope.payload
+      const inputId = payload.inputId as string | undefined
+      if (!inputId || !String(payload.type).startsWith('input_')) return
+      let response: Record<string, unknown> | undefined
+      if (payload.type === 'input_begin') {
+        response = {
+          type: 'input_progress',
+          inputId,
+          receivedBytes,
+          receivedChunks,
+          status: 'receiving'
+        }
+      } else if (payload.type === 'input_chunk') {
+        receivedBytes += Buffer.from(
+          payload.bytesBase64 as string,
+          'base64'
+        ).length
+        receivedChunks += 1
+        response = {
+          type: 'input_progress',
+          inputId,
+          receivedBytes,
+          receivedChunks,
+          status: 'receiving'
+        }
+      } else if (payload.type === 'input_commit') {
+        committedSha = payload.sha256 as string
+        response = {
+          type: 'input_committed',
+          reference: {
+            inputId,
+            sha256: committedSha,
+            mediaType: 'text/plain',
+            byteLength: receivedBytes,
+            characterLength: receivedBytes,
+            chunkCount: receivedChunks,
+            sourceName: 'composer-instruction.txt'
+          }
+        }
+      }
+      if (!response) return
+      referenced.socket.receive({
+        protocolVersion: AGENT_PROTOCOL_VERSION,
+        sessionId: envelope.sessionId,
+        messageId: `input-response-${++serverSequence}`,
+        sequence: serverSequence,
+        timestamp: '2026-07-29T08:00:00.000Z',
+        payload: response
+      })
+    }
+    const largeText = `${exactBoundaryText}x`
+    await expect(
+      referenced.bridge.sendUserMessage(
+        largeText,
         selectionSnapshot,
         sheet
       )
-    ).toThrow('complete AI request')
-    expect(rejected.socket.sent).toEqual([])
-    expect(rejected.socket.readyState).toBe(FakeBrowserWebSocket.OPEN)
-    expect(rejected.bridge.state.messages.some((message) => message.role === 'user')).toBe(
-      false
+    ).resolves.toContain('Large instruction stored locally')
+
+    const sent = referenced.socket.sent.map((value) => JSON.parse(value))
+    const chunkCount = Math.ceil(
+      Buffer.byteLength(largeText, 'utf8') / MAX_INPUT_CHUNK_BYTES
     )
-    expect(consoleError).toHaveBeenCalledWith(
-      expect.stringContaining('2 MiB transport capacity')
-    )
-    rejected.bridge.disconnect()
+    expect(sent.map((message) => message.payload.type)).toEqual([
+      'input_begin',
+      ...Array.from({ length: chunkCount }, () => 'input_chunk'),
+      'input_commit',
+      'submit_turn'
+    ])
+    expect(sent.at(-1)?.payload).toMatchObject({
+      type: 'submit_turn',
+      instructionInputId: `input-${committedSha}`,
+      referenceInputIds: []
+    })
+    expect(sent.at(-1)?.payload).not.toHaveProperty('text')
+    expect(referenced.bridge.state.messages[0].text.length).toBeLessThan(4_000)
+    expect(referenced.socket.readyState).toBe(FakeBrowserWebSocket.OPEN)
+    referenced.bridge.disconnect()
   })
 
-  it('lets selection context dynamically reduce prompt transport capacity', async () => {
+  it('keeps arbitrarily large frozen selections browser-local', async () => {
     const sheet = {
       paper: 'A3' as const,
       orientation: 'landscape' as const,
       scaleDenominator: 500,
       drawingUnit: 'm'
     }
-    const emptySelection = { ids: [], count: 0, units: 'Meters' }
-    const accepted = await configuredBridge()
-    const baseline = JSON.stringify({
-      type: 'user_message',
-      text: '',
-      selectionSnapshot: emptySelection,
-      sheet,
-      configurationRevision: accepted.revision
-    })
-    const prompt = 'p'.repeat(
-      MAX_WEBSOCKET_PAYLOAD_BYTES -
-        new TextEncoder().encode(baseline).byteLength -
-        1_000
-    )
-    accepted.bridge.sendUserMessage(prompt, emptySelection, sheet)
-    expect(accepted.socket.sent).toHaveLength(1)
-    accepted.bridge.disconnect()
-
-    const rejected = await configuredBridge()
     const ids = Array.from(
-      { length: 100 },
+      { length: 20_000 },
       (_, index) => `selected-entity-${index.toString().padStart(3, '0')}`
     )
-    vi.spyOn(console, 'error').mockImplementation(() => undefined)
-    expect(() =>
-      rejected.bridge.sendUserMessage(
-        prompt,
-        { ids, count: ids.length, units: 'Meters' },
-        sheet
-      )
-    ).toThrow('complete AI request')
-    expect(rejected.socket.sent).toEqual([])
-    rejected.bridge.disconnect()
+    const accepted = await configuredBridge()
+    accepted.bridge.sendUserMessage('inspect these', selection(ids), sheet)
+    expect(accepted.socket.sent).toHaveLength(1)
+    const wire = JSON.parse(accepted.socket.sent[0])
+    expect(wire.payload.selectionSnapshot).toEqual({
+      count: ids.length,
+      units: 'Meters',
+      revision: getWorkspaceRevision()
+    })
+    expect(accepted.socket.sent[0]).not.toContain(ids[0])
+    expect(accepted.socket.sent[0]).not.toContain(ids.at(-1))
+    expect(new TextEncoder().encode(accepted.socket.sent[0]).byteLength).toBeLessThan(
+      1_000
+    )
+    accepted.bridge.disconnect()
+  })
+
+  it('keeps the pre-terminal cursor durable when clearing the terminal turn fails', async () => {
+    const storage = new ControllableStorage()
+    const turnSession = new DurableTurnSession({ storage })
+    const bridge = new AgentBridge({ turnSession })
+    const { socket } = await configuredBridge(bridge)
+    const sheet = {
+      paper: 'A3' as const,
+      orientation: 'landscape' as const,
+      scaleDenominator: 500,
+      drawingUnit: 'm'
+    }
+    bridge.sendUserMessage('Preserve this turn across a crash.', selection(), sheet)
+    const submit = JSON.parse(socket.sent[0])
+    const turnId = submit.turnId as string
+    const sessionId = submit.sessionId as string
+    const workspaceRevision = submit.payload.selectionSnapshot.revision
+    const transition = {
+      turnId,
+      revision: workspaceRevision,
+      revisionTransition: 'same-document',
+      activeSkillIds: ['cad-core', 'dxf-core'],
+      provider: 'claude-code',
+      elapsedMs: 2,
+      status: 'Accepted.'
+    }
+    const durableEvent = (sequence: number, payload: unknown) => ({
+      protocolVersion: AGENT_PROTOCOL_VERSION,
+      sessionId,
+      messageId: `server-${sequence}`,
+      turnId,
+      sequence,
+      timestamp: '2026-07-29T08:00:00.000Z',
+      payload
+    })
+
+    socket.receive(
+      durableEvent(1, {
+        type: 'turn_accepted',
+        ...transition,
+        messageId: submit.messageId,
+        phase: 'accepted'
+      })
+    )
+    socket.receive(
+      durableEvent(2, {
+        type: 'assistant_text_delta',
+        turnId,
+        text: 'Durable partial output.'
+      })
+    )
+    await vi.waitFor(() =>
+      expect(turnSession.activeTurn).toMatchObject({
+        lastServerSequence: 2,
+        streamingText: 'Durable partial output.'
+      })
+    )
+
+    storage.failWrites = true
+    socket.receive(
+      durableEvent(3, {
+        type: 'turn_finished',
+        ...transition,
+        phase: 'completed',
+        outcome: 'completed',
+        status: 'Completed.',
+        finalRevision: workspaceRevision,
+        metrics: { totalMs: 5, toolCalls: 0 }
+      })
+    )
+    await vi.waitFor(() =>
+      expect(bridge.state.terminalOutcome).toBe('completed')
+    )
+
+    storage.failWrites = false
+    const restored = new DurableTurnSession({ storage })
+    expect(restored.activeTurn).toMatchObject({
+      turnId,
+      lastServerSequence: 2,
+      streamingText: 'Durable partial output.'
+    })
+    expect(
+      restored.command(
+        { type: 'resume_turn', turnId, lastSequence: 2 },
+        turnId
+      ).payload
+    ).toEqual({ type: 'resume_turn', turnId, lastSequence: 2 })
+    bridge.disconnect()
   })
 
   it('keeps refresh pending through cached capabilities and blocks duplicate refreshes and chat', async () => {
@@ -744,10 +1073,10 @@ describe('AgentBridge', () => {
       { type: 'refresh_ai_capabilities' }
     ])
     expect(bridge.state.refreshingCapabilities).toBe(true)
-    expect(() =>
+    expect(
       bridge.sendUserMessage(
         'draw',
-        { ids: [], count: 0, units: 'Meters' },
+        selection(),
         {
           paper: 'A3',
           orientation: 'landscape',
@@ -755,9 +1084,8 @@ describe('AgentBridge', () => {
           drawingUnit: 'm'
         }
       )
-    ).toThrow(
-      'Wait for the selected provider, model, and effort to be confirmed before sending.'
-    )
+    ).toBe('draw')
+    expect(bridge.state.queuedMessages).toHaveLength(1)
 
     socket.receive({
       type: 'ai_capabilities',
@@ -772,6 +1100,7 @@ describe('AgentBridge', () => {
     })
     expect(bridge.state.refreshingCapabilities).toBe(false)
     expect(bridge.state.configurationReady).toBe(true)
+    await vi.waitFor(() => expect(bridge.state.queuedMessages).toHaveLength(0))
     bridge.disconnect()
   })
 
@@ -805,10 +1134,10 @@ describe('AgentBridge', () => {
     expect(reset.revision).toBeGreaterThan(initial.revision)
     expect(bridge.state.configurationReady).toBe(false)
     expect(bridge.state.messages).toHaveLength(1)
-    expect(() =>
+    expect(
       bridge.sendUserMessage(
         'draw',
-        { ids: [], count: 0, units: 'Meters' },
+        selection(),
         {
           paper: 'A3',
           orientation: 'landscape',
@@ -816,7 +1145,8 @@ describe('AgentBridge', () => {
           drawingUnit: 'm'
         }
       )
-    ).toThrow('Wait for the selected provider')
+    ).toBe('draw')
+    expect(bridge.state.queuedMessages).toHaveLength(1)
 
     socket.receive({
       type: 'ai_configuration_applied',
@@ -826,7 +1156,10 @@ describe('AgentBridge', () => {
     })
     expect(bridge.state.configurationReady).toBe(true)
     expect(bridge.state.appliedRevision).toBe(reset.revision)
-    expect(bridge.state.messages).toHaveLength(0)
+    await vi.waitFor(() => expect(bridge.state.queuedMessages).toHaveLength(0))
+    expect(bridge.state.messages).toEqual([
+      expect.objectContaining({ role: 'user', text: 'draw' })
+    ])
     bridge.disconnect()
   })
 

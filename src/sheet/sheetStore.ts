@@ -1,5 +1,8 @@
 import { reactive, watch } from 'vue'
-import type { CadDrawingUnit } from '../cad/session'
+import {
+  markCadSessionSheetEdited,
+  type CadDrawingUnit
+} from '../cad/session'
 import type { SheetDefinition } from './types'
 
 const SHEET_STORAGE_VERSION = 1
@@ -38,6 +41,7 @@ watch(
   () => sheetStore.current,
   (sheet) => {
     if (persistenceSuspended || !activeDocumentName) return
+    markCadSessionSheetEdited()
     writePersistedSheet(activeDocumentName, sheet)
   },
   { deep: true, flush: 'sync' }

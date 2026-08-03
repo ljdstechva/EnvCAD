@@ -1,352 +1,291 @@
 # EnvCAD AI Assistant protocol
 
-This document describes the v0.2.3 renderer-to-sidecar contract. The protocol is
-provider-neutral: Claude Code and OpenAI Codex share configuration, lifecycle,
-streaming, metrics, and CAD tool messages.
+Status: protocol v2 is the durable production path. Protocol v1 remains only as
+a bounded compatibility adapter while older benchmark and acceptance harnesses
+are migrated.
 
-`inspect_sheet_preview` is the only CAD tool permitted to return an image. Its
-successful result contains bounded text metadata and one validated PNG or WebP
-payload from the same final SVG used by the Sheet Preview UI. Claude receives
-that payload as an MCP image content block; Codex receives it as a dynamic-tool
-`inputImage` data URL. The renderer and sidecar independently reject malformed,
-oversized, stale, non-tool-associated, resource-bearing, or digest-spoofed
-image results.
+The contract is provider-neutral and lives in `shared/agent-contracts/`.
+Renderer code does not import sidecar tool definitions.
 
 ## Transport and authentication
 
-The packaged renderer connects to a random loopback WebSocket port created by
-the Electron utility process. The HTTP upgrade must satisfy all three checks:
+The packaged renderer connects to a random loopback WebSocket owned by the
+Electron utility process. The upgrade requires:
 
-1. exact renderer `Origin`;
-2. subprotocol `envcad.v1`;
+1. the exact random renderer origin;
+2. the `envcad.v1` transport subprotocol; and
 3. a per-launch `envcad.session.<token>` subprotocol.
 
-The 256-bit token exists only in Electron main/preload/utility-process memory.
-Complete serialized WebSocket messages are limited to 2 MiB, including prompt
-text, the selection snapshot, and sheet context. The renderer measures the exact
-UTF-8 serialization before sending, so an oversized request is rejected locally
-without clearing the draft or reconnecting. This is a dynamic transport boundary,
-not a prompt character limit. The app-server used by Codex is stdio-only and
-never exposes a network port.
+The transport name remains `envcad.v1` for compatibility; it can carry the
+versioned protocol-v2 envelopes described below. The token stays in
+main/preload/utility-process memory and rotates whenever the supervised sidecar
+restarts.
 
-Every decoded object is strict: unknown fields, unknown message types, invalid
-provider IDs, non-canonical tool names, unsupported effort values, and
-unbounded metadata strings/arrays are rejected. `user_message.text` is the sole
-unbounded string surface: it must contain a non-whitespace character and is
-preserved exactly, subject only to the complete-message transport boundary.
+Complete serialized WebSocket frames are bounded. Large source content never
+relies on raising that bound: it uses the chunked local-input protocol.
+Selection IDs remain renderer-local until an authorized selection query runs.
 
-## Capability and configuration lifecycle
+Every decoded object uses a strict schema. Unknown message types, fields,
+providers, tool names, revisions, or unbounded metadata are rejected. Raw Zod,
+JSON-RPC, CLI, SDK, and stack-trace text is not projected into normal chat.
 
-The utility process starts even when neither provider is installed. It sends an
-initial catalog with `checking` statuses, discovers both providers concurrently,
-then sends provider-specific updates.
+## Versioned envelopes
 
-Client:
+Every protocol-v2 command and event is wrapped as:
 
-```json
-{ "type": "refresh_ai_capabilities" }
-```
-
-Server:
-
-```json
-{
-  "type": "ai_capabilities",
-  "refreshing": false,
-  "providers": [
-    {
-      "id": "claude-code",
-      "displayName": "Claude Code",
-      "status": "ready",
-      "statusMessage": "Claude Code is ready.",
-      "executableVersion": "2.1.220",
-      "discoveryMs": 820,
-      "models": [
-        {
-          "id": "default",
-          "invocationName": "default",
-          "resolvedModel": "claude-opus-5",
-          "displayName": "Default",
-          "description": "Provider description",
-          "supportedEfforts": [
-            {
-              "value": "high",
-              "displayName": "High",
-              "isDefault": true
-            }
-          ],
-          "defaultEffort": "high",
-          "isDefault": true
-        }
-      ]
-    }
-  ]
+```ts
+interface MessageEnvelope<T> {
+  protocolVersion: 2
+  sessionId: string
+  messageId: string
+  turnId?: string
+  sequence: number
+  timestamp: string
+  payload: T
 }
 ```
 
-The cached catalog uses `"refreshing": true`; the final catalog always uses
-`"refreshing": false`. Discovery is single-flight. While either the initial
-discovery or a manual refresh is pending, the renderer and sidecar both reject
-turns and configuration changes so an in-flight catalog cannot invalidate a
-conversation silently.
+Client-command and server-event sequences are monotonic within their session.
+They are separate sequence spaces. Stable message IDs make journal appends
+idempotent.
 
-An individual discovery completion is:
+All CAD-sensitive commands carry the full workspace revision:
 
-```json
-{ "type": "ai_provider_status", "provider": { "...": "ProviderCapability" } }
-```
-
-Statuses are `checking`, `ready`, `missing`, `authentication-required`,
-`incompatible`, or `failed`. Unavailable providers remain visible. One provider
-failure does not disable the other provider or CAD editing.
-
-Configuration is revisioned:
-
-```json
-{
-  "type": "set_ai_configuration",
-  "revision": 7,
-  "configuration": {
-    "provider": "openai-codex",
-    "model": "gpt-5.6-sol",
-    "effort": "high"
-  }
+```ts
+interface WorkspaceRevision {
+  documentId: string
+  documentRevision: number
+  contentRevision: number
+  sheetRevision: number
+  viewRevision: number
 }
 ```
 
-The sidecar validates the provider, live model invocation name, and advertised
-effort before closing the old conversation and creating the new one. It replies:
-
-```json
-{
-  "type": "ai_configuration_applied",
-  "revision": 7,
-  "configuration": {
-    "provider": "openai-codex",
-    "model": "gpt-5.6-sol",
-    "effort": "high"
-  },
-  "newConversation": true
-}
-```
-
-or:
-
-```json
-{
-  "type": "ai_configuration_rejected",
-  "revision": 7,
-  "message": "OpenAI Codex does not support effort \"max\" for this model."
-}
-```
-
-The renderer ignores stale acknowledgements and cannot send a prompt until its
-latest revision is applied. Provider/model/effort changes are rejected while a
-turn is running.
-
-If the authenticated sidecar socket drops during a turn, the renderer ends the
-partial response, resets its local turn state, and starts a replacement
-conversation after reconnecting. Late messages and CAD-tool results remain
-bound to the old socket and are never forwarded into the replacement session.
-
-Starting a new chat also uses a revision, so input stays disabled while the old
-provider conversation is closed and a replacement is created:
-
-```json
-{ "type": "reset", "revision": 8 }
-```
-
-Completion is the same `ai_configuration_applied` message with revision 8 and
-`newConversation: true`.
-
-## Turns
-
-The renderer sends the exact applied revision:
-
-```json
-{
-  "type": "user_message",
-  "text": "Move these five metres east.",
-  "configurationRevision": 8,
-  "selectionSnapshot": {
-    "ids": ["3A", "3B"],
-    "count": 2,
-    "units": "Meters"
-  },
-  "sheet": {
-    "paper": "A3",
-    "orientation": "landscape",
-    "scaleDenominator": 500,
-    "drawingUnit": "m"
-  }
-}
-```
-
-Selection is frozen when the message is sent. `get_selected_entities` substitutes
-those IDs in the sidecar; a model cannot change them.
-
-Streaming messages:
-
-```json
-{ "type": "status", "state": "thinking" }
-{ "type": "assistant_text_delta", "text": "I’ll move the two entities. " }
-```
-
-Completion includes the actual provider configuration and monotonic metrics:
-
-```json
-{
-  "type": "assistant_done",
-  "provider": "openai-codex",
-  "model": "gpt-5.6-sol",
-  "effort": "high",
-  "metrics": {
-    "providerReadyMs": 810,
-    "conversationStartupMs": 310,
-    "firstTextMs": 950,
-    "firstToolCallMs": 1310,
-    "totalMs": 4720,
-    "toolCalls": 1,
-    "retries": 0,
-    "inputTokens": 840,
-    "outputTokens": 95
-  }
-}
-{ "type": "status", "state": "idle" }
-```
-
-Token counts are omitted when a provider does not report them. Hidden reasoning
-is never transported to the renderer.
-
-Interruption is:
-
-```json
-{ "type": "interrupt" }
-```
-
-## CAD tool forwarding
-
-Both provider adapters are generated from `sidecar/src/cadToolSpecs.ts`. A tool
-definition contains one strict Zod object schema, its generated Draft 7 JSON
-Schema, description, timeout, and browser bridge handler.
-
-Sidecar to renderer:
-
-```json
-{
-  "type": "tool_call",
-  "callId": "f8eb...",
-  "name": "draw_rectangle",
-  "input": {
-    "corner1": { "x": 0, "y": 0 },
-    "corner2": { "x": 20, "y": 10 },
-    "layer": "AI_BENCHMARK"
-  }
-}
-```
-
-Renderer to sidecar:
-
-```json
-{
-  "type": "tool_result",
-  "callId": "f8eb...",
-  "result": {
-    "data": {
-      "entityIds": ["42"],
-      "corner1": { "x": 0, "y": 0 },
-      "corner2": { "x": 20, "y": 10 },
-      "layer": "AI_BENCHMARK"
-    }
-  }
-}
-```
-
-A failure uses `{ "result": { "error": "..." } }`; `data` and `error` are
-mutually exclusive. Invalid arguments are rejected before browser dispatch.
-Unknown call IDs and tool names are protocol errors.
-
-Tool calls are serialized in both sidecar and renderer. Each mutating browser
-handler opens and commits one database transaction, preserving one-call/one-undo
-semantics. A tool failure stops the provider workflow rather than becoming a
-successful model observation.
-
-The canonical catalog contains CAD operations only. It has no filesystem,
-shell, process, network, web, connector, app, plugin, skill, or subagent tool.
-
-### Sheet Preview image integrity
-
-`inspect_sheet_preview` may return exactly one `image` object and no other tool
-may return one. The payload is canonical Base64 PNG or WebP and is limited to
-1,179,648 decoded bytes. The protocol accepts dimensions up to 4,096 pixels per
-side and 16,777,216 total pixels; EnvCAD's rasterizer targets a 1,400-pixel
-longest side and will not shrink below 700 pixels merely to fit the byte limit.
-Declared byte length, MIME header, dimensions, aspect ratio, capture ID, render
-revision, and lowercase SHA-256 are mandatory.
-
-The renderer structurally validates the result and then recomputes SHA-256 with
-Web Crypto immediately before WebSocket send. The sidecar repeats structural
-validation and independently recomputes SHA-256 from the decoded bytes before
-the provider adapter can observe the image. Either mismatch becomes a tool
-failure. The image is generated in memory from the singleton Sheet Preview
-service's final SVG; no temporary image file or arbitrary screen capture is
-used.
-
-## Provider boundaries
-
-Claude:
-
-- installed Claude Code subscription login only;
-- `tools: []`;
-- `allowedTools: ["mcp__cad__*"]`;
-- `permissionMode: "dontAsk"`;
-- no settings sources, skills, plugins, or built-in tools;
-- one streaming-input SDK query per in-app conversation;
-- `persistSession: false`, with no disk-backed `resume`.
-
-Claude preview payloads therefore remain in the live SDK stream and are not
-written to `~/.claude/projects`. On upgrade, EnvCAD removes only legacy Claude
-project directories whose key exactly matches an EnvCAD-owned
-`%LOCALAPPDATA%\EnvCAD\ai-runtime\session-*` directory.
-
-Codex:
-
-- installed Codex CLI ChatGPT login only;
-- `codex app-server --stdio`, experimental dynamic tools;
-- process launch pins the `openai` model provider and official ChatGPT backend;
-- zero-turn `account/read` re-attests ChatGPT authentication before model
-  discovery and every conversation;
-- empty `%LOCALAPPDATA%\EnvCAD\ai-runtime\session-*` working directory;
-- read-only sandbox, `never` approvals, no model fallback;
-- project instructions/context disabled;
-- a short-lived, zero-turn `config/read` probe extracts only validated MCP
-  server property names and closes before production startup;
-- a new production process disables every discovered MCP at both process and
-  thread scope;
-- production `config/read` plus bounded `mcpServerStatus/list` pagination proves
-  every user MCP is disabled and inert and rejects unexpected surfaces such as
-  `codex_apps` before account/model access or conversation startup;
-- shell, web, apps, connectors, plugins, skills, remote control, and
-  multi-agent features disabled.
-
-Codex `thread/started` and `thread/settings/updated` are validated against the
-official model provider, expected model, effort, working directory, approval
-policy, read-only/no-network sandbox, and explicit-request-only multi-agent
-mode. Logout or any alternate authentication update fails closed. Command,
-file-change, web, app, connector, MCP, or subagent events interrupt and fail the
+Document replacement is explicit. Component revisions cannot regress inside a
 turn.
 
-## Preferences
+## Durable turns
 
-The renderer does not use `localStorage` for AI selection. A narrow preload API
-loads/saves strict JSON under Electron `userData`:
+The renderer assigns `messageId` and `turnId` before send. The sidecar journals
+the draft and accepted event before emitting `turn_accepted`. Acceptance does
+not wait for provider startup or another model call.
 
-- selected provider;
-- last selected model per provider;
-- last effort per provider/model;
-- optional benchmark recommendations;
-- schema version.
+Normal phases are:
 
-Writes use a temporary file and atomic replacement. Credentials and secret-like
-strings are rejected. Corrupt files recover to the existing-user Claude Code
-default without automatically sending a message.
+```text
+draft -> accepted -> ingesting -> briefing -> planning -> inspecting
+      -> executing -> verifying -> completed
+
+active -> recovering -> retrying | degraded | needs-input | failed
+active -> cancelled
+```
+
+Each progress event contains the turn ID, sequence, timestamp, workspace
+revision, active skill IDs, provider, elapsed time, and safe status. The local
+instruction breakdown is a separate event and contains objective, inputs,
+constraints, required context, planned tool categories, expected output, and
+risk.
+
+Every accepted turn emits exactly one `turn_finished`:
+
+```ts
+type TurnOutcome =
+  | 'completed'
+  | 'recovered'
+  | 'needs-input'
+  | 'cancelled'
+  | 'failed'
+```
+
+A failed or cancelled v2 turn never emits legacy `assistant_done`. Duplicate
+submission replays journaled events and never re-executes the provider or a CAD
+mutation.
+
+`resume_session` supplies the session, active turn, and last received server
+sequence. The sidecar returns only later events. WebSocket loss does not clear
+the active turn. Partial text, progress, skills, receipts, and terminal state
+are rebuilt by `TurnProjection`.
+
+The Electron main process owns checksummed turn journals under
+`userData/agent-journal-v2`. On Windows, active renderer cursor/session state,
+composer drafts, and queued messages are also atomically mirrored into two
+fixed, allowlisted files encrypted with Electron `safeStorage`. This permits
+recovery when a restart changes the renderer's random loopback origin.
+
+## Structured failures
+
+Terminal errors use the shared failure taxonomy:
+
+```ts
+type FailureKind =
+  | 'validation'
+  | 'domain'
+  | 'stale-workspace'
+  | 'transient-tool'
+  | 'transient-provider'
+  | 'rate-limit'
+  | 'authentication'
+  | 'permission'
+  | 'security'
+  | 'cancelled'
+  | 'unknown-operation'
+```
+
+Each failure has a stable code, safe user message, retryability, optional field
+corrections and retry delay, and explicit recovery actions. Developer details
+remain in redacted diagnostics.
+
+Recovery is bounded: argument correction, same-provider retry, conversation
+recreation, provider/runtime restart, consented cross-provider fallback,
+database-only degradation, then an actionable terminal. Security failures fail
+closed. Cross-provider fallback is disabled by default and is never permitted
+for unresolved mutations.
+
+## Large input
+
+Inline turn text is limited to 128 KiB of UTF-8 so provider context has room for
+instructions and bounded tool results. This is not a composer character limit.
+Larger instructions and attachments use:
+
+```text
+input_begin
+input_chunk
+input_commit
+input_abort
+```
+
+Chunks decode to at most 256 KiB. Every chunk and committed artifact has a
+SHA-256 digest. The default local quota is 1 GiB with an additional free-space
+reserve. Capacity is checked before provider execution.
+
+A committed artifact returns an `InputReference` with exact bytes, UTF-8
+character length when applicable, chunk count, media type, source name, and
+complete digest. Authoritative bytes remain local until explicitly cleared.
+Classification uses only a bounded local preview.
+
+Providers can request only:
+
+- `get_input_metadata`
+- `get_input_outline`
+- `search_input`
+- `read_input_chunk`
+- `read_input_range`
+
+Reads are bounded and restricted to input IDs attached to the active turn.
+Valid UTF-8 ranges return text without duplicate Base64. Binary ranges return
+Base64 without lossy text. Summaries are never authoritative.
+
+`ContextBudgetManager` reserves output capacity, counts static instructions,
+the current prompt, tool metadata, and image capacity, and refuses unsafe
+results. A write result's maximum size is reserved before mutation so context
+exhaustion cannot turn a committed edit into a provider error.
+
+## Skills and capability broker
+
+The sidecar verifies and compiles pinned skill manifests once at startup.
+`cad-core` and `dxf-core` activate before every accepted turn. Local
+classification conditionally activates drawing analysis, geometry, layers,
+annotations, sheets, imports, environmental siting, and visual QA. Activation
+events include name, semantic version, provenance digest status, and time.
+
+A mandatory integrity failure blocks AI writes while manual CAD, conversation,
+and diagnostics remain available.
+
+`CapabilityBroker` is the only provider-to-application boundary. It:
+
+- starts from the neutral canonical manifest;
+- restricts tools to verified active skills and available capabilities;
+- validates strict inputs;
+- rechecks skill integrity before every write;
+- applies manifest timeout and output limits;
+- enforces context capacity;
+- records redacted allow/deny audit events; and
+- delegates only to native CAD, the drawing read model, revision-bound vision,
+  or active-turn input retrieval.
+
+Providers never receive user MCP configuration, shell, filesystem, web,
+connector, plugin, app, skill, or subagent authority. Claude's MCP server
+registers only broker-permitted tools for the active intent. Codex currently
+attaches dynamic tools at `thread/start`, the only point supported by the
+installed app-server schema; its static thread catalog is still guarded on
+every invocation by the same intent-scoped broker. Changing that catalog
+mid-thread is deferred until the upstream interface can do so without losing
+conversation continuity.
+
+## Exactly-once mutations
+
+Every mutating tool is converted to a `CadOperationRequest` containing:
+
+- stable turn, operation, and operation-group IDs;
+- deterministic idempotency key and arguments hash;
+- complete expected workspace revision; and
+- deadline.
+
+The renderer's single-writer `OperationCoordinator`:
+
+1. returns the prior receipt for a repeated idempotency key;
+2. blocks while any receipt is unresolved;
+3. checks the complete revision before execution;
+4. persists `pending` before opening the CAD transaction;
+5. runs mutation and postconditions inside the transaction callback;
+6. commits the receipt only after postconditions pass;
+7. records rolled-back, cancelled, or unknown status explicitly; and
+8. never retries a pending or unknown operation.
+
+The Electron main process is the production receipt/result owner. Receipt
+transitions are checksummed and synchronized; large results are
+content-addressed and digest-verified. `get_operation_status` reconciles timeout
+or connection-loss uncertainty. A provider resumes after committed receipts
+instead of replaying them.
+
+One assistant action has one operation group and one visible Undo AI action.
+Manual CAD remains available if the AI ledger is poisoned or unresolved.
+
+## Drawing reads and vision
+
+`DrawingReadModel` indexes entity ID, layer, type, text, bounding box,
+visibility, space, and annotation type by workspace revision. Stable cursor
+pagination no longer requires a model-space rescan for every page. Immutable
+queries can run concurrently; writes remain serialized.
+
+Vision capabilities are:
+
+- `inspect_model_view`
+- `inspect_sheet_preview`
+- `inspect_region`
+- `inspect_selection`
+- `compare_before_after`
+- `render_analysis_overlay`
+
+Each image has a digest, capture/evidence ID, complete revision, bounds,
+selection IDs, visible layers, and render settings. The renderer and sidecar
+independently validate its MIME header, dimensions, byte length, aspect ratio,
+revision, and SHA-256. Relevant layout/annotation/visibility requests capture
+evidence before provider planning and after mutation. Without valid evidence,
+the result is explicitly database-only and cannot claim visual QA.
+
+## Provider and runtime supervision
+
+Provider configuration is revisioned and make-before-break. Discovery is
+single-flight and cached. Health, retry budgets, circuit breakers, conversation
+recreation, and fallback consent are owned above the Claude and Codex adapters.
+Ordinary domain/tool errors are recoverable observations, not security
+shutdowns.
+
+Electron's AI runtime supervisor restarts an unexpectedly exited sidecar with
+bounded exponential backoff and jitter, a restart-window circuit breaker, a
+fresh token/origin binding, and journal restoration. It does not enter an
+infinite crash loop.
+
+Claude uses no built-in tools, settings, plugins, or persistence. Codex runs
+`app-server --stdio` in an isolated empty runtime directory with read-only,
+no-network, never-approval policy; user MCP servers and all non-CAD surfaces are
+disabled and attested before use.
+
+## Protocol-v1 compatibility
+
+Legacy `user_message`, `status`, `assistant_text_delta`, `assistant_done`,
+`tool_call`, and `tool_result` messages remain accepted only by the
+compatibility path. New renderer turns use v2. Compatibility completion is
+emitted only for a successful v2 terminal; failure and cancellation never
+masquerade as completion.

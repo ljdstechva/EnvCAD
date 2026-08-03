@@ -6,6 +6,7 @@ import {
 import {
   activeCadLayoutHasEntity,
   isEntityVisible,
+  markCadSessionViewEdited,
   regenerateCadSession,
   recordCadFit,
   requireEditableCadSession,
@@ -86,6 +87,7 @@ export async function fitDrawingToScreen(): Promise<CadFitStatus> {
       regenerationCompleted: true
     }
     recordCadFit(result)
+    markCadSessionViewEdited()
     return result
   } catch (error) {
     const result: CadFitStatus = {

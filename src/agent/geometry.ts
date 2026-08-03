@@ -115,6 +115,24 @@ export function unionBoundingBoxes(boxes: readonly BoundingBox2D[]): BoundingBox
   }
 }
 
+/** Euclidean clearance between two axis-aligned boxes; zero means touch/overlap. */
+export function boundingBoxDistance(
+  left: BoundingBox2D,
+  right: BoundingBox2D
+): number {
+  const dx = Math.max(
+    left.min.x - right.max.x,
+    right.min.x - left.max.x,
+    0
+  )
+  const dy = Math.max(
+    left.min.y - right.max.y,
+    right.min.y - left.max.y,
+    0
+  )
+  return Math.hypot(dx, dy)
+}
+
 export function boundingBoxCenter(box: BoundingBox2D): Point2D {
   return {
     x: (box.min.x + box.max.x) / 2,

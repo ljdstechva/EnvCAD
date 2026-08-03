@@ -1,5 +1,8 @@
 import { AcDbUnitsValue } from '@mlightcad/data-model'
-import { requireEditableCadSession } from '../cad/session'
+import {
+  getCadSessionRevision,
+  requireEditableCadSession
+} from '../cad/session'
 import { sheetStore } from '../sheet/sheetStore'
 import type { SelectionSnapshot, SheetSnapshot } from './protocol'
 
@@ -9,14 +12,15 @@ import type { SelectionSnapshot, SheetSnapshot } from './protocol'
  * docs/agent-protocol.md "Selection snapshot semantics".
  */
 export function captureSelectionSnapshot(): SelectionSnapshot {
+  const revision = getCadSessionRevision()
   try {
     const manager = requireEditableCadSession().manager
     const ids = [...manager.curView.selectionSet.ids]
     const units = AcDbUnitsValue[manager.curDocument.database.insunits] ?? 'Unknown'
-    return { ids, count: ids.length, units }
+    return { ids, count: ids.length, units, revision }
   } catch {
     // No document/view created yet.
-    return { ids: [], count: 0, units: 'Unknown' }
+    return { ids: [], count: 0, units: 'Unknown', revision }
   }
 }
 

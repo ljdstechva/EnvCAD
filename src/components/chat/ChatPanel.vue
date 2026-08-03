@@ -1,11 +1,17 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount } from 'vue'
 import { agentBridge } from '../../agent/bridge'
+import { getWorkspaceRevision } from '../../cad/session'
 import type {
   EffortCapability,
   ModelCapability,
   ProviderId
 } from '../../agent/protocol'
+import {
+  sameWorkspaceRevision,
+  type InputReference,
+  type RecoveryActionKind
+} from '../../../shared/agent-contracts'
 import type { CadViewerApi } from '../../viewer/useCadViewer'
 import { useChatTimeline } from './useChatTimeline'
 import ChatMessageList from './ChatMessageList.vue'
@@ -15,7 +21,14 @@ const props = defineProps<{
   viewer: CadViewerApi
 }>()
 
-const { entries, sendMessage, interrupt, resetChat, dispose } =
+const {
+  entries,
+  sendMessage,
+  retryLastMessage,
+  interrupt,
+  resetChat,
+  dispose
+} =
   useChatTimeline()
 
 onBeforeUnmount(dispose)
@@ -23,7 +36,10 @@ defineExpose({ sendMessage })
 
 const bridgeState = agentBridge.state
 const isOffline = computed(() => bridgeState.connectionState !== 'online')
-const isStreaming = computed(() => bridgeState.status === 'thinking')
+const hasActiveTurn = computed(() => Boolean(bridgeState.activeTurnId))
+const isStreaming = computed(
+  () => hasActiveTurn.value && bridgeState.status !== 'idle'
+)
 const selectedProvider = computed(() =>
   agentBridge.selectedProviderCapability()
 )
@@ -36,15 +52,27 @@ const configurationPending = computed(
   () => bridgeState.pendingRevision !== undefined
 )
 const inputDisabled = computed(
+  () => bridgeState.queuedMessages.length >= 100 && isStreaming.value
+)
+const composerQueueing = computed(
   () =>
     isOffline.value ||
-    isStreaming.value ||
+    hasActiveTurn.value ||
+    bridgeState.status !== 'idle' ||
     bridgeState.refreshingCapabilities ||
-    !bridgeState.configurationReady ||
-    !props.viewer.documentOpen ||
-    !props.viewer.editable ||
-    !props.viewer.viewReady
+    !bridgeState.configurationReady
 )
+const canUndoAiAction = computed(() => {
+  const terminal = bridgeState.terminal
+  return Boolean(
+    terminal &&
+      props.viewer.canUndo &&
+      bridgeState.operationReceipts.some(
+        (receipt) => receipt.status === 'committed'
+      ) &&
+      sameWorkspaceRevision(getWorkspaceRevision(), terminal.finalRevision)
+  )
+})
 const providerStatusClass = computed(() => {
   const status = selectedProvider.value?.status
   return status === 'ready'
@@ -73,19 +101,114 @@ const offlineMessage = computed(
 )
 const canOpenLogs = Boolean(window.envcadDesktop)
 
-function onSend(text: string) {
-  return sendMessage(text)
+function onSend(text: string, attachments: InputReference[] = []) {
+  return sendMessage(text, attachments)
+}
+
+function onAttach(file: File) {
+  return agentBridge.ingestTextAttachment(file)
+}
+
+function onDeleteAttachment(inputId: string) {
+  return agentBridge.deleteLocalInput(inputId)
+}
+
+function onDraftChange(text: string): boolean {
+  return agentBridge.saveComposerDraft(text)
 }
 
 function onNewChat() {
   if (!bridgeState.configurationReady || isStreaming.value) return
   if (
     window.confirm(
-      'Start a new chat? This clears the current conversation.'
+      'Start a new chat? This clears the current conversation and queued follow-ups.'
     )
   ) {
+    agentBridge.clearQueuedMessages()
     resetChat()
   }
+}
+
+function undoAiAction() {
+  if (canUndoAiAction.value) props.viewer.undo()
+}
+
+async function onRecoveryAction(kind: RecoveryActionKind) {
+  if (kind === 'undo') {
+    undoAiAction()
+    return
+  }
+  if (kind === 'export-diagnostics') {
+    exportDiagnostics()
+    return
+  }
+  if (kind === 'open-drawing') {
+    window.dispatchEvent(new Event('envcad:open-drawing'))
+    return
+  }
+  if (kind === 'choose-provider') {
+    document.querySelector<HTMLSelectElement>('[aria-label="AI provider"]')?.focus()
+    return
+  }
+  if (kind === 'retry' || kind === 'resume' || kind === 'replan') {
+    const drawingStatus = bridgeState.terminal?.recovery?.drawingChanged
+    if (
+      drawingStatus === 'unknown' &&
+      !window.confirm(
+        'EnvCAD cannot yet confirm whether the previous drawing operation changed the file. Retry only after reviewing the operation receipt. Continue?'
+      )
+    ) {
+      return
+    }
+    await retryLastMessage()
+  }
+}
+
+function exportDiagnostics() {
+  const payload = {
+    schemaVersion: 1,
+    exportedAt: new Date().toISOString(),
+    connectionState: bridgeState.connectionState,
+    agentStatus: bridgeState.status,
+    provider: bridgeState.selectedProvider,
+    model: bridgeState.selectedModelId,
+    activeTurnId: bridgeState.activeTurnId,
+    phase: bridgeState.turnPhase,
+    turnStatus: bridgeState.turnStatus,
+    queueCount: bridgeState.queuedMessages.length,
+    skills: bridgeState.activeSkills.map((skill) => ({
+      id: skill.skillId,
+      version: skill.version,
+      integrity: skill.integrity
+    })),
+    operationReceipts: bridgeState.operationReceipts.map((receipt) => ({
+      operationId: receipt.operationId,
+      toolName: receipt.toolName,
+      status: receipt.status,
+      revisionBefore: receipt.revisionBefore,
+      revisionAfter: receipt.revisionAfter,
+      affectedEntityCount: receipt.affectedEntityIds.length,
+      failureCode: receipt.failureCode
+    })),
+    terminal: bridgeState.terminal
+      ? {
+          outcome: bridgeState.terminal.outcome,
+          phase: bridgeState.terminal.phase,
+          finalRevision: bridgeState.terminal.finalRevision,
+          errorCode: bridgeState.terminal.error?.code,
+          verification: bridgeState.terminal.verification
+        }
+      : undefined
+  }
+  const blob = new Blob([`${JSON.stringify(payload, null, 2)}\n`], {
+    type: 'application/json'
+  })
+  const url = URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.download = `envcad-diagnostics-${Date.now()}.json`
+  anchor.click()
+  URL.revokeObjectURL(url)
 }
 
 function onProviderChange(event: Event) {
@@ -274,6 +397,12 @@ function openLogs() {
         <span class="next-provider">
           Next prompt: {{ nextPromptCompany }}
         </span>
+        <span
+          class="skill-badge"
+          title="The pinned earthtojake/text-to-cad CAD/DXF skill files are integrity-checked and invoked through EnvCAD's native tools for every AI turn."
+        >
+          CAD Skills · always active
+        </span>
       </div>
     </div>
 
@@ -291,9 +420,49 @@ function openLogs() {
     <div
       v-if="!props.viewer.documentOpen || !props.viewer.viewReady"
       class="provider-message document-message"
+      tabindex="0"
     >
-      No editable drawing is open. Choose New Drawing or Open before sending an AI request.
+      Conversation is available. Drawing inspection and CAD edits will stay
+      gated until you choose New Drawing or Open.
     </div>
+
+    <section
+      v-if="bridgeState.queuedMessages.length"
+      class="queue-panel"
+      aria-label="Queued assistant follow-ups"
+    >
+      <header>
+        <strong>
+          {{ bridgeState.queuedMessages.length }} queued follow-up{{
+            bridgeState.queuedMessages.length === 1 ? '' : 's'
+          }}
+        </strong>
+        <span>{{ bridgeState.queueStatus }}</span>
+      </header>
+      <ol>
+        <li
+          v-for="queued in bridgeState.queuedMessages"
+          :key="queued.queueId"
+          :class="{ review: queued.status === 'needs-review' }"
+        >
+          <span>{{ queued.text.slice(0, 120) }}</span>
+          <small>{{ queued.status.replace('-', ' ') }}</small>
+          <button
+            v-if="queued.status === 'needs-review'"
+            type="button"
+            @click="agentBridge.resumeQueuedMessage(queued.queueId)"
+          >
+            Send with current drawing
+          </button>
+          <button
+            type="button"
+            @click="agentBridge.removeQueuedMessage(queued.queueId)"
+          >
+            Remove
+          </button>
+        </li>
+      </ol>
+    </section>
 
     <div class="chat-toolbar">
       <span class="status-text">
@@ -313,7 +482,19 @@ function openLogs() {
       </span>
       <span class="grow"></span>
       <button v-if="isStreaming" class="stop-btn" @click="interrupt">
-        Stop
+        Cancel turn
+      </button>
+      <button
+        class="new-chat-btn"
+        type="button"
+        :disabled="!canUndoAiAction"
+        title="Available only while the drawing still matches the completed AI revision"
+        @click="undoAiAction"
+      >
+        Undo AI action
+      </button>
+      <button class="new-chat-btn" type="button" @click="exportDiagnostics">
+        Export diagnostics
       </button>
       <button
         class="new-chat-btn"
@@ -328,11 +509,28 @@ function openLogs() {
       </button>
     </div>
 
-    <ChatMessageList :entries="entries" />
+    <div class="visually-hidden" aria-live="assertive" aria-atomic="true">
+      {{
+        bridgeState.turnStatus ||
+        (bridgeState.terminalOutcome
+          ? `Assistant turn ${bridgeState.terminalOutcome}`
+          : '')
+      }}
+    </div>
+
+    <ChatMessageList
+      :entries="entries"
+      @recovery-action="onRecoveryAction"
+    />
 
     <ChatInput
       :disabled="inputDisabled"
+      :queueing="composerQueueing"
       :selection-count="props.viewer.selectionCount"
+      :initial-draft="agentBridge.getComposerDraft()"
+      :on-draft-change="onDraftChange"
+      :on-attach="onAttach"
+      :on-delete-attachment="onDeleteAttachment"
       :on-send="onSend"
     />
   </div>
@@ -353,7 +551,7 @@ function openLogs() {
   color: var(--warn-text);
   border-bottom: 1px solid var(--warn-border);
   padding: 6px 10px;
-  font-size: 11px;
+  font-size: 12px;
   line-height: 1.4;
   display: flex;
   align-items: center;
@@ -371,7 +569,7 @@ function openLogs() {
   background: var(--bg-button);
   color: var(--text-primary);
   padding: 3px 7px;
-  font-size: 10px;
+  font-size: 12px;
   cursor: pointer;
 }
 
@@ -394,20 +592,20 @@ function openLogs() {
   flex-direction: column;
   gap: 2px;
   color: var(--text-muted);
-  font-size: 9px;
+  font-size: 12px;
 }
 
 .selector-field select {
   width: 100%;
   min-width: 0;
-  height: 25px;
+  height: 30px;
   padding: 2px 4px;
   border: 1px solid var(--border-color);
   border-radius: 3px;
   background: var(--bg-input);
   color: var(--text-primary);
   font: inherit;
-  font-size: 10px;
+  font-size: 12px;
   text-overflow: ellipsis;
 }
 
@@ -424,13 +622,13 @@ function openLogs() {
 }
 
 .refresh-btn {
-  height: 25px;
+  height: 30px;
   border: 1px solid var(--border-color);
   border-radius: 3px;
   padding: 2px 6px;
   background: var(--bg-button);
   color: var(--text-primary);
-  font-size: 9px;
+  font-size: 12px;
   cursor: pointer;
 }
 
@@ -441,7 +639,7 @@ function openLogs() {
   align-items: center;
   gap: 6px;
   color: var(--text-muted);
-  font-size: 9px;
+  font-size: 12px;
 }
 
 .readiness-badge {
@@ -473,8 +671,18 @@ function openLogs() {
 
 .next-provider {
   min-width: 0;
+  flex: 1;
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.skill-badge {
+  flex: none;
+  border: 1px solid #476b9e;
+  border-radius: 8px;
+  padding: 1px 6px;
+  color: #9cc5ff;
   white-space: nowrap;
 }
 
@@ -484,7 +692,7 @@ function openLogs() {
   border-bottom: 1px solid var(--warn-border);
   background: var(--warn-bg);
   color: var(--warn-text);
-  font-size: 10px;
+  font-size: 12px;
   line-height: 1.35;
 }
 
@@ -493,12 +701,13 @@ function openLogs() {
   display: flex;
   align-items: center;
   gap: 8px;
+  flex-wrap: wrap;
   padding: 6px 8px;
   border-bottom: 1px solid var(--border-strong);
 }
 
 .status-text {
-  font-size: 11px;
+  font-size: 12px;
   color: var(--text-muted);
 }
 
@@ -513,7 +722,7 @@ function openLogs() {
   border: 1px solid var(--border-color);
   border-radius: 3px;
   padding: 4px 9px;
-  font-size: 11px;
+  font-size: 12px;
   cursor: pointer;
 }
 
@@ -534,6 +743,81 @@ function openLogs() {
 .new-chat-btn:disabled {
   opacity: 0.5;
   cursor: default;
+}
+
+.queue-panel {
+  flex: none;
+  max-height: 160px;
+  overflow: auto;
+  padding: 7px 8px;
+  border-bottom: 1px solid var(--border-color);
+  background: var(--info-bg);
+  color: var(--info-text);
+  font-size: 12px;
+}
+
+.queue-panel header {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.queue-panel header span {
+  color: var(--text-secondary);
+}
+
+.queue-panel ol {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin: 6px 0 0;
+  padding-left: 22px;
+}
+
+.queue-panel li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 5px;
+}
+
+.queue-panel li.review {
+  color: var(--warn-text);
+}
+
+.queue-panel li > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.queue-panel button {
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  background: var(--bg-button);
+  color: var(--text-primary);
+  padding: 3px 6px;
+  font: inherit;
+  cursor: pointer;
+}
+
+button:focus-visible,
+select:focus-visible,
+.document-message:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 
 @media (max-width: 360px) {

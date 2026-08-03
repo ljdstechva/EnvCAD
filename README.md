@@ -12,20 +12,36 @@ the renderer.
 
 ## Windows installation
 
-EnvCAD v0.2.3 targets Windows 11 x64. Install the generated Squirrel
-`EnvCAD-0.2.3 Setup.exe`, then launch **EnvCAD** from the Desktop shortcut or
+EnvCAD v0.2.4 targets Windows 11 x64. Install the generated Squirrel
+`EnvCAD-0.2.4 Setup.exe`, then launch **EnvCAD** from the Desktop shortcut or
 Start menu. The installer is currently unsigned, so Windows may show a
 SmartScreen warning.
 
-Version 0.2.3 lets either supported AI provider inspect the actual Sheet Preview
+Version 0.2.4 lets either supported AI provider inspect the actual Sheet Preview
 through a bounded, in-memory image generated from the same final SVG shown in
-the UI. **Inspect with AI** uses the selected provider, model, and effort without
-switching providers or granting screen, browser, shell, or filesystem access.
-The renderer and sidecar independently recompute the image SHA-256 before a
-provider can receive it. Claude runs one non-persistent streaming SDK session
-per in-app conversation, so preview Base64 is not written to Claude project
-transcripts; the upgrade also removes only legacy EnvCAD-runtime transcript
-directories created by earlier development builds.
+the UI. It also removes selection as a prerequisite for drawing/layer work and
+provides cursor-based continuation and bounded operation batches so the AI can
+work through large selections and drawing catalogs instead of receiving one
+inaccessible oversized result. **Inspect with AI**
+uses the selected provider, model, and effort without switching providers or
+granting screen, browser, shell, or filesystem access.
+
+At sidecar startup EnvCAD loads, integrity-checks, and compiles the bundled,
+pinned CAD and DXF `SKILL.md` sources from
+[`earthtojake/text-to-cad`](https://github.com/earthtojake/text-to-cad) through
+EnvCAD's native compatibility layer. Every accepted turn activates the verified
+`cad-core` and `dxf-core` manifests before acknowledgment; intent-specific
+compiled fragments are added without repeatedly injecting the complete source
+corpus. The UI shows every activation and its integrity status. Attribution and
+the MIT license are in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+
+Revision-bound sheet, model, region, selection, comparison, and overlay
+captures carry dimensions, render settings, evidence IDs, and SHA-256 digests.
+The renderer and sidecar independently validate image metadata and content
+before a provider can receive it. Claude runs one non-persistent streaming SDK
+session per in-app conversation, so preview Base64 is not written to Claude
+project transcripts; the upgrade also removes only legacy EnvCAD-runtime
+transcript directories created by earlier development builds.
 The explicit document lifecycle, deterministic **Fit Drawing**, per-drawing
 sheet setup, and unit/clipping safeguards from 0.2.2 remain intact.
 
@@ -54,6 +70,11 @@ new conversation; there is no provider-to-provider fallback.
   inspect layers, and use deterministic **Fit Drawing**.
 - Draw and transform lines, polylines, rectangles, circles, arcs, text, hatches,
   dimensions, leaders, and environmental symbols.
+- Ask the AI to inspect the whole drawing or any layer without selecting
+  objects first. Large selections, entity catalogs, layer catalogs, long text,
+  and long polylines expose lossless continuation pages that the agent is
+  required to consume; large edits use internal operation batches with no
+  total entity-count limit.
 - Measure area, length, overlap, containment, and clearance using drawing
   database geometry.
 - Import CSV boundaries and GeoJSON geometry.
@@ -74,9 +95,13 @@ The utility process contains a provider-neutral coordinator:
   subscription login.
 - `CodexProvider` uses `codex app-server --stdio` with the existing ChatGPT
   login.
-- Both adapters are generated from one canonical 35-tool CAD catalog.
-- Browser CAD tool calls are schema-validated, serialized, bounded by timeouts,
-  and each mutating call remains one undo step.
+- Both adapters are generated from one neutral 54-capability catalog, including
+  bounded local-input retrieval and revision-bound vision.
+- An app-owned broker re-authorizes every call against verified active skills,
+  schemas, data scope, context capacity, and capability policy.
+- Immutable reads may run concurrently. Mutations pass through one durable
+  operation coordinator with complete workspace revisions, idempotency keys,
+  receipts, postcondition checks, reconciliation, and AI-action undo groups.
 - The providers receive no arbitrary renderer IPC.
 
 Codex runs in an empty per-session directory under
@@ -92,11 +117,28 @@ ChatGPT backend, re-attests the account before discovery and every conversation,
 and treats command, file, web, app, connector, MCP, or subagent events as
 security failures.
 
-User prompts have no fixed character-count limit. EnvCAD preserves prompt text
-and formatting and applies the 2 MiB ceiling only to the complete serialized
-WebSocket request, whose selection and sheet context also consume capacity.
+User prompts have no fixed character-count limit. Inline UTF-8 instructions up
+to 128 KiB use one protocol-v2 turn envelope; larger text and attachments are
+streamed in independently hashed 256 KiB chunks to a 1 GiB-quota local
+authoritative store. Providers receive a reference plus bounded outline,
+search, chunk, range, and metadata tools. A conservative context budget counts
+system instructions, the current prompt, tool results, and image reserves.
+Exact selection IDs stay frozen inside the renderer and do not get copied into
+the model prompt. Each AI turn and operation is bound to the complete workspace
+revision (document identity plus document, content, sheet, and view revisions);
+stale commands are rejected before CAD execution.
 `ultra` is never advertised as an effort, and a model whose provider default is
 `ultra` is omitted because EnvCAD is intentionally single-agent.
+
+Accepted turns are journaled before acknowledgment and emit monotonic,
+replayable protocol-v2 events through exactly one terminal outcome. Drafts,
+queued follow-ups, partial output, turn cursors, and operation receipts survive
+reconnects and renderer reloads. In the packaged Windows app, renderer recovery
+state is atomically mirrored under Electron `userData` and encrypted with
+Windows protected storage so it also survives the random loopback origin
+changing after an application restart. The sidecar and provider supervisors
+use bounded restart, backoff, health, and circuit-breaker policies; EnvCAD never
+silently switches providers.
 
 Claude is configured with no built-in tools and may invoke only
 `mcp__cad__*`. Its settings, skills, and plugins are excluded. Its SDK query is

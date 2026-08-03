@@ -11,6 +11,8 @@ import { FakeProvider } from './fakeProviders'
 
 const ORIGIN = 'http://127.0.0.1:45678'
 const RUNTIME_DIRECTORY = 'C:\\Users\\test\\AppData\\Local\\EnvCAD\\ai-runtime\\test'
+const INPUT_STORE_DIRECTORY =
+  'C:\\Users\\test\\AppData\\Roaming\\EnvCAD\\agent-journal-v2\\inputs-test'
 const handles: SidecarHandle[] = []
 
 afterEach(async () => {
@@ -48,6 +50,7 @@ describe('startSidecar', () => {
       permittedOrigin: ORIGIN,
       sessionToken: token,
       runtimeDirectory: RUNTIME_DIRECTORY,
+      inputStoreDirectory: INPUT_STORE_DIRECTORY,
       providerManagerFactory: managerFactory,
       logger
     })
@@ -100,6 +103,7 @@ describe('startSidecar', () => {
       permittedOrigin: ORIGIN,
       sessionToken: token,
       runtimeDirectory: RUNTIME_DIRECTORY,
+      inputStoreDirectory: INPUT_STORE_DIRECTORY,
       providerManagerFactory: managerFactory,
       logger: { log: vi.fn(), error: vi.fn() }
     })

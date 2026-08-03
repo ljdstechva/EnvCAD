@@ -10,12 +10,22 @@ import type {
   ProviderCapability,
   ToolResult
 } from '../../../src/agent/protocol'
-import { modelImageInputSupport } from '../../../src/agent/protocol'
 import {
-  CAD_TOOL_SPECS,
-  executeCadTool,
+  IMAGE_CAPABLE_CAD_TOOL_NAMES,
+  modelImageInputSupport
+} from '../../../src/agent/protocol'
+import {
+  cadToolMayMutate,
+  compactMutationResultText,
+  maximumProviderToolOutputBytes,
+  utf8ByteLength,
   type CadToolBridge
 } from '../cadToolSpecs'
+import {
+  PROVIDER_TOOL_SPECS,
+  executeProviderTool,
+  type ProviderToolSpec
+} from '../providerToolSpecs'
 import { createEffortCapabilities } from '../providerCatalog'
 import { SYSTEM_PROMPT } from '../systemPrompt'
 import {
@@ -186,6 +196,10 @@ function nonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0 && value.length <= 4_000
 }
 
+function boundedMethod(value: string): string {
+  return value.replace(/[^A-Za-z0-9_./:-]/g, '?').slice(0, 200)
+}
+
 function assertChatGptAccount(value: unknown): void {
   if (
     !isRecord(value) ||
@@ -343,9 +357,11 @@ function mapModels(models: readonly CodexModel[]): ModelCapability[] {
   return mapped.map((model, index) => ({ ...model, isDefault: index === defaultIndex }))
 }
 
-const MAX_VISUAL_METADATA_CHARACTERS = 32_000
-
-export function toCodexDynamicToolResult(result: ToolResult) {
+export function toCodexDynamicToolResult(
+  result: ToolResult,
+  toolName?: string,
+  input?: unknown
+) {
   if (result.error) {
     return {
       contentItems: [{ type: 'inputText', text: result.error }],
@@ -355,10 +371,32 @@ export function toCodexDynamicToolResult(result: ToolResult) {
   const text =
     typeof result.data === 'string'
       ? result.data
-      : JSON.stringify(result.data ?? null, null, 2)
+      : JSON.stringify(result.data ?? null)
+  if (utf8ByteLength(text) > maximumProviderToolOutputBytes(toolName)) {
+    if (toolName && cadToolMayMutate(toolName, input)) {
+      return {
+        contentItems: [
+          {
+            type: 'inputText',
+            text: compactMutationResultText(result)
+          }
+        ],
+        success: true
+      }
+    }
+    return {
+      contentItems: [
+        {
+          type: 'inputText',
+          text:
+            'CAD tool metadata exceeded its bounded page size. Retry the read with its continuation cursor.'
+        }
+      ],
+      success: false
+    }
+  }
   if (result.image) {
     if (
-      text.length > MAX_VISUAL_METADATA_CHARACTERS ||
       text.includes(result.image.base64)
     ) {
       return {
@@ -450,7 +488,7 @@ class CodexConversation implements AgentConversation {
   private fatalError: Error | undefined
   private readonly removeNotificationListener: () => void
   private readonly removeProtocolErrorListener: () => void
-  private readonly dynamicToolSpecs: typeof CAD_TOOL_SPECS
+  private readonly dynamicToolSpecs: readonly ProviderToolSpec[]
   private readonly allowedDynamicToolNames: Set<string>
   private readonly instructions: string
 
@@ -461,14 +499,16 @@ class CodexConversation implements AgentConversation {
     private readonly runtimeDirectory: string,
     private readonly environment: NodeJS.ProcessEnv,
     imageInputSupport: ReturnType<typeof modelImageInputSupport>,
+    private readonly logger: ProviderLogger,
     private readonly onClosed: () => void
   ) {
+    const imageTools = new Set<string>(IMAGE_CAPABLE_CAD_TOOL_NAMES)
     this.dynamicToolSpecs =
       imageInputSupport === 'unsupported'
-        ? CAD_TOOL_SPECS.filter(
-            (spec) => spec.name !== 'inspect_sheet_preview'
+        ? PROVIDER_TOOL_SPECS.filter(
+            (spec) => !imageTools.has(spec.name)
           )
-        : CAD_TOOL_SPECS
+        : PROVIDER_TOOL_SPECS
     this.allowedDynamicToolNames = new Set(
       this.dynamicToolSpecs.map((spec) => spec.name)
     )
@@ -495,6 +535,7 @@ The selected Codex model explicitly excludes image input. The visual Sheet Previ
     environment: NodeJS.ProcessEnv,
     disabledMcpServerNames: readonly string[],
     imageInputSupport: ReturnType<typeof modelImageInputSupport>,
+    logger: ProviderLogger,
     onClosed: () => void
   ): Promise<CodexConversation> {
     const conversation = new CodexConversation(
@@ -504,6 +545,7 @@ The selected Codex model explicitly excludes image input. The visual Sheet Previ
       runtimeDirectory,
       environment,
       imageInputSupport,
+      logger,
       onClosed
     )
     try {
@@ -526,7 +568,6 @@ The selected Codex model explicitly excludes image input. The visual Sheet Previ
         ephemeral: true,
         experimentalRawEvents: false,
         environments: [],
-        baseInstructions: conversation.instructions,
         developerInstructions: conversation.instructions,
         dynamicTools: conversation.dynamicToolSpecs.map((spec) => ({
           type: 'function',
@@ -666,18 +707,16 @@ The selected Codex model explicitly excludes image input. The visual Sheet Previ
         )}`
       )
     }
-    const result = await executeCadTool(
+    const result = await executeProviderTool(
       this.tools,
       params.tool as string,
       params.arguments
     )
-    if (result.error) {
-      const failure = new Error(
-        `Codex CAD tool ${String(params.tool)} failed: ${result.error}`
-      )
-      setImmediate(() => this.securityFailure(failure))
-    }
-    const forwarded = toCodexDynamicToolResult(result)
+    const forwarded = toCodexDynamicToolResult(
+      result,
+      params.tool as string,
+      params.arguments
+    )
     if (
       result.image &&
       forwarded.success &&
@@ -724,7 +763,7 @@ The selected Codex model explicitly excludes image input. The visual Sheet Previ
         isRecord(params) && typeof params.message === 'string'
           ? `: ${params.message}`
           : ''
-      this.securityFailure(new Error(`Codex app-server error${detail}`))
+      this.providerTurnFailure(new Error(`Codex app-server error${detail}`))
       return
     }
     if (method === 'item/started' || method === 'item/completed') {
@@ -823,8 +862,10 @@ The selected Codex model explicitly excludes image input. The visual Sheet Previ
       if (error) this.securityFailure(error)
       return
     }
-    this.securityFailure(
-      new Error(`Codex app-server emitted unrecognized event "${method}".`)
+    this.logger.log(
+      `[sidecar] Codex quarantined unrecognized passive event "${boundedMethod(
+        method
+      )}".`
     )
   }
 
@@ -1252,6 +1293,23 @@ The selected Codex model explicitly excludes image input. The visual Sheet Previ
       .catch(() => {})
       .finally(this.onClosed)
   }
+
+  private providerTurnFailure(error: Error): void {
+    const safe = new Error(redactProviderDiagnostic(error.message))
+    if (this.currentQueue) {
+      this.currentQueue.fail(safe)
+    } else {
+      this.logger.error('[sidecar] Codex app-server reported an idle error.', safe)
+    }
+    if (this.currentTurnId) {
+      void this.client
+        .request('turn/interrupt', {
+          threadId: this.threadId,
+          turnId: this.currentTurnId
+        })
+        .catch(() => {})
+    }
+  }
 }
 
 export class CodexProvider implements AgentProvider {
@@ -1480,6 +1538,7 @@ export class CodexProvider implements AgentProvider {
       this.environment,
       this.disabledMcpServerNames,
       modelImageInputSupport(model),
+      this.logger,
       () => {
         if (conversation) this.conversations.delete(conversation)
       }

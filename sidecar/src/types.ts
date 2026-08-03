@@ -1,4 +1,4 @@
-import type { SelectionSnapshot, ToolResult } from '../../src/agent/protocol'
+import type { SelectionContext, ToolResult } from '../../src/agent/protocol'
 
 /**
  * What a CAD tool handler needs from its owning BridgeSession. Kept as a
@@ -8,6 +8,6 @@ import type { SelectionSnapshot, ToolResult } from '../../src/agent/protocol'
 export interface ToolBridge {
   /** Forward a tool call to the browser and await its result (or timeout). */
   callTool(name: string, input: unknown): Promise<ToolResult>
-  /** The selectionSnapshot attached to the user_message that started this turn, if any. */
-  getSelectionSnapshot(): SelectionSnapshot | undefined
+  /** Browser-local selection metadata attached to the current turn; exact IDs are not present. */
+  getSelectionSnapshot(): SelectionContext | undefined
 }

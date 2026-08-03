@@ -19,7 +19,8 @@ import type {
   ProviderCapability
 } from '../../../src/agent/protocol'
 import { createCadMcpServer } from '../cadTools'
-import { CAD_TOOL_NAMES, type CadToolBridge } from '../cadToolSpecs'
+import type { CadToolBridge } from '../cadToolSpecs'
+import { PROVIDER_TOOL_NAMES } from '../providerToolSpecs'
 import { createEffortCapabilities } from '../providerCatalog'
 import { SYSTEM_PROMPT } from '../systemPrompt'
 import {
@@ -45,7 +46,7 @@ const CLAUDE_SECRET_NAMES = [
   'CLAUDE_CODE_OAUTH_TOKEN'
 ] as const
 const ALLOWED_CLAUDE_TOOLS = new Set(
-  CAD_TOOL_NAMES.map((name) => `mcp__cad__${name}`)
+  PROVIDER_TOOL_NAMES.map((name) => `mcp__cad__${name}`)
 )
 
 type ClaudeQueryFactory = typeof query
@@ -185,7 +186,6 @@ class ClaudeConversation implements AgentConversation {
   private currentQuery: Query | undefined
   private currentMessages: AsyncIterator<SDKMessage> | undefined
   private promptStream: AsyncMessageQueue<SDKUserMessage> | undefined
-  private activeToolFailure: Error | undefined
   private turnRunning = false
   private closed = false
   private generation = 0
@@ -206,7 +206,6 @@ class ClaudeConversation implements AgentConversation {
     const generation = this.generation
     this.turnRunning = true
     let rateLimitError: string | undefined
-    this.activeToolFailure = undefined
     let activeQuery: Query | undefined
     try {
       await recordProviderPromptEvidence(
@@ -297,22 +296,15 @@ class ClaudeConversation implements AgentConversation {
                 : {})
             }
           }
-          if (this.activeToolFailure) throw this.activeToolFailure
           if (rateLimitError) throw new Error(rateLimitError)
           break
         }
       }
     } catch (error) {
-      // Interrupting the SDK is how EnvCAD stops generation after a browser
-      // CAD-tool error. Some SDK versions surface that interrupt before the
-      // async iterator ends, so preserve the authoritative tool failure.
       if (this.closed || generation !== this.generation) return
-      const toolFailure = this.activeToolFailure
       if (activeQuery) this.discardQuery(activeQuery)
-      if (toolFailure) throw toolFailure
       throw error
     } finally {
-      this.activeToolFailure = undefined
       this.turnRunning = false
     }
   }
@@ -357,8 +349,7 @@ class ClaudeConversation implements AgentConversation {
     if (this.currentQuery) return this.currentQuery
 
     const prompts = new AsyncMessageQueue<SDKUserMessage>()
-    let activeQuery: Query | undefined
-    activeQuery = this.queryFactory({
+    const activeQuery = this.queryFactory({
       prompt: prompts,
       options: {
         model: this.configuration.model,
@@ -369,10 +360,6 @@ class ClaudeConversation implements AgentConversation {
         mcpServers: {
           cad: createCadMcpServer(
             this.tools,
-            (error) => {
-              this.activeToolFailure = error
-              void activeQuery?.interrupt().catch(() => {})
-            },
             (result) =>
               recordProviderVisualEvidence(
                 {

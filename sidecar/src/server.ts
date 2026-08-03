@@ -10,6 +10,10 @@ import { ClaudeProvider } from './providers/claudeProvider'
 import { CodexProvider } from './providers/codexProvider'
 import { ProviderManager } from './providers/providerManager'
 import { MAX_WEBSOCKET_PAYLOAD_BYTES } from '../../src/agent/protocol'
+import type { TurnJournalPort } from '../../shared/agent-contracts'
+import { LocalInputStore } from './application/input/LocalInputStore'
+import { InputRetrievalService } from './application/input/InputRetrievalService'
+import { SkillRegistry } from './application/skills/SkillRegistry'
 
 const DEFAULT_CLOSE_TIMEOUT_MS = 2_000
 
@@ -24,6 +28,9 @@ export interface StartSidecarOptions {
   permittedOrigin: string
   sessionToken: string
   runtimeDirectory: string
+  inputStoreDirectory: string
+  turnJournal?: TurnJournalPort
+  skillRegistry?: SkillRegistry
   environment?: NodeJS.ProcessEnv
   providerManagerFactory?: () => ProviderManager
   logger?: SidecarLogger
@@ -93,12 +100,19 @@ export function startSidecar(options: StartSidecarOptions): SidecarHandle {
   if (!isAbsolute(options.runtimeDirectory)) {
     throw new Error('runtimeDirectory must be an absolute path')
   }
+  if (!isAbsolute(options.inputStoreDirectory)) {
+    throw new Error('inputStoreDirectory must be an absolute path')
+  }
 
   const permittedOrigin = validatedOrigin(options.permittedOrigin)
   const logger = options.logger ?? console
   const expectedTokenProtocol = sessionTokenProtocol(options.sessionToken)
   const closeTimeoutMs = options.closeTimeoutMs ?? DEFAULT_CLOSE_TIMEOUT_MS
   const sessions = new Set<BridgeSession>()
+  const inputStore = new LocalInputStore(options.inputStoreDirectory)
+  const inputRetrieval = new InputRetrievalService(inputStore)
+  const skillRegistry = options.skillRegistry ?? new SkillRegistry()
+  skillRegistry.initialize()
   let listening = false
   let closing = false
   let closePromise: Promise<void> | undefined
@@ -157,6 +171,10 @@ export function startSidecar(options: StartSidecarOptions): SidecarHandle {
       )
     const session = new BridgeSession(ws, {
       providerManager,
+      skillRegistry,
+      inputStore,
+      inputRetrieval,
+      ...(options.turnJournal ? { turnJournal: options.turnJournal } : {}),
       logger
     })
     sessions.add(session)
@@ -181,6 +199,7 @@ export function startSidecar(options: StartSidecarOptions): SidecarHandle {
         [...sessions].map((session) => session.close('Sidecar shutting down'))
       )
       sessions.clear()
+      await inputStore.close()
       for (const client of wss.clients) client.close(1001, 'Sidecar shutting down')
 
       await new Promise<void>((resolve) => {

@@ -1,15 +1,24 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import type { RecoveryActionKind } from '../../../shared/agent-contracts'
 import type { ChatEntry } from './useChatTimeline'
 import ToolCallChip from './ToolCallChip.vue'
+import TurnActivityCard from './TurnActivityCard.vue'
 
 const props = defineProps<{
   entries: ChatEntry[]
 }>()
+const emit = defineEmits<{
+  recoveryAction: [kind: RecoveryActionKind]
+}>()
 
 const scrollEl = ref<HTMLDivElement | null>(null)
 const isAtBottom = ref(true)
+const windowStart = ref(0)
 const BOTTOM_THRESHOLD_PX = 40
+const WINDOW_SIZE = 250
+const visibleEntries = computed(() => props.entries.slice(windowStart.value))
+const hiddenCount = computed(() => windowStart.value)
 
 function checkAtBottom() {
   const el = scrollEl.value
@@ -27,22 +36,60 @@ function scrollToBottom(smooth = false) {
 
 watch(
   () => props.entries.length,
-  () => {
-    if (isAtBottom.value) nextTick(() => scrollToBottom())
+  (length, previousLength) => {
+    if (isAtBottom.value) {
+      windowStart.value = Math.max(0, length - WINDOW_SIZE)
+      nextTick(() => scrollToBottom())
+    } else if (length < previousLength) {
+      windowStart.value = Math.max(0, length - WINDOW_SIZE)
+    }
   }
 )
 
 // Streaming text grows an existing entry without changing entries.length.
 watch(
-  () => props.entries.map((entry) => (entry.kind === 'assistant' ? entry.text.length : 0)).join(','),
+  () => {
+    const last = props.entries.at(-1)
+    return last?.kind === 'assistant' ? last.text.length : 0
+  },
   () => {
     if (isAtBottom.value) nextTick(() => scrollToBottom())
   }
 )
 
-onMounted(() => nextTick(() => scrollToBottom()))
+watch(
+  () => {
+    const last = props.entries.at(-1)
+    return last?.kind === 'activity' &&
+      last.activity === 'terminal' &&
+      last.terminal?.phase === 'failed'
+      ? last.id
+      : undefined
+  },
+  (failedId) => {
+    if (!failedId) return
+    nextTick(() => {
+      scrollEl.value
+        ?.querySelector<HTMLElement>('[data-recovery-card="true"]')
+        ?.focus()
+    })
+  }
+)
+
+onMounted(() => {
+  windowStart.value = Math.max(0, props.entries.length - WINDOW_SIZE)
+  nextTick(() => scrollToBottom())
+})
 
 const showJumpButton = computed(() => !isAtBottom.value)
+
+function loadEarlier() {
+  windowStart.value = Math.max(0, windowStart.value - WINDOW_SIZE)
+  nextTick(() => {
+    const el = scrollEl.value
+    if (el) el.scrollTop = 1
+  })
+}
 
 function providerName(provider: string | undefined): string {
   if (provider === 'claude-code') return 'Claude Code'
@@ -75,12 +122,29 @@ defineExpose({ scrollToBottom })
 
 <template>
   <div class="message-list-wrap">
-    <div ref="scrollEl" class="message-list" @scroll="checkAtBottom">
+    <div
+      ref="scrollEl"
+      class="message-list"
+      role="log"
+      aria-label="Assistant conversation"
+      aria-live="polite"
+      aria-relevant="additions text"
+      @scroll="checkAtBottom"
+    >
       <div v-if="entries.length === 0" class="empty-state">
-        Ask the assistant to inspect or edit the drawing. Select entities first if your
-        request refers to "these" or "selected".
+        Ask a question at any time. Open a drawing only when you want the
+        assistant to inspect or edit CAD content.
       </div>
-      <template v-for="entry in entries" :key="entry.id">
+      <button
+        v-if="hiddenCount > 0"
+        class="load-earlier"
+        type="button"
+        @click="loadEarlier"
+      >
+        Load {{ Math.min(WINDOW_SIZE, hiddenCount) }} earlier events
+        ({{ hiddenCount.toLocaleString() }} hidden)
+      </button>
+      <template v-for="entry in visibleEntries" :key="entry.id">
         <div v-if="entry.kind === 'user'" class="bubble-row user">
           <div class="bubble user">
             <div class="bubble-text">{{ entry.text }}</div>
@@ -131,6 +195,12 @@ defineExpose({ scrollToBottom })
         <div v-else-if="entry.kind === 'tool'" class="bubble-row assistant">
           <ToolCallChip :entry="entry" />
         </div>
+        <div v-else-if="entry.kind === 'activity'" class="bubble-row assistant">
+          <TurnActivityCard
+            :entry="entry"
+            @action="emit('recoveryAction', $event)"
+          />
+        </div>
         <div v-else-if="entry.kind === 'boundary'" class="conversation-boundary">
           <span>New conversation</span>
           <small>{{ entry.label }}</small>
@@ -140,7 +210,13 @@ defineExpose({ scrollToBottom })
         </div>
       </template>
     </div>
-    <button v-if="showJumpButton" class="jump-to-bottom" @click="scrollToBottom(true)">
+    <button
+      v-if="showJumpButton"
+      class="jump-to-bottom"
+      type="button"
+      aria-label="Jump to new messages"
+      @click="scrollToBottom(true)"
+    >
       ↓ New messages
     </button>
   </div>
@@ -224,7 +300,7 @@ defineExpose({ scrollToBottom })
   border-radius: 8px;
   padding: 1px 5px;
   color: var(--text-muted);
-  font-size: 9px;
+  font-size: 12px;
   line-height: 1.3;
 }
 
@@ -233,7 +309,7 @@ defineExpose({ scrollToBottom })
   align-items: center;
   gap: 6px;
   color: var(--text-muted);
-  font-size: 10px;
+  font-size: 12px;
 }
 
 .conversation-boundary::before,
@@ -248,7 +324,7 @@ defineExpose({ scrollToBottom })
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 9px;
+  font-size: 12px;
 }
 
 .bubble.error {
@@ -259,7 +335,7 @@ defineExpose({ scrollToBottom })
 
 .attach-note {
   margin-top: 4px;
-  font-size: 10px;
+  font-size: 12px;
   color: #cfe6f7;
   opacity: 0.85;
 }
@@ -288,12 +364,35 @@ defineExpose({ scrollToBottom })
   border: none;
   border-radius: 12px;
   padding: 5px 12px;
-  font-size: 11px;
+  font-size: 12px;
   cursor: pointer;
   box-shadow: 0 2px 8px var(--shadow-color);
 }
 
 .jump-to-bottom:hover {
   background: var(--accent-border);
+}
+
+.load-earlier {
+  align-self: center;
+  border: 1px solid var(--border-color);
+  border-radius: 999px;
+  background: var(--bg-button);
+  color: var(--text-primary);
+  padding: 5px 10px;
+  font: inherit;
+  cursor: pointer;
+}
+
+.load-earlier:focus-visible,
+.jump-to-bottom:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .caret {
+    animation: none;
+  }
 }
 </style>

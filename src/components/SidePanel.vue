@@ -13,11 +13,12 @@ type TabId = 'ai' | 'sheet'
 const activeTab = ref<TabId>('ai')
 const chatPanel = ref<InstanceType<typeof ChatPanel> | null>(null)
 
-function inspectSheetWithAi(): boolean {
-  const sent =
-    chatPanel.value?.sendMessage(
-      'Inspect the current Sheet Preview. State whether it is blank, clipped, unreadable, low-contrast, or overlapping, and describe only what you can actually see.'
-    ) ?? false
+async function inspectSheetWithAi(): Promise<boolean> {
+  const sent = chatPanel.value
+    ? await chatPanel.value.sendMessage(
+        'Inspect the current Sheet Preview. State whether it is blank, clipped, unreadable, low-contrast, or overlapping, and describe only what you can actually see.'
+      )
+    : false
   if (sent) activeTab.value = 'ai'
   return sent
 }

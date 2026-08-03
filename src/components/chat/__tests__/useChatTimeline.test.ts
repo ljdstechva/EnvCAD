@@ -37,7 +37,12 @@ vi.mock('../../../agent/bridge', () => ({
 }))
 
 vi.mock('../../../agent/context', () => ({
-  captureSelectionSnapshot: () => ({ ids: [], count: 0, units: 'Meters' }),
+  captureSelectionSnapshot: () => ({
+    ids: [],
+    count: 0,
+    units: 'Meters',
+    revision: { documentRevision: 2, contentRevision: 5 }
+  }),
   captureSheetSnapshot: () => ({
     paper: 'A3',
     orientation: 'landscape',
@@ -55,14 +60,19 @@ describe('useChatTimeline', () => {
     mocks.sendUserMessage.mockImplementation(() => undefined)
   })
 
-  it('preserves prompt formatting and adds the user turn only after local acceptance', () => {
+  it('preserves prompt formatting and adds the user turn only after local acceptance', async () => {
     const timeline = useChatTimeline()
     const text = '  BEGIN\r\nUnicode 🌏\nEND  '
 
-    expect(timeline.sendMessage(text)).toBe(true)
+    await expect(timeline.sendMessage(text)).resolves.toBe(true)
     expect(mocks.sendUserMessage).toHaveBeenCalledWith(
       text,
-      { ids: [], count: 0, units: 'Meters' },
+      {
+        ids: [],
+        count: 0,
+        units: 'Meters',
+        revision: { documentRevision: 2, contentRevision: 5 }
+      },
       expect.objectContaining({ paper: 'A3' })
     )
     expect(timeline.entries.value).toEqual([
@@ -71,7 +81,7 @@ describe('useChatTimeline', () => {
     timeline.dispose()
   })
 
-  it('does not add a false user turn when local payload validation rejects the request', () => {
+  it('does not add a false user turn when local payload validation rejects the request', async () => {
     mocks.sendUserMessage.mockImplementation(() => {
       throw new Error(
         "The complete AI request exceeds EnvCAD's 2 MiB transport capacity."
@@ -79,7 +89,9 @@ describe('useChatTimeline', () => {
     })
     const timeline = useChatTimeline()
 
-    expect(timeline.sendMessage('preserve this draft')).toBe(false)
+    await expect(timeline.sendMessage('preserve this draft')).resolves.toBe(
+      false
+    )
     expect(timeline.entries.value).toEqual([
       expect.objectContaining({
         kind: 'error',
@@ -113,9 +125,9 @@ describe('useChatTimeline', () => {
     timeline.dispose()
   })
 
-  it('keeps the transcript until the matching reset acknowledgement', () => {
+  it('keeps the transcript until the matching reset acknowledgement', async () => {
     const timeline = useChatTimeline()
-    timeline.sendMessage('Keep this until reset is confirmed.')
+    await timeline.sendMessage('Keep this until reset is confirmed.')
 
     timeline.resetChat()
     expect(timeline.entries.value).toHaveLength(1)

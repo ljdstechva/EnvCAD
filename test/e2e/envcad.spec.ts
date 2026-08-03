@@ -13,7 +13,6 @@ import {
   visualFixtureExpectation,
   type VisualMarkerQuadrant
 } from '../../scripts/visualFixtures'
-import { MAX_WEBSOCKET_PAYLOAD_BYTES } from '../../src/agent/protocol'
 
 const FIXTURE = path.join(process.cwd(), 'test', 'fixtures', 'sample-site.dxf')
 const CONTROL_URL = 'http://127.0.0.1:8788'
@@ -167,6 +166,100 @@ const ACI7_MTEXT_DXF = [
   0, 'ENDSEC',
   0, 'EOF'
 ].join('\n')
+
+function createLargeSelectionDxf(count = 209): string {
+  const lines: string[] = []
+  const push = (code: number, value: string | number) => {
+    lines.push(String(code), String(value))
+  }
+
+  push(0, 'SECTION')
+  push(2, 'HEADER')
+  push(9, '$ACADVER')
+  push(1, 'AC1018')
+  push(9, '$INSUNITS')
+  push(70, 6)
+  push(0, 'ENDSEC')
+  push(0, 'SECTION')
+  push(2, 'TABLES')
+  push(0, 'TABLE')
+  push(2, 'LAYER')
+  push(70, 2)
+  for (const [handle, name, color] of [
+    ['4', '0', 7],
+    ['5', 'ANNOTATION', 7]
+  ] as const) {
+    push(0, 'LAYER')
+    push(5, handle)
+    push(100, 'AcDbSymbolTableRecord')
+    push(100, 'AcDbLayerTableRecord')
+    push(2, name)
+    push(70, 0)
+    push(62, color)
+    push(6, 'CONTINUOUS')
+  }
+  push(0, 'ENDTAB')
+  push(0, 'TABLE')
+  push(2, 'BLOCK_RECORD')
+  push(5, '2')
+  push(330, '0')
+  push(100, 'AcDbSymbolTable')
+  push(70, 1)
+  push(0, 'BLOCK_RECORD')
+  push(5, '10')
+  push(330, '2')
+  push(100, 'AcDbSymbolTableRecord')
+  push(100, 'AcDbBlockTableRecord')
+  push(2, '*Model_Space')
+  push(70, 0)
+  push(280, 1)
+  push(281, 0)
+  push(0, 'ENDTAB')
+  push(0, 'ENDSEC')
+  push(0, 'SECTION')
+  push(2, 'BLOCKS')
+  push(0, 'BLOCK')
+  push(5, '11')
+  push(330, '10')
+  push(100, 'AcDbEntity')
+  push(8, '0')
+  push(100, 'AcDbBlockBegin')
+  push(2, '*Model_Space')
+  push(70, 0)
+  push(10, 0)
+  push(20, 0)
+  push(30, 0)
+  push(3, '*Model_Space')
+  push(1, '')
+  push(0, 'ENDBLK')
+  push(5, '12')
+  push(330, '10')
+  push(100, 'AcDbEntity')
+  push(8, '0')
+  push(100, 'AcDbBlockEnd')
+  push(0, 'ENDSEC')
+  push(0, 'SECTION')
+  push(2, 'ENTITIES')
+  for (let index = 0; index < count; index += 1) {
+    push(0, 'MTEXT')
+    push(5, (0x100 + index).toString(16).toUpperCase())
+    push(330, '10')
+    push(100, 'AcDbEntity')
+    push(8, 'ANNOTATION')
+    push(62, 256)
+    push(100, 'AcDbMText')
+    push(10, index % 20)
+    push(20, Math.floor(index / 20))
+    push(30, 0)
+    push(40, 1)
+    push(41, 30)
+    push(71, 1)
+    push(1, `LABEL-${index.toString().padStart(3, '0')}-${'x'.repeat(120)}`)
+  }
+  push(0, 'ENDSEC')
+  push(0, 'EOF')
+  return `${lines.join('\n')}\n`
+}
 
 interface TestEntity {
   id: string
@@ -772,6 +865,198 @@ test.describe.serial('EnvCAD preview with scripted fake sidecar', () => {
     expect(variance.brightnessRange).toBeGreaterThan(20)
   })
 
+  test('discovers a drawing without selection and pages all 209 selected entities without overflow', async ({
+    page,
+    request
+  }) => {
+    await page.goto('/')
+    await expect.poll(() => page.evaluate(() => Boolean(window.__cadTest))).toBe(true)
+    const dxf = createLargeSelectionDxf()
+    await page.evaluate(
+      ({ name, text }) => window.__cadTest?.openTextFile(name, text),
+      { name: 'large-selection.dxf', text: dxf }
+    )
+    await expect
+      .poll(() => page.evaluate(() => window.__cadTest?.entities().length ?? 0))
+      .toBe(209)
+    await expect(page.getByText('Selection optional')).toBeVisible()
+
+    const result = await page.evaluate(async () => {
+      const api = window.__cadTest!
+      api.clearSelection()
+      const context = await api.callTool('get_drawing_context', {})
+      const layers = await api.callTool('list_layers', {})
+
+      const listIds: string[] = []
+      const listPageCharacters: number[] = []
+      let listCursor = 0
+      let listPages = 0
+      do {
+        const pageResult = await api.callTool('list_entities', {
+          layers: ['ANNOTATION'],
+          cursor: listCursor,
+          pageSize: 500,
+          detail: 'geometry'
+        })
+        if (pageResult.error) throw new Error(pageResult.error)
+        const data = pageResult.data as {
+          entities: Array<{ id: string }>
+          hasMore: boolean
+          nextCursor: number | null
+        }
+        listIds.push(...data.entities.map((entity) => entity.id))
+        listPageCharacters.push(JSON.stringify(pageResult.data).length)
+        listPages += 1
+        if (!data.hasMore) break
+        listCursor = data.nextCursor as number
+      } while (true)
+
+      api.select(listIds)
+      const selectedIds: string[] = []
+      const selectionPageCharacters: number[] = []
+      let selectionCursor = 0
+      let selectionPages = 0
+      do {
+        const pageResult = await api.callTool('get_selected_entities', {
+          ids: listIds,
+          cursor: selectionCursor,
+          pageSize: 500,
+          detail: 'geometry'
+        })
+        if (pageResult.error) throw new Error(pageResult.error)
+        const data = pageResult.data as {
+          entities: Array<{ id: string }>
+          hasMore: boolean
+          nextCursor: number | null
+        }
+        selectedIds.push(...data.entities.map((entity) => entity.id))
+        selectionPageCharacters.push(JSON.stringify(pageResult.data).length)
+        selectionPages += 1
+        if (!data.hasMore) break
+        selectionCursor = data.nextCursor as number
+      } while (true)
+
+      api.clearSelection()
+      const edited = await api.callTool('change_text', {
+        entityId: listIds[0],
+        newText: 'FORMATTED WITHOUT SELECTION'
+      })
+      const readBack = await api.callTool('list_entities', {
+        entityIds: [listIds[0]],
+        detail: 'geometry'
+      })
+      return {
+        context: context.data,
+        layers: layers.data,
+        listIds,
+        listPages,
+        listPageCharacters,
+        selectedIds,
+        selectionPages,
+        selectionPageCharacters,
+        selectionAfterEdit: api.selection(),
+        edited,
+        readBack: readBack.data,
+        canUndo: api.canUndo()
+      }
+    })
+
+    expect(result.context).toMatchObject({
+      entityCount: 209,
+      entityDiscovery: {
+        tool: 'list_entities',
+        selectionRequired: false,
+        paginated: true
+      }
+    })
+    expect(result.layers).toMatchObject({
+      layerCount: 2,
+      hasMore: false
+    })
+    expect(result.listIds).toHaveLength(209)
+    expect(result.listPages).toBeGreaterThan(1)
+    expect(Math.max(...result.listPageCharacters)).toBeLessThan(32_000)
+    expect(result.selectedIds).toEqual(result.listIds)
+    expect(result.selectionPages).toBeGreaterThan(1)
+    expect(Math.max(...result.selectionPageCharacters)).toBeLessThan(32_000)
+    expect(result.selectionAfterEdit).toEqual([])
+    expect(result.edited.error).toBeUndefined()
+    expect(
+      (
+        result.readBack as {
+          entities: Array<{ geometry: { content: string } }>
+        }
+      ).entities[0].geometry.content
+    ).toBe('FORMATTED WITHOUT SELECTION')
+    expect(result.canUndo).toBe(true)
+
+    await page.keyboard.press('Control+z')
+    await expect
+      .poll(async () => {
+        const read = await page.evaluate(async (entityId) => {
+          const result = await window.__cadTest?.callTool('list_entities', {
+            entityIds: [entityId],
+            detail: 'geometry'
+          })
+          return (
+            result?.data as
+              | { entities?: Array<{ geometry?: { content?: string } }> }
+              | undefined
+          )?.entities?.[0]?.geometry?.content
+        }, result.listIds[0])
+        return read
+      })
+      .toContain('LABEL-000-')
+
+    await request.post(`${CONTROL_URL}/reset-stats`)
+    const beforeAgentMove = byId(
+      await page.evaluate(() => window.__cadTest?.entities() ?? []),
+      result.listIds
+    )
+    await page.evaluate(
+      (entityIds) => window.__cadTest?.select(entityIds),
+      result.listIds
+    )
+    await expect(page.locator('.selection-chip')).toContainText('209 objects')
+    await page.locator('.chat-textarea').fill(
+      'Move every attached entity five drawing units to the right.'
+    )
+    await page.getByRole('button', { name: 'Send' }).click()
+    await expect(page.locator('.bubble.assistant').last()).toContainText(
+      'scripted move completed'
+    )
+
+    const selectionReads = page
+      .locator('.tool-chip')
+      .filter({ hasText: 'get_selected_entities' })
+    const verificationReads = page
+      .locator('.tool-chip')
+      .filter({ hasText: 'list_entities' })
+    expect(await selectionReads.count()).toBeGreaterThan(1)
+    expect(await verificationReads.count()).toBeGreaterThan(1)
+    expect(
+      await page.locator('.tool-chip').filter({ hasText: 'move_entities' }).count()
+    ).toBeGreaterThanOrEqual(1)
+    const afterAgentMove = byId(
+      await page.evaluate(() => window.__cadTest?.entities() ?? []),
+      result.listIds
+    )
+    expect(afterAgentMove).toHaveLength(beforeAgentMove.length)
+    afterAgentMove.forEach((entity, index) => {
+      expect(entity.bbox?.minX).toBe(
+        (beforeAgentMove[index].bbox?.minX ?? 0) + 5
+      )
+      expect(entity.bbox?.maxX).toBe(
+        (beforeAgentMove[index].bbox?.maxX ?? 0) + 5
+      )
+      expect(entity.bbox?.minY).toBe(beforeAgentMove[index].bbox?.minY)
+      expect(entity.bbox?.maxY).toBe(beforeAgentMove[index].bbox?.maxY)
+    })
+    const stats = await (await request.get(`${CONTROL_URL}/stats`)).json()
+    expect(stats.userMessageCount).toBe(1)
+    expect(stats.toolResultCount).toBeGreaterThan(3)
+  })
+
   test('captures the exact shared Sheet Preview SVG as bounded full and quadrant images while its tab is hidden', async ({
     page
   }) => {
@@ -1118,8 +1403,10 @@ test.describe.serial('EnvCAD preview with scripted fake sidecar', () => {
       return window.__cadTest!.callTool('get_view_status', {})
     })
     expect(editedStatus.data).toMatchObject({ completeExtentsFit: false })
-    await expect(page.getByRole('button', { name: 'Undo' })).toBeEnabled()
-    await page.getByRole('button', { name: 'Undo' }).click()
+    await expect(
+      page.getByRole('button', { name: 'Undo', exact: true })
+    ).toBeEnabled()
+    await page.getByRole('button', { name: 'Undo', exact: true }).click()
     await expect
       .poll(() => page.evaluate(() => window.__cadTest!.entities().length))
       .toBe(originalEntities.length)
@@ -1472,18 +1759,30 @@ test.describe.serial('EnvCAD preview with scripted fake sidecar', () => {
     expect(geometryFingerprint(saved)).toBe(geometryFingerprint(reopened))
   })
 
-  test('moves attached entities by +5 through chat and Ctrl+Z restores them', async ({
+  test('uses the frozen turn selection even when the live selection changes, then Ctrl+Z restores the edit', async ({
     page,
     request
   }) => {
     await loadFixture(page)
     await request.post(`${CONTROL_URL}/reset-stats`)
+    await request.post(`${CONTROL_URL}/delay?ms=750`)
     const selectedIds = await page.evaluate(() => window.__cadTest?.selectByLayer('BUILDINGS') ?? [])
     expect(selectedIds).toHaveLength(2)
+    const boundaryIds = await page.evaluate(
+      () =>
+        window.__cadTest
+          ?.entities()
+          .filter((entity) => entity.layer === 'BOUNDARY')
+          .map((entity) => entity.id) ?? []
+    )
 
     const before = byId(
       await page.evaluate(() => window.__cadTest?.entities() ?? []),
       selectedIds
+    )
+    const boundaryBefore = byId(
+      await page.evaluate(() => window.__cadTest?.entities() ?? []),
+      boundaryIds
     )
     expect(before).toHaveLength(2)
     await expect(page.locator('.selection-chip')).toContainText('2 objects')
@@ -1492,6 +1791,15 @@ test.describe.serial('EnvCAD preview with scripted fake sidecar', () => {
     await expect(input).toBeEnabled()
     await input.fill('Move these buildings five units to the right.')
     await page.getByRole('button', { name: 'Send' }).click()
+
+    const selectionRead = page
+      .locator('.tool-chip')
+      .filter({ hasText: 'get_selected_entities' })
+    await expect(selectionRead).toHaveClass(/ok/)
+    const replacementSelection = await page.evaluate(
+      () => window.__cadTest?.selectByLayer('BOUNDARY') ?? []
+    )
+    expect(replacementSelection).toEqual(boundaryIds)
 
     const tool = page.locator('.tool-chip').filter({ hasText: 'move_entities' })
     await expect(tool).toHaveClass(/ok/)
@@ -1507,6 +1815,12 @@ test.describe.serial('EnvCAD preview with scripted fake sidecar', () => {
       expect(entity.bbox?.minY).toBe(before[index].bbox?.minY)
       expect(entity.bbox?.maxY).toBe(before[index].bbox?.maxY)
     })
+    expect(
+      byId(
+        await page.evaluate(() => window.__cadTest?.entities() ?? []),
+        boundaryIds
+      )
+    ).toEqual(boundaryBefore)
     await expect.poll(() => page.evaluate(() => window.__cadTest?.canUndo())).toBe(true)
 
     await page.locator('.canvas-host').click({ position: { x: 20, y: 20 } })
@@ -1518,7 +1832,96 @@ test.describe.serial('EnvCAD preview with scripted fake sidecar', () => {
       .toEqual(before)
 
     const stats = await (await request.get(`${CONTROL_URL}/stats`)).json()
-    expect(stats).toMatchObject({ userMessageCount: 1, toolResultCount: 1 })
+    expect(stats).toMatchObject({ userMessageCount: 1, toolResultCount: 3 })
+  })
+
+  test('inspects the complete drawing and layers through chat with nothing selected', async ({
+    page,
+    request
+  }) => {
+    const before = await loadFixture(page)
+    await request.post(`${CONTROL_URL}/reset-stats`)
+    await page.evaluate(() => window.__cadTest?.clearSelection())
+    await expect(page.locator('.selection-hint')).toContainText(
+      'Selection optional'
+    )
+
+    const input = page.locator('.chat-textarea')
+    await input.fill('Inspect the complete drawing and all layers without a selection.')
+    await page.getByRole('button', { name: 'Send' }).click()
+
+    await expect(
+      page.locator('.tool-chip').filter({ hasText: 'list_layers' })
+    ).toHaveClass(/ok/)
+    await expect(
+      page.locator('.tool-chip').filter({ hasText: 'list_entities' })
+    ).toHaveClass(/ok/)
+    await expect(
+      page.locator('.tool-chip').filter({ hasText: 'get_selected_entities' })
+    ).toHaveCount(0)
+    await expect(page.locator('.bubble.assistant').last()).toContainText(
+      'drawing-wide inspection completed'
+    )
+    expect(await page.evaluate(() => window.__cadTest?.entities() ?? [])).toEqual(
+      before
+    )
+
+    const stats = await (await request.get(`${CONTROL_URL}/stats`)).json()
+    expect(stats).toMatchObject({ userMessageCount: 1, toolResultCount: 2 })
+  })
+
+  test('rejects a pending AI edit if Undo changes the drawing after inspection', async ({
+    page,
+    request
+  }) => {
+    const original = await loadFixture(page)
+    await request.post(`${CONTROL_URL}/reset-stats`)
+    await request.post(`${CONTROL_URL}/delay?ms=1000`)
+    const selectedIds = await page.evaluate(
+      () => window.__cadTest?.selectByLayer('BUILDINGS') ?? []
+    )
+    expect(selectedIds).toHaveLength(2)
+    const prepared = await page.evaluate((entityIds) => {
+      return window.__cadTest?.callTool('move_entities', {
+        entityIds,
+        dx: 1,
+        dy: 0
+      })
+    }, selectedIds)
+    expect(prepared).toMatchObject({
+      data: { entityIds: selectedIds, dx: 1, dy: 0 }
+    })
+    await page.evaluate((entityIds) => window.__cadTest?.select(entityIds), selectedIds)
+
+    const input = page.locator('.chat-textarea')
+    await input.fill('Move these buildings five units to the right.')
+    await page.getByRole('button', { name: 'Send' }).click()
+    await expect(
+      page.locator('.tool-chip').filter({ hasText: 'get_selected_entities' })
+    ).toHaveClass(/ok/)
+
+    await expect(
+      page.getByRole('button', { name: 'Undo', exact: true })
+    ).toBeEnabled()
+    await page.getByRole('button', { name: 'Undo', exact: true }).click()
+    await expect
+      .poll(() => page.evaluate(() => window.__cadTest?.entities() ?? []))
+      .toEqual(original)
+
+    const rejectedMove = page
+      .locator('.tool-chip.error')
+      .filter({ hasText: 'move_entities' })
+    await expect(rejectedMove).toContainText(
+      'the drawing changed since this AI turn began'
+    )
+    await expect(rejectedMove).toContainText('No CAD change was made')
+    await expect(page.locator('.status-text')).toHaveText('Idle')
+    expect(await page.evaluate(() => window.__cadTest?.entities() ?? [])).toEqual(
+      original
+    )
+
+    const stats = await (await request.get(`${CONTROL_URL}/stats`)).json()
+    expect(stats).toMatchObject({ userMessageCount: 1, toolResultCount: 2 })
   })
 
   test('discovers provider-specific models and effort options with keyboard-safe layouts', async ({
@@ -1540,6 +1943,9 @@ test.describe.serial('EnvCAD preview with scripted fake sidecar', () => {
       'Low',
       'High'
     ])
+    await expect(page.locator('.skill-badge')).toHaveText(
+      'CAD Skills · always active'
+    )
 
     await provider.focus()
     await expect(provider).toBeFocused()
@@ -1653,7 +2059,7 @@ test.describe.serial('EnvCAD preview with scripted fake sidecar', () => {
     await sendLongPrompt('openai-codex', 2)
   })
 
-  test('rejects an oversized complete request locally while preserving the draft and socket', async ({
+  test('streams a formerly oversized request through a local reference without disconnecting', async ({
     page,
     request
   }) => {
@@ -1661,7 +2067,7 @@ test.describe.serial('EnvCAD preview with scripted fake sidecar', () => {
     await request.post(`${CONTROL_URL}/reset-stats`)
     const input = page.locator('.chat-textarea')
     const oversizedDraft = `BEGIN-OVERSIZED\n${'x'.repeat(
-      MAX_WEBSOCKET_PAYLOAD_BYTES
+      2 * 1024 * 1024
     )}\nEND-OVERSIZED`
     await input.evaluate((element, value) => {
       const textarea = element as HTMLTextAreaElement
@@ -1672,25 +2078,30 @@ test.describe.serial('EnvCAD preview with scripted fake sidecar', () => {
       .poll(() => input.evaluate((element) => (element as HTMLTextAreaElement).value.length))
       .toBe(oversizedDraft.length)
 
-    await page.getByRole('button', { name: 'Send' }).click()
+    await page.getByRole('button', { name: 'Send', exact: true }).click()
 
-    await expect(page.locator('.bubble.error').last()).toContainText(
-      'complete AI request'
-    )
-    await expect(page.locator('.bubble.error').last()).toContainText(
-      '2 MiB transport capacity'
-    )
-    await expect(page.locator('.bubble.user')).toHaveCount(0)
-    await expect
-      .poll(() => input.evaluate((element) => (element as HTMLTextAreaElement).value.length))
-      .toBe(oversizedDraft.length)
+    await expect(page.locator('.activity-card.terminal').last()).toBeVisible()
+    const rendered = await page.locator('.bubble.user').last().innerText()
+    expect(rendered.length).toBeLessThan(5_000)
+    expect(rendered).toContain('Large instruction stored locally')
+    expect(rendered).toContain('BEGIN-OVERSIZED')
+    expect(rendered).toContain('END-OVERSIZED')
+    await expect(input).toHaveValue('')
     await expect(page.locator('.offline-banner')).toBeHidden()
     await expect(input).toBeEnabled()
     const stats = await (await request.get(`${CONTROL_URL}/stats`)).json()
     expect(stats).toMatchObject({
       wsRunning: true,
-      userMessageCount: 0
+      userMessageCount: 1,
+      lastPromptEvidence: {
+        characters: oversizedDraft.length,
+        utf8Bytes: Buffer.byteLength(oversizedDraft, 'utf8'),
+        sha256: createHash('sha256')
+          .update(oversizedDraft, 'utf8')
+          .digest('hex')
+      }
     })
+    expect(stats.lastPromptEvidence.utf8Bytes).toBeGreaterThan(2 * 1024 * 1024)
   })
 
   test('locks configuration during a turn, labels responses, and starts a new conversation on switch', async ({
@@ -1755,14 +2166,17 @@ test.describe.serial('EnvCAD preview with scripted fake sidecar', () => {
     await expect(page.locator('.provider-message')).toContainText(
       'Install Codex CLI, run "codex login", then refresh.'
     )
-    await expect(page.locator('.chat-textarea')).toBeDisabled()
+    const composer = page.locator('.chat-textarea')
+    await expect(composer).toBeEditable()
+    await composer.fill('Keep this provider recovery draft.')
     await expect(
       page.getByRole('button', { name: 'Open', exact: true })
     ).toBeEnabled()
 
     await request.post(`${CONTROL_URL}/scenario?name=ready`)
     await expect(page.locator('.readiness-badge')).toHaveText('ready')
-    await expect(page.locator('.chat-textarea')).toBeEnabled()
+    await expect(composer).toBeEditable()
+    await expect(composer).toHaveValue('Keep this provider recovery draft.')
 
     await request.post(`${CONTROL_URL}/scenario?name=both-unavailable`)
     await expect(page.locator('.readiness-badge')).toHaveText(
@@ -1771,7 +2185,8 @@ test.describe.serial('EnvCAD preview with scripted fake sidecar', () => {
     await expect(page.locator('.provider-message')).toContainText(
       'Run "codex login", then refresh.'
     )
-    await expect(page.locator('.chat-textarea')).toBeDisabled()
+    await expect(composer).toBeEditable()
+    await expect(composer).toHaveValue('Keep this provider recovery draft.')
     await expect(
       page.getByRole('button', { name: 'Open', exact: true })
     ).toBeEnabled()
@@ -1867,7 +2282,7 @@ test.describe.serial('EnvCAD preview with scripted fake sidecar', () => {
     })
     expect(pageErrors).toEqual([])
 
-    await page.getByRole('button', { name: 'Undo' }).click()
+    await page.getByRole('button', { name: 'Undo', exact: true }).click()
     await expect
       .poll(() => page.evaluate(() => window.__cadTest?.entities() ?? []))
       .toEqual(originalEntities)
@@ -1901,19 +2316,36 @@ test.describe.serial('EnvCAD preview with scripted fake sidecar', () => {
     ).toBeNull()
   })
 
-  test('shows offline disabled chat and reconnects when the fake sidecar starts', async ({
+  test('preserves an offline follow-up and sends it after the fake sidecar reconnects', async ({
     page,
     request
   }) => {
     await loadFixture(page)
+    await request.post(`${CONTROL_URL}/reset-stats`)
     await request.post(`${CONTROL_URL}/stop`)
     try {
       await expect(page.locator('.offline-banner')).toBeVisible()
-      await expect(page.locator('.chat-textarea')).toBeDisabled()
+      const composer = page.locator('.chat-textarea')
+      await expect(composer).toBeEditable()
+      await composer.fill('Inspect the drawing after the connection returns.')
+      await page.getByRole('button', { name: 'Queue follow-up' }).click()
+      await expect(
+        page.getByRole('region', { name: 'Queued assistant follow-ups' })
+      ).toContainText('Inspect the drawing after the connection returns.')
 
       await request.post(`${CONTROL_URL}/start`)
       await expect(page.locator('.offline-banner')).toBeHidden()
-      await expect(page.locator('.chat-textarea')).toBeEnabled()
+      await expect(composer).toBeEditable()
+      await expect(page.locator('.activity-card.terminal')).toBeVisible()
+      await expect(
+        page.getByRole('region', { name: 'Queued assistant follow-ups' })
+      ).toHaveCount(0)
+      await expect
+        .poll(async () => {
+          const stats = await request.get(`${CONTROL_URL}/stats`)
+          return (await stats.json()).userMessageCount as number
+        })
+        .toBe(1)
     } finally {
       await request.post(`${CONTROL_URL}/start`)
     }

@@ -343,8 +343,9 @@ describe('ClaudeProvider', () => {
     ).rejects.toThrow('Claude security boundary rejected non-CAD tools: WebFetch')
   })
 
-  it('surfaces the CAD-tool failure when stopping the SDK turn raises an interrupt error', async () => {
+  it('returns a CAD domain failure to Claude so the same turn can repair it', async () => {
     const discoveryQuery = fakeQuery([], models)
+    let forwardedResult: unknown
     let turnOptions:
       | {
           mcpServers: Record<
@@ -372,13 +373,17 @@ describe('ClaudeProvider', () => {
           model: 'claude-opus-test',
           tools: ['mcp__cad__draw_line']
         }
-        await turnOptions!.mcpServers.cad.instance._registeredTools.draw_line.handler(
-          {
+        forwardedResult =
+          await turnOptions!.mcpServers.cad.instance._registeredTools.draw_line.handler({
             start: { x: 0, y: 0 },
             end: { x: 1, y: 0 }
-          }
-        )
-        throw new Error('SDK turn interrupted')
+          })
+        yield {
+          type: 'result',
+          subtype: 'success',
+          session_id: 'session-1',
+          usage: { input_tokens: 8, output_tokens: 3 }
+        }
       },
       interrupt: vi.fn(async () => undefined),
       close: vi.fn()
@@ -400,13 +405,18 @@ describe('ClaudeProvider', () => {
       }
     )
 
-    await expect(
-      collect(conversation.runTurn({ prompt: 'draw' }))
-    ).rejects.toThrow(
-      'Claude CAD tool draw_line failed: Layer not found: AI_BENCHMARK'
-    )
-    expect(turnQuery.interrupt).toHaveBeenCalledOnce()
-    expect(turnQuery.close).toHaveBeenCalledOnce()
+    await expect(collect(conversation.runTurn({ prompt: 'draw' }))).resolves.toEqual([
+      { type: 'resolved_model', model: 'claude-opus-test' },
+      { type: 'token_usage', inputTokens: 8, outputTokens: 3 }
+    ])
+    expect(forwardedResult).toEqual({
+      content: [
+        { type: 'text', text: 'Layer not found: AI_BENCHMARK' }
+      ],
+      isError: true
+    })
+    expect(turnQuery.interrupt).not.toHaveBeenCalled()
+    expect(turnQuery.close).not.toHaveBeenCalled()
   })
 
   it('closes authoritatively without waiting for a wedged interrupt acknowledgement', async () => {

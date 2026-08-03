@@ -385,6 +385,28 @@ export function installAgentTestHarness() {
 
         const unsubscribe = agentBridge.subscribe((message) => {
           switch (message.type) {
+            case 'durable_event': {
+              const event = message.envelope.payload
+              if (event.type === 'assistant_text_delta') {
+                assistantText += event.text
+              } else if (event.type === 'turn_finished') {
+                if (
+                  event.outcome === 'completed' ||
+                  event.outcome === 'recovered'
+                ) {
+                  finish(() => resolve({ assistantText, toolCalls }))
+                } else {
+                  finish(() =>
+                    reject(
+                      new Error(
+                        event.error?.userMessage ?? event.status
+                      )
+                    )
+                  )
+                }
+              }
+              break
+            }
             case 'assistant_text_delta':
               assistantText += message.text
               break

@@ -2,6 +2,18 @@
 
 Normal automated suites are deterministic and never send a real Claude or Codex
 model request. Live provider calls require the separate `--live` benchmark flag.
+AI acceptance covers the always-active `earthtojake/text-to-cad` invocation
+marker, selection-free drawing discovery, lossless continuation of a 209-entity
+selection through chat, bounded escape-heavy text pages, and pre-execution
+input rejection for oversized mutation batches. A separate defense test proves
+that any unexpected oversized successful mutation result remains a compact
+provider success instead of becoming a false post-commit failure.
+
+Protocol-v2 coverage additionally proves durable acknowledgment and replay,
+exactly one terminal outcome, operation idempotency and uncertainty barriers,
+large-input references, verified skill routing, context budgeting,
+revision-bound visual evidence, supervised recovery, persistent drafts/queues,
+and the Assistant Workbench accessibility contract.
 
 ## Prerequisites
 
@@ -23,6 +35,10 @@ Coverage includes:
 
 - CAD geometry, measurements, annotations, import, sheets, autosave, and file
   safety;
+- selection-free entity/layer discovery, compact provider JSON, 209-entity
+  continuation paging, exact long-text/polyline continuation, entity color
+  modes, case-insensitive layer handling, >100-layer continuation, bounded
+  overlap-cluster segments, and undoable layer/entity-color edits;
 - the canonical CAD tool catalog and equivalent Claude/Codex schemas;
 - argument validation before browser dispatch, serialization, timeouts, tool
   failure propagation, and one-call/one-undo behavior;
@@ -39,14 +55,29 @@ Coverage includes:
 - exact 4,000-, 4,001-, 16,000-, Unicode, multiline, and substantially larger
   prompt preservation through protocol, renderer, WebSocket, sidecar, context
   construction, Claude, and Codex boundaries;
-- exact complete-request UTF-8 boundary acceptance/rejection, dynamic selection
-  capacity, draft preservation, no false user turn, and no socket disconnect;
+- exact complete-request UTF-8 boundary acceptance/rejection, browser-local
+  20,000-ID frozen selection, draft preservation, no false user turn, and no
+  socket disconnect;
 - strict protocol catalogs, revisions, metrics, malformed messages, and reset
   acknowledgement;
+- protocol-v2 envelopes, monotonic replay cursors, exactly-one-terminal state
+  transitions, renderer projection recovery, and checksummed desktop journals;
+- durable operation receipts, repeated idempotency keys, stale full-workspace
+  revisions, cancellation, unknown-operation barriers, 31-second reconciliation,
+  complete rollback after partial copy, and grouped undo;
+- 100 MiB chunked input with exact beginning/middle/end sentinels, resumed
+  ingestion, per-chunk and complete hashes, binary/text range separation, quota
+  exhaustion, context-overflow denial, and large-instruction skill routing;
+- mandatory/conditional skill activation, digest corruption, capability
+  allowlisting, mutation-time integrity checks, intent-scoped Claude MCP
+  registration, and pre-mutation context-result reservation;
+- 100,000-entity indexed drawing-read performance and revision-bound visual
+  evidence validation;
 - atomic/corrupt preference behavior and the Claude existing-user default;
 - renderer fallback, persistence projection, no cross-provider fallback,
-  turn-time configuration locking, stale acknowledgement handling, and
-  socket-generation isolation after an interrupted turn.
+  turn-time configuration locking, stale acknowledgement handling,
+  drawing-revision compare-and-swap, and socket-generation isolation after an
+  interrupted turn.
 
 Provider tests use deterministic fake adapters. They do not invoke installed
 provider executables.
@@ -59,22 +90,27 @@ npm run test:e2e
 
 Playwright builds the renderer with `.env.e2e` and starts
 `test/fakeSidecar.ts`. The fake sidecar advertises provider-specific Claude and
-Codex model catalogs and performs a deterministic CAD move.
+Codex model catalogs and performs deterministic drawing discovery and CAD
+edits.
 
 The suite verifies:
 
 - real DXF open/render pixels, theme, page setup, DXF/PDF download, and
   undo/redo;
 - provider/model/effort dropdown population and model-dependent efforts;
-- keyboard selection and 280/420 px chat-panel layout without overflow;
+- keyboard selection and a resizable 340-560 px Assistant Workbench, with a
+  true 400 px default, visible focus, status announcements, and reduced motion;
+- selection-free whole-drawing/layer inspection, frozen-selection behavior
+  after the live selection changes, and rejection of a delayed edit after Undo;
 - >4,000-character Claude and Codex submissions with SHA-256/length/sentinel
-  evidence, plus local rejection of a synthetic >2 MiB request without clearing
-  the draft or disconnecting;
+  evidence, plus streaming of a formerly oversized request into a local
+  reference without rendering its body, clearing the draft, or disconnecting;
 - turn-time control locking, response provider/model/effort/metrics labels, and
   new-conversation boundaries;
 - provider missing/auth-required recovery while CAD stays usable;
 - strict one-message/one-browser-tool behavior;
-- malformed DXF recovery and sidecar reconnect.
+- malformed DXF recovery, offline queue replay, durable renderer reload,
+  mandatory skill cards, and evidence-bound visual verification.
 
 No Anthropic or OpenAI endpoint is contacted.
 
@@ -93,6 +129,8 @@ Playwright Electron. It checks:
 - authenticated WebSocket round-trip and invalid-token rejection;
 - single-instance behavior;
 - strict persisted AI preferences;
+- protected composer draft recovery across a full application restart and
+  changed random renderer origin;
 - CAD availability with blocked key variables;
 - Claude/Codex missing and signed-out/incompatible-style failure states through
   isolated environments;
@@ -115,7 +153,7 @@ signature/hash/size, and the final installed version.
 
 ### Dependency-audit findings
 
-As of 2026-07-28, `npm audit --omit=dev` reports one high and two moderate
+As of 2026-07-29, `npm audit --omit=dev` reports one high and two moderate
 findings from the same `lodash-es` package already present in the v0.1.1
 dependency graph:
 
@@ -191,8 +229,9 @@ the exact installed `app.asar`, refreshes provider discovery twice, sends one
 meaningful >4,000-character Unicode CAD request through both Codex and Claude,
 compares the exact UI prompt with hashes/lengths/sentinel positions recorded at
 each provider boundary, verifies required tool calls and saved/reopened 10 m by
-6 m DXF geometry, and captures screenshots. It also rejects a synthetic >2 MiB
-complete request without clearing the draft, adding a false user turn, calling
-a provider, or disconnecting; then relaunches and confirms both sidecar ports
-close. Raw evidence stays under ignored `output/desktop/installed-acceptance/`;
-prompt bodies are never written to evidence or logs.
+6 m DXF geometry, and captures screenshots. Current release acceptance must
+stream oversized instructions into the local authoritative store and verify
+bounded provider retrieval rather than expect a transport rejection. It then
+relaunches and confirms both sidecar ports close. Raw evidence stays under
+ignored `output/desktop/installed-acceptance/`; prompt bodies are never written
+to evidence or logs.

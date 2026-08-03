@@ -283,7 +283,7 @@ test('packaged EnvCAD keeps CAD available when both provider CLIs are missing', 
   }
 })
 
-test('packaged EnvCAD persists non-secret AI preferences across restarts', async () => {
+test('packaged EnvCAD persists AI preferences and an exact protected draft across restarts', async () => {
   const profile = await mkdtemp(path.join(tmpdir(), 'envcad-preferences-profile-'))
   const environment = cleanEnvironment()
   environment.PATH = path.join(environment.SystemRoot ?? 'C:\\Windows', 'System32')
@@ -300,6 +300,7 @@ test('packaged EnvCAD persists non-secret AI preferences across restarts', async
     args: [PRODUCTION_ASAR],
     env: environment
   })
+  const draft = '  Protected restart draft\nUnicode αβ🌏  '
   try {
     const page = await application.firstWindow()
     await expect(page.getByRole('button', { name: 'Open', exact: true })).toBeVisible()
@@ -315,6 +316,15 @@ test('packaged EnvCAD persists non-secret AI preferences across restarts', async
         return saved.selectedProvider
       })
       .toBe('openai-codex')
+    await page.getByRole('button', { name: 'AI Assistant' }).click()
+    await page.locator('.chat-textarea').fill(draft)
+    await expect
+      .poll(() =>
+        page.evaluate(() =>
+          window.envcadDesktop!.loadAgentState('envcad.agent.drafts.v1')
+        )
+      )
+      .toContain('Protected restart draft')
   } finally {
     await application.close()
   }
@@ -330,6 +340,8 @@ test('packaged EnvCAD persists non-secret AI preferences across restarts', async
     const provider = page.getByLabel('AI provider', { exact: true })
     await expect(provider.locator('option')).toHaveCount(2)
     await expect(provider).toHaveValue('openai-codex')
+    await page.getByRole('button', { name: 'AI Assistant' }).click()
+    await expect(page.locator('.chat-textarea')).toHaveValue(draft)
     expect(
       (await page.evaluate(() => window.envcadDesktop!.getAiPreferences()))
         .selectedProvider

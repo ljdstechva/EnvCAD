@@ -1,12 +1,20 @@
 # AI Assistant scripted acceptance dialogues
 
+The sidecar must verify the exact pinned upstream CAD/DXF skill sources at
+startup, compile their bounded manifests, and visibly activate `cad-core` and
+`dxf-core` before every accepted turn. Full skill sources must not be duplicated
+in each provider prompt. Large read
+sets must be consumed through all continuation pages before the first edit;
+large mutations must be preflighted and automatically completed through
+bounded operation batches without asking the user to reselect entities.
+
 These dialogues exercise CAD behavior end to end:
 real chat UI → provider-neutral sidecar → selected Claude/Codex adapter →
 canonical CAD tool → browser executor → drawing database. Each case names the
 tool calls and observable result, so a regression is concrete.
 
 The run log below is the historical Claude Code pass from 2026-07-26. EnvCAD
-v0.2.3 applies the same catalog and schemas to both providers; the installed
+v0.2.4 applies the same catalog and schemas to both providers; the installed
 cross-provider deterministic creation/annotation evidence is recorded in
 `docs/ai-benchmark.md`.
 
@@ -23,7 +31,7 @@ cross-provider deterministic creation/annotation evidence is recorded in
 Entity ids in this document (`35`, `36`, …) are the handles this fixture
 produces on a clean load. They are stable per load, not across edits.
 
-For v0.2.3 visual release acceptance, unit tests intentionally corrupt a valid
+For v0.2.4 visual release acceptance, unit tests intentionally corrupt a valid
 PNG's reported SHA-256 and require rejection independently at the renderer-send
 and sidecar-receive boundaries. Claude tests also require one streaming query
 across multiple turns, `persistSession: false`, and no `resume`. The installed
@@ -54,9 +62,11 @@ Each dialogue is a fresh start:
    from the `[agent-bridge]` protocol log that `src/agent/bridge.ts` emits in
    dev builds.
 
-`get_selected_entities` always appears in the log with the ids the sidecar
-substituted from the frozen snapshot, not with whatever Claude passed — see
-"Selection snapshot semantics" in `docs/agent-protocol.md`.
+`get_selected_entities` appears in the public log without private frozen IDs.
+The renderer injects those IDs from its turn-local snapshot only at browser
+execution time. It also strips the private drawing-revision binding before
+showing the call in the UI — see "Selection snapshot semantics" in
+`docs/agent-protocol.md`.
 
 ## The dialogues
 
@@ -213,6 +223,28 @@ permitted but not required.
   {"start":{"x":0,"y":70},"end":{"x":100,"y":70},"layer":"SETBACK"}` →
   `calculate_length {"entityIds":["49"]}` → `{"units":"Meters","totalLength":100}`.
   Reply enumerates all three changes and reports "**100 m**".
+
+### Drawing-wide discovery and large selections
+
+- **No-selection scope:** a prompt such as `Inspect the ANNOTATION layer and
+  format the ST-01 notes` must use `get_drawing_context`, `list_entities`, and
+  Sheet Preview inspection. An empty selection is not a refusal condition
+  because the named layer and text provide discoverable scope.
+- **Large selection:** selecting 209 or more entities must not create an
+  inaccessible provider file. `get_selected_entities` returns bounded pages;
+  the agent follows every `nextCursor` until `hasMore` is false without asking
+  the user to select smaller batches.
+- **Turn safety:** changing the live selection after Send does not change the
+  frozen turn selection. Undo, Redo, Open, or another content edit during the
+  turn invalidates delayed tool calls, which must fail before execution.
+- **Long values:** truncated text previews continue through `get_entity_text`;
+  truncated polyline previews continue through `get_polyline_vertices`.
+- **Layers and colors:** `get_drawing_context`/`list_layers` report layer
+  states and counts. `list_entities` distinguishes explicit true white from
+  ByLayer color; `set_entity_color` and `set_layer_properties` are undoable.
+- **Overprinting:** `find_text_overlaps` reports connected TEXT/MTEXT collision
+  clusters without requiring the user to identify or select each label. A
+  209-member cluster is returned as bounded, lossless member segments.
 
 ## Supplementary checks
 

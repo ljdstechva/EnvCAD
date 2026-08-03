@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { CAD_TOOL_NAMES } from '../cadToolSpecs'
+import { PROVIDER_TOOL_NAMES } from '../providerToolSpecs'
 import {
   createCadMcpServer,
   toClaudeCallToolResult
@@ -43,11 +43,31 @@ describe('Claude CAD MCP tools', () => {
     })
 
     expect(registerTool.mock.calls.map(([name]) => name)).toEqual([
-      ...CAD_TOOL_NAMES
+      ...PROVIDER_TOOL_NAMES
     ])
-    expect(registerTool.mock.calls.map(([name]) => name)).toContain(
-      'inspect_sheet_preview'
+    expect(registerTool.mock.calls.map(([name]) => name)).toEqual(
+      expect.arrayContaining([
+        'inspect_sheet_preview',
+        'inspect_model_view',
+        'inspect_region',
+        'inspect_selection',
+        'compare_before_after',
+        'render_analysis_overlay'
+      ])
     )
+  })
+
+  it('registers only the broker-permitted tools for an intent-scoped turn', () => {
+    createCadMcpServer({
+      callTool: vi.fn(),
+      getSelectionSnapshot: vi.fn(),
+      permittedToolNames: () => ['list_entities', 'inspect_sheet_preview']
+    })
+
+    expect(registerTool.mock.calls.map(([name]) => name)).toEqual([
+      'list_entities',
+      'inspect_sheet_preview'
+    ])
   })
 
   it('returns bounded metadata and a separate MCP image content block', () => {
@@ -58,7 +78,7 @@ describe('Claude CAD MCP tools', () => {
       content: [
         {
           type: 'text',
-          text: JSON.stringify(result.data, null, 2)
+          text: JSON.stringify(result.data)
         },
         {
           type: 'image',
@@ -77,7 +97,7 @@ describe('Claude CAD MCP tools', () => {
       content: [
         {
           type: 'text',
-          text: JSON.stringify({ entityIds: ['line-1'] }, null, 2)
+          text: JSON.stringify({ entityIds: ['line-1'] })
         }
       ]
     })
@@ -85,5 +105,60 @@ describe('Claude CAD MCP tools', () => {
       content: [{ type: 'text', text: 'render failed' }],
       isError: true
     })
+  })
+
+  it('fails closed before forwarding oversized ordinary CAD metadata', () => {
+    const forwarded = toClaudeCallToolResult({
+      data: { content: 'x'.repeat(32_001) }
+    })
+
+    expect(forwarded).toEqual({
+      content: [
+        {
+          type: 'text',
+          text:
+            'CAD tool metadata exceeded its bounded page size. Retry the read with its continuation cursor.'
+        }
+      ],
+      isError: true
+    })
+    expect(JSON.stringify(forwarded)).not.toContain('x'.repeat(1_000))
+  })
+
+  it('enforces canonical output limits in UTF-8 bytes', () => {
+    const content = 'é'.repeat(16_000)
+    expect(JSON.stringify({ content }).length).toBeLessThan(32_000)
+
+    const forwarded = toClaudeCallToolResult(
+      { data: { content } },
+      'list_entities'
+    )
+    expect(forwarded.isError).toBe(true)
+    expect(JSON.stringify(forwarded)).not.toContain(content.slice(0, 1_000))
+  })
+
+  it('never converts an oversized successful mutation into a provider failure', () => {
+    const forwarded = toClaudeCallToolResult(
+      {
+        data: {
+          entityIds: ['line-1'],
+          unexpectedMetadata: 'x'.repeat(32_001)
+        }
+      },
+      'move_entities',
+      { entityIds: ['line-1'], dx: 1, dy: 0 }
+    )
+    const metadata = JSON.parse(
+      (forwarded.content[0] as { type: 'text'; text: string }).text
+    )
+
+    expect(forwarded.isError).toBeUndefined()
+    expect(metadata).toMatchObject({
+      mutationSucceeded: true,
+      metadataCompacted: true,
+      affectedEntityCount: 1,
+      entityIdsPreview: ['line-1']
+    })
+    expect(JSON.stringify(forwarded)).not.toContain('x'.repeat(1_000))
   })
 })

@@ -33,9 +33,12 @@ const validUserMessage = {
   text: 'draw a line',
   configurationRevision: 1,
   selectionSnapshot: {
-    ids: ['entity-1'],
     count: 1,
-    units: 'Millimeters'
+    units: 'Millimeters',
+    revision: {
+      documentRevision: 4,
+      contentRevision: 2
+    }
   },
   sheet: {
     paper: 'A3',
@@ -93,15 +96,38 @@ describe('agent protocol validation', () => {
     }
   })
 
-  it('rejects a selection count that does not match its ids', () => {
+  it('keeps exact selection ids out of the WebSocket message', () => {
     const parsed = parseClientMessage({
       ...validUserMessage,
-      selectionSnapshot: { ...validUserMessage.selectionSnapshot, count: 2 }
+      selectionSnapshot: {
+        ...validUserMessage.selectionSnapshot,
+        ids: ['entity-1']
+      }
     })
 
     expect(parsed).toEqual({
       ok: false,
-      error: 'selectionSnapshot.count must equal selectionSnapshot.ids.length'
+      error: 'selectionSnapshot contains unsupported fields'
+    })
+  })
+
+  it('requires a valid drawing revision on selection context', () => {
+    const parsed = parseClientMessage({
+      ...validUserMessage,
+      selectionSnapshot: {
+        count: 1,
+        units: 'Millimeters',
+        revision: {
+          documentRevision: -1,
+          contentRevision: 2
+        }
+      }
+    })
+
+    expect(parsed).toEqual({
+      ok: false,
+      error:
+        'selectionSnapshot.revision.documentRevision must be a non-negative safe integer'
     })
   })
 

@@ -24,6 +24,7 @@ export default defineConfig({
       'sidecar/src/**/*.test.ts',
       'desktop/**/*.test.ts',
       'src/agent/**/*.test.ts',
+      'src/cad/**/*.test.ts',
       'src/components/**/*.test.ts',
       'src/geo/**/*.test.ts',
       'src/viewer/**/*.test.ts',

@@ -32,7 +32,7 @@ export function envCadClaudeProjectDirectoryPattern(
 
 /**
  * Removes only legacy Claude transcripts whose project key is an EnvCAD-owned
- * ephemeral AI runtime directory. EnvCAD 0.2.3 disables SDK persistence; this
+ * ephemeral AI runtime directory. EnvCAD 0.2.4 disables SDK persistence; this
  * narrow migration clears payloads written by earlier acceptance/dev builds.
  */
 export async function removeLegacyEnvCadClaudeTranscripts(

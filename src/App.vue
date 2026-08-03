@@ -21,10 +21,78 @@ const viewer = useCadViewer()
 const canvasContainer = ref<HTMLDivElement | null>(null)
 const layersOpen = ref(false)
 const sidePanelOpen = ref(true)
+const WORKBENCH_MIN_WIDTH = 340
+const WORKBENCH_MAX_WIDTH = 560
+const WORKBENCH_DEFAULT_WIDTH = 400
+const WORKBENCH_WIDTH_KEY = 'envcad.assistant-workbench.width'
+const sidePanelWidth = ref(loadWorkbenchWidth())
 const toolbarRef = ref<InstanceType<typeof Toolbar> | null>(null)
 const restoreSnapshot = ref<AutosaveSnapshot | null>(null)
 const restoring = ref(false)
 let stopAutosave: (() => void) | null = null
+let resizeStartX = 0
+let resizeStartWidth = WORKBENCH_DEFAULT_WIDTH
+
+function loadWorkbenchWidth(): number {
+  try {
+    const persisted = localStorage.getItem(WORKBENCH_WIDTH_KEY)
+    if (persisted === null) return WORKBENCH_DEFAULT_WIDTH
+    const stored = Number(persisted)
+    return Number.isFinite(stored)
+      ? Math.min(WORKBENCH_MAX_WIDTH, Math.max(WORKBENCH_MIN_WIDTH, stored))
+      : WORKBENCH_DEFAULT_WIDTH
+  } catch {
+    return WORKBENCH_DEFAULT_WIDTH
+  }
+}
+
+function setWorkbenchWidth(width: number) {
+  sidePanelWidth.value = Math.min(
+    WORKBENCH_MAX_WIDTH,
+    Math.max(WORKBENCH_MIN_WIDTH, Math.round(width))
+  )
+  try {
+    localStorage.setItem(WORKBENCH_WIDTH_KEY, String(sidePanelWidth.value))
+  } catch {
+    // The current width still works for this session.
+  }
+}
+
+function beginWorkbenchResize(event: PointerEvent) {
+  resizeStartX = event.clientX
+  resizeStartWidth = sidePanelWidth.value
+  window.addEventListener('pointermove', resizeWorkbench)
+  window.addEventListener('pointerup', endWorkbenchResize, { once: true })
+}
+
+function resizeWorkbench(event: PointerEvent) {
+  setWorkbenchWidth(resizeStartWidth + resizeStartX - event.clientX)
+}
+
+function endWorkbenchResize() {
+  window.removeEventListener('pointermove', resizeWorkbench)
+}
+
+function resizeWorkbenchWithKeyboard(event: KeyboardEvent) {
+  const step = event.shiftKey ? 40 : 16
+  if (event.key === 'ArrowLeft') {
+    event.preventDefault()
+    setWorkbenchWidth(sidePanelWidth.value + step)
+  } else if (event.key === 'ArrowRight') {
+    event.preventDefault()
+    setWorkbenchWidth(sidePanelWidth.value - step)
+  } else if (event.key === 'Home') {
+    event.preventDefault()
+    setWorkbenchWidth(WORKBENCH_MIN_WIDTH)
+  } else if (event.key === 'End') {
+    event.preventDefault()
+    setWorkbenchWidth(WORKBENCH_MAX_WIDTH)
+  }
+}
+
+function openDrawingFromAssistant() {
+  toolbarRef.value?.triggerOpen()
+}
 
 function formatSavedAt(savedAt: number): string {
   try {
@@ -87,6 +155,7 @@ onMounted(() => {
     void viewer.setCanvasBackground(CANVAS_BACKGROUND[theme.value])
   }
   window.addEventListener('keydown', onGlobalKeydown)
+  window.addEventListener('envcad:open-drawing', openDrawingFromAssistant)
   restoreSnapshot.value = loadAutosaveSnapshot()
   stopAutosave = startAutosave({
     get documentOpen() {
@@ -104,6 +173,8 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', onGlobalKeydown)
+  window.removeEventListener('envcad:open-drawing', openDrawingFromAssistant)
+  window.removeEventListener('pointermove', resizeWorkbench)
   stopAutosave?.()
 })
 
@@ -139,11 +210,40 @@ function toggleLayers() {
           <strong>No drawing is open.</strong>
           <span>Choose New Drawing or Open.</span>
         </div>
-        <button class="side-toggle" @click="sidePanelOpen = !sidePanelOpen">
+        <button
+          class="side-toggle"
+          type="button"
+          :aria-label="
+            sidePanelOpen
+              ? 'Hide Assistant Workbench'
+              : 'Open Assistant Workbench'
+          "
+          @click="sidePanelOpen = !sidePanelOpen"
+        >
           {{ sidePanelOpen ? '›' : '‹' }}
+          <span>{{ sidePanelOpen ? 'Hide AI' : 'Open AI' }}</span>
         </button>
       </div>
-      <div v-if="sidePanelOpen" class="side-dock">
+      <div
+        v-if="sidePanelOpen"
+        class="workbench-resizer"
+        role="separator"
+        aria-label="Resize Assistant Workbench"
+        aria-orientation="vertical"
+        :aria-valuemin="WORKBENCH_MIN_WIDTH"
+        :aria-valuemax="WORKBENCH_MAX_WIDTH"
+        :aria-valuenow="sidePanelWidth"
+        tabindex="0"
+        @pointerdown.prevent="beginWorkbenchResize"
+        @keydown="resizeWorkbenchWithKeyboard"
+      ></div>
+      <div
+        v-if="sidePanelOpen"
+        class="side-dock"
+        role="complementary"
+        aria-label="Assistant Workbench"
+        :style="{ width: `${sidePanelWidth}px` }"
+      >
         <SidePanel :viewer="viewer" />
       </div>
     </div>
@@ -194,9 +294,25 @@ function toggleLayers() {
 }
 
 .side-dock {
-  width: 280px;
   flex-shrink: 0;
   border-left: 1px solid var(--border-strong);
+}
+
+.workbench-resizer {
+  width: 7px;
+  flex: none;
+  cursor: col-resize;
+  background: var(--bg-panel);
+  border-left: 1px solid var(--border-color);
+  border-right: 1px solid var(--border-color);
+  touch-action: none;
+}
+
+.workbench-resizer:hover,
+.workbench-resizer:focus-visible {
+  background: var(--accent);
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
 }
 
 .restore-banner {
@@ -234,14 +350,26 @@ function toggleLayers() {
   position: absolute;
   right: 0;
   top: 8px;
-  width: 18px;
+  min-width: 56px;
   height: 32px;
   background: var(--bg-button);
   color: var(--text-secondary);
   border: 1px solid var(--border-color);
   border-right: none;
+  border-radius: 4px 0 0 4px;
+  padding: 0 7px;
+  font-size: 0;
   cursor: pointer;
   z-index: 2;
+}
+
+.side-toggle span {
+  font-size: 12px;
+}
+
+.side-toggle:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 .canvas-empty-state {

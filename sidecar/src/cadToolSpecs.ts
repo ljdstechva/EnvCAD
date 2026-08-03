@@ -1,12 +1,23 @@
 import { z } from 'zod'
-import type { SelectionSnapshot, ToolResult } from '../../src/agent/protocol'
+import type { SelectionContext, ToolResult } from '../../src/agent/protocol'
+import {
+  CAD_TOOL_NAMES,
+  getToolManifestEntry,
+  toolCallMayMutate,
+  type CadToolName
+} from '../../shared/agent-contracts/tool-manifest'
+import { utf8ByteLength } from '../../shared/agent-contracts/tool-result'
+import { getInputToolSpec } from './inputToolSpecs'
+
+export { CAD_TOOL_NAMES, type CadToolName }
 
 export interface CadToolBridge {
   callTool(name: string, input: unknown): Promise<ToolResult>
-  getSelectionSnapshot(): SelectionSnapshot | undefined
+  getSelectionSnapshot(): SelectionContext | undefined
+  permittedToolNames?(): readonly string[]
 }
 
-export interface CadToolSpec<Name extends string = string> {
+export interface CadToolSpec<Name extends CadToolName = CadToolName> {
   name: Name
   description: string
   inputSchema: z.ZodObject
@@ -15,10 +26,123 @@ export interface CadToolSpec<Name extends string = string> {
   execute(bridge: CadToolBridge, input: unknown): Promise<ToolResult>
 }
 
-const DEFAULT_TOOL_TIMEOUT_MS = 30_000
+export const DEFAULT_PROVIDER_TOOL_OUTPUT_BYTES = 32_000
+export const MAX_ENTITY_ID_BATCH_BYTES = 12_000
+const MAX_ENTITY_IDS_PER_BATCH = 100
+const MAX_TITLE_BLOCK_FIELDS_PER_CALL = 100
+
+export function cadToolMayMutate(name: string, input?: unknown): boolean {
+  return toolCallMayMutate(name, input)
+}
+
+export function maximumProviderToolOutputBytes(toolName?: string): number {
+  return toolName
+    ? getToolManifestEntry(toolName)?.maximumOutputBytes ??
+        getInputToolSpec(toolName)?.maximumOutputBytes ??
+        DEFAULT_PROVIDER_TOOL_OUTPUT_BYTES
+    : DEFAULT_PROVIDER_TOOL_OUTPUT_BYTES
+}
+
+export { utf8ByteLength }
+
+export function compactMutationResultText(result: ToolResult): string {
+  const data =
+    typeof result.data === 'object' &&
+    result.data !== null &&
+    !Array.isArray(result.data)
+      ? (result.data as Record<string, unknown>)
+      : undefined
+  const entityIds = Array.isArray(data?.entityIds)
+    ? data.entityIds.filter((value): value is string => typeof value === 'string')
+    : []
+  return JSON.stringify({
+    mutationSucceeded: true,
+    metadataCompacted: true,
+    affectedEntityCount: entityIds.length,
+    entityIdsPreview: entityIds.slice(0, 25),
+    entityIdsTruncated: entityIds.length > 25,
+    message:
+      'The CAD edit completed, but its unexpected full metadata was compacted. Re-read the affected scope with paginated discovery before the next edit.'
+  })
+}
+
+function entityIdBatch(minimum = 1, maximum = MAX_ENTITY_IDS_PER_BATCH) {
+  return z
+    .array(z.string().min(1).max(200))
+    .min(minimum)
+    .max(maximum)
+    .superRefine((ids, context) => {
+      if (utf8ByteLength(JSON.stringify(ids)) > MAX_ENTITY_ID_BATCH_BYTES) {
+        context.addIssue({
+          code: 'custom',
+          message:
+            'this per-call id batch is too large for a guaranteed provider-readable result; ' +
+            'continue automatically in smaller batches (this is not a total drawing limit)'
+        })
+      }
+    })
+    .describe(
+      'One bounded operation batch. Continue automatically with additional batches until every ' +
+        'target id is processed; do not ask the user to split the selection.'
+    )
+}
+
+function titleBlockFields() {
+  return z
+    .record(z.string().min(1).max(200), z.string().max(4_000))
+    .superRefine((fields, context) => {
+      if (Object.keys(fields).length > MAX_TITLE_BLOCK_FIELDS_PER_CALL) {
+        context.addIssue({
+          code: 'custom',
+          message: `at most ${MAX_TITLE_BLOCK_FIELDS_PER_CALL} fields may be updated in one call`
+        })
+      }
+    })
+}
+
 const Point2D = z.strictObject({
   x: z.number().finite().describe('X coordinate in drawing units'),
   y: z.number().finite().describe('Y coordinate in drawing units')
+})
+const EntityPageFields = {
+  cursor: z
+    .number()
+    .int()
+    .min(0)
+    .default(0)
+    .describe('Zero-based continuation cursor; use nextCursor from the preceding page'),
+  pageSize: z
+    .number()
+    .int()
+    .min(1)
+    .max(500)
+    .default(100)
+    .describe(
+      'Maximum records requested for this page; EnvCAD may return fewer to keep the response provider-readable'
+    ),
+  detail: z
+    .enum(['summary', 'geometry'])
+    .default('summary')
+    .describe('summary returns index fields; geometry also returns type-specific geometry')
+}
+const EntityKind = z.enum([
+  'text',
+  'line',
+  'polyline',
+  'circle',
+  'arc',
+  'block',
+  'point',
+  'hatch',
+  'leader',
+  'solid',
+  'other'
+])
+const QueryBounds = z.strictObject({
+  minX: z.number().finite(),
+  minY: z.number().finite(),
+  maxX: z.number().finite(),
+  maxY: z.number().finite()
 })
 
 function validationMessage(name: string, error: z.ZodError): string {
@@ -31,12 +155,14 @@ function validationMessage(name: string, error: z.ZodError): string {
   return `Invalid arguments for ${name}: ${details}`
 }
 
-function defineTool<Name extends string>(
+function defineTool<Name extends CadToolName>(
   name: Name,
   description: string,
   inputSchema: z.ZodObject,
   prepareInput?: (bridge: CadToolBridge, parsed: unknown) => unknown
 ): CadToolSpec<Name> {
+  const manifest = getToolManifestEntry(name)
+  if (!manifest) throw new Error(`Missing canonical tool manifest entry for "${name}".`)
   const jsonSchema = z.toJSONSchema(inputSchema, {
     target: 'draft-07',
     io: 'input',
@@ -48,10 +174,23 @@ function defineTool<Name extends string>(
     description,
     inputSchema,
     jsonSchema,
-    timeoutMs: DEFAULT_TOOL_TIMEOUT_MS,
+    timeoutMs: manifest.timeoutMs,
     async execute(bridge: CadToolBridge, input: unknown): Promise<ToolResult> {
       const parsed = inputSchema.safeParse(input)
       if (!parsed.success) return { error: validationMessage(name, parsed.error) }
+      const mutating = cadToolMayMutate(name, parsed.data)
+      if (
+        utf8ByteLength(JSON.stringify(parsed.data)) > manifest.maximumInputBytes
+      ) {
+        return {
+          error: mutating
+            ? `${name} was not executed because this single edit batch exceeds EnvCAD's ` +
+              'provider-readable mutation envelope. Continue automatically with smaller edit ' +
+              'batches; this is not a total drawing limit. No CAD change was made.'
+            : `${name} was not executed because its arguments exceed EnvCAD's ` +
+              'provider-readable input envelope. Retry with a smaller bounded query.'
+        }
+      }
       const browserInput = prepareInput ? prepareInput(bridge, parsed.data) : parsed.data
       return bridge.callTool(name, browserInput)
     }
@@ -62,19 +201,93 @@ const specs = [
   defineTool(
     'get_selected_entities',
     'Get the entities in the selection snapshot attached to the current user message. ' +
-      'Always call this before acting on "this/these/it/selected" — never guess entity ids. ' +
-      'Returns selectedCount: 0 with an empty entities list when the user had nothing selected ' +
-      'at the moment they sent their message; that is a definitive "no selection", not a ' +
-      'failure, and you must stop and ask them to select something rather than picking entities ' +
-      'yourself.',
-    z.strictObject({}),
-    (bridge) => ({ ids: bridge.getSelectionSnapshot()?.ids ?? [] })
+      'Always call this before acting on "this/these/it/selected"; never guess entity ids. ' +
+      'The result is automatically bounded and paginated: when hasMore is true, call again with ' +
+      'nextCursor until every selected entity has been read. Never ask the user to make smaller ' +
+      'selections merely because a page continues. A zero selectedCount only means there is no ' +
+      'selected referent; it does not prevent drawing-wide discovery through list_entities.',
+    z.strictObject({
+      ...EntityPageFields,
+      detail: EntityPageFields.detail.default('geometry')
+    })
+  ),
+  defineTool(
+    'list_entities',
+    'Discover model-space entities directly from the open drawing; no user selection is required. ' +
+      'Use it for named objects, layers, whole-drawing review, and broad requests such as formatting ' +
+      'the sheet. Filter by ids, exact layer names, CAD types, friendly kinds, text, or intersecting ' +
+      'bounds. Results are automatically bounded and paginated. When hasMore is true, continue with ' +
+      'nextCursor using the same filters and detail until complete; never ask the user to select ' +
+      'smaller batches because a continuation exists.',
+    z.strictObject({
+      entityIds: z.array(z.string().min(1)).min(1).optional(),
+      layers: z.array(z.string().min(1)).min(1).optional(),
+      types: z.array(z.string().min(1)).min(1).optional(),
+      kinds: z.array(EntityKind).min(1).optional(),
+      textContains: z.string().min(1).optional(),
+      bounds: QueryBounds.optional(),
+      ...EntityPageFields
+    })
+  ),
+  defineTool(
+    'list_layers',
+    'Read every drawing layer with color, visibility/lock/plot state, entity count, and entity-kind ' +
+      'counts without requiring a selection. Results are automatically bounded and paginated; ' +
+      'continue with nextCursor until hasMore is false.',
+    z.strictObject({
+      cursor: EntityPageFields.cursor,
+      pageSize: EntityPageFields.pageSize
+    })
+  ),
+  defineTool(
+    'find_text_overlaps',
+    'Find connected clusters of TEXT/MTEXT bounding boxes that overlap or violate a requested ' +
+      'minimum gap. No selection is required. Use this for whole-drawing note/callout cleanup, ' +
+      'then read each cluster through list_entities before moving anything. Large clusters are ' +
+      'split into bounded member segments with the same clusterIndex. Continue the top-level ' +
+      'nextCursor until hasMore is false to receive every cluster member.',
+    z.strictObject({
+      layers: z.array(z.string().min(1)).min(1).optional(),
+      bounds: QueryBounds.optional(),
+      minimumGap: z
+        .number()
+        .finite()
+        .min(0)
+        .default(0)
+        .describe('Required clear gap between text bounding boxes, in drawing units'),
+      cursor: EntityPageFields.cursor,
+      pageSize: EntityPageFields.pageSize
+    })
+  ),
+  defineTool(
+    'get_entity_text',
+    'Read the exact full contents of one TEXT or MTEXT entity without a selection. Entity-list ' +
+      'previews are intentionally compact; when hasMore is true, continue with nextCursor until ' +
+      'all characters have been read.',
+    z.strictObject({
+      entityId: z.string().min(1),
+      cursor: z.number().int().min(0).default(0),
+      chunkSize: z.number().int().min(1).max(16_000).default(8_000)
+    })
+  ),
+  defineTool(
+    'get_polyline_vertices',
+    'Read every exact vertex and bulge of one polyline without a selection. Geometry summaries ' +
+      'show at most the first 50 vertices; when hasMore is true, continue with nextCursor until ' +
+      'all vertices have been read.',
+    z.strictObject({
+      entityId: z.string().min(1),
+      cursor: z.number().int().min(0).default(0),
+      pageSize: z.number().int().min(1).max(500).default(100)
+    })
   ),
   defineTool(
     'get_drawing_context',
     'Get the authoritative document lifecycle, editability, view readiness, active layout, ' +
-      'database and sheet units, visible/entity counts, layers, and drawing extents. This is ' +
-      'safe when no drawing is open and then explicitly reports documentOpen=false.',
+      'database and sheet units, drawing extents, and the first bounded page of layers with color, ' +
+      'state, entity count, and entity-kind counts. If layersHasMore is true, continue with ' +
+      'list_layers. No selection is required. This is safe when no drawing is open and then ' +
+      'explicitly reports documentOpen=false.',
     z.strictObject({})
   ),
   defineTool(
@@ -103,13 +316,72 @@ const specs = [
         ])
         .default('full')
         .describe('Bounded page view to capture')
+      })
+  ),
+  defineTool(
+    'inspect_model_view',
+    'Capture the current model canvas as revision-bound visual evidence. Use this for visibility ' +
+      'and appearance questions about the active viewport; database metadata alone is not visual proof.',
+    z.strictObject({})
+  ),
+  defineTool(
+    'inspect_region',
+    'Capture one drawing-coordinate region from the current model viewport. Prefer this over a ' +
+      'full view when a bounded area contains the relevant layout or annotation evidence.',
+    z.strictObject({
+      bounds: QueryBounds.refine(
+        (bounds) =>
+          bounds.maxX > bounds.minX && bounds.maxY > bounds.minY,
+        'Region bounds must have positive width and height'
+      )
+    })
+  ),
+  defineTool(
+    'inspect_selection',
+    'Capture visual evidence around exact entity ids. Read the frozen selection first and pass ' +
+      'only the returned ids; the evidence records those ids and the current workspace revision.',
+    z.strictObject({
+      entityIds: entityIdBatch()
+    })
+  ),
+  defineTool(
+    'compare_before_after',
+    'Create one bounded side-by-side image from two previously captured evidence ids. The two ' +
+      'artifacts must belong to the same drawing.',
+    z.strictObject({
+      beforeEvidenceId: z.string().min(1).max(200),
+      afterEvidenceId: z.string().min(1).max(200)
+    })
+  ),
+  defineTool(
+    'render_analysis_overlay',
+    'Render bounded normalized highlight boxes over existing visual evidence. Coordinates are ' +
+      'fractions of image width and height from 0 through 1.',
+    z.strictObject({
+      evidenceId: z.string().min(1).max(200),
+      boxes: z
+        .array(
+          z.strictObject({
+            x: z.number().min(0).max(1),
+            y: z.number().min(0).max(1),
+            width: z.number().positive().max(1),
+            height: z.number().positive().max(1),
+            label: z.string().min(1).max(100).optional()
+          }).refine(
+            (box) => box.x + box.width <= 1 && box.y + box.height <= 1,
+            'Overlay box must remain inside the image'
+          )
+        )
+        .min(1)
+        .max(50)
     })
   ),
   defineTool(
     'move_entities',
-    'Move one or more entities by a relative offset (dx, dy) in drawing units.',
+    'Move one or more entities by a relative offset (dx, dy) in drawing units. For a large ' +
+      'target set, repeat this tool automatically with successive id batches until all ids are moved.',
     z.strictObject({
-      entityIds: z.array(z.string()).min(1).describe('Ids of the entities to move'),
+      entityIds: entityIdBatch().describe('Ids of the entities to move in this batch'),
       dx: z.number().finite().describe('Offset along X in drawing units'),
       dy: z.number().finite().describe('Offset along Y in drawing units')
     })
@@ -119,7 +391,7 @@ const specs = [
     'Duplicate one or more entities, placing the copies offset by (dx, dy) from the originals. ' +
       'The originals are left untouched.',
     z.strictObject({
-      entityIds: z.array(z.string()).min(1).describe('Ids of the entities to copy'),
+      entityIds: entityIdBatch().describe('Ids of the entities to copy in this batch'),
       dx: z.number().finite().describe('Offset along X in drawing units for the copies'),
       dy: z.number().finite().describe('Offset along Y in drawing units for the copies')
     })
@@ -131,7 +403,7 @@ const specs = [
       'NOT the same as rotating each entity about its own base point. Pass center explicitly ' +
       'whenever the pivot matters. The center actually used is echoed in the result.',
     z.strictObject({
-      entityIds: z.array(z.string()).min(1).describe('Ids of the entities to rotate'),
+      entityIds: entityIdBatch().describe('Ids of the entities to rotate in this batch'),
       angleDeg: z.number().finite().describe('Rotation angle in degrees, counter-clockwise positive'),
       center: Point2D.optional().describe(
         'Pivot point in drawing units; defaults to the center of the combined bounding box of entityIds'
@@ -145,7 +417,7 @@ const specs = [
       'scaling each entity about its own base point. Pass center explicitly whenever the base ' +
       'point matters. The center actually used is echoed in the result.',
     z.strictObject({
-      entityIds: z.array(z.string()).min(1).describe('Ids of the entities to scale'),
+      entityIds: entityIdBatch().describe('Ids of the entities to scale in this batch'),
       factor: z.number().positive().finite().describe('Scale factor, e.g. 2 doubles size, 0.5 halves it'),
       center: Point2D.optional().describe(
         'Base point in drawing units; defaults to the center of the combined bounding box of entityIds'
@@ -156,7 +428,7 @@ const specs = [
     'delete_entities',
     'Delete one or more entities from the drawing.',
     z.strictObject({
-      entityIds: z.array(z.string()).min(1).describe('Ids of the entities to delete')
+      entityIds: entityIdBatch().describe('Ids of the entities to delete in this batch')
     })
   ),
   defineTool(
@@ -166,8 +438,24 @@ const specs = [
       'names with get_drawing_context first and confirm with the user before introducing a new ' +
       'layer, rather than silently creating one from a misspelled name.',
     z.strictObject({
-      entityIds: z.array(z.string()).min(1).describe('Ids of the entities to re-layer'),
+      entityIds: entityIdBatch().describe('Ids of the entities to re-layer in this batch'),
       layerName: z.string().min(1).describe('Name of the destination layer')
+    })
+  ),
+  defineTool(
+    'set_entity_color',
+    'Set one or more entities to inherit color from their layer/block or use one explicit color. ' +
+      'Use list_entities to inspect stored and resolved colors first. This is the correct way to ' +
+      'repair explicit true-white entities; changing their layer alone does not override an ' +
+      'explicit entity color. The whole call is one undoable edit.',
+    z.strictObject({
+      entityIds: entityIdBatch(),
+      mode: z.enum(['by-layer', 'by-block', 'explicit']),
+      colorCss: z
+        .string()
+        .min(1)
+        .optional()
+        .describe('Required only for explicit mode, e.g. "#000000"')
     })
   ),
   defineTool(
@@ -185,7 +473,7 @@ const specs = [
       'exactly. Fails on open entities rather than assuming a closing segment. Always use this ' +
       'instead of estimating an area yourself, and report the units it returns.',
     z.strictObject({
-      entityIds: z.array(z.string()).min(1).describe('Ids of the entities to measure')
+      entityIds: entityIdBatch().describe('Ids of the entities to measure in this batch')
     })
   ),
   defineTool(
@@ -195,7 +483,7 @@ const specs = [
       'the arc, not the chord. Always use this instead of estimating a length yourself, and ' +
       'report the units it returns.',
     z.strictObject({
-      entityIds: z.array(z.string()).min(1).describe('Ids of the entities to measure')
+      entityIds: entityIdBatch().describe('Ids of the entities to measure in this batch')
     })
   ),
   defineTool(
@@ -336,6 +624,20 @@ const specs = [
     })
   ),
   defineTool(
+    'set_layer_properties',
+    'Change one or more properties of an existing layer as one undoable edit. Omitted properties ' +
+      'remain unchanged. Read the exact layer name and current properties from get_drawing_context ' +
+      'first. At least one property besides name is required.',
+    z.strictObject({
+      name: z.string().min(1).describe('Exact existing layer name'),
+      colorCss: z.string().min(1).optional().describe('CSS color, e.g. "#ff0000"'),
+      isOff: z.boolean().optional(),
+      isFrozen: z.boolean().optional(),
+      isLocked: z.boolean().optional(),
+      isPlottable: z.boolean().optional()
+    })
+  ),
+  defineTool(
     'set_current_layer',
     'Set the current (active) layer that new entities are drawn onto.',
     z.strictObject({
@@ -363,7 +665,8 @@ const specs = [
     'import_boundary_from_geojson',
     'Import GeoJSON Point, LineString, and Polygon features as CAD points and polylines. ' +
       'Polygon exterior and interior rings become separate closed polylines. Coordinates are ' +
-      'used as-is: CRS reprojection is NOT performed, and that note is returned to the caller.',
+      'used as-is: CRS reprojection is NOT performed, and that note is returned to the caller. ' +
+      'For a larger collection, continue automatically with successive FeatureCollection batches.',
     z.strictObject({
       geojsonText: z.string().min(1).describe('GeoJSON FeatureCollection, Feature, or geometry text'),
       layer: z.string().min(1).optional().describe('Destination layer; defaults to IMPORT')
@@ -375,7 +678,7 @@ const specs = [
       'This is the authoritative tool for siting questions; never eyeball containment. ' +
       'Arc-segmented polylines use their chord polygons and the result reports that degradation.',
     z.strictObject({
-      entityIds: z.array(z.string()).min(1).describe('Entity ids to classify'),
+      entityIds: entityIdBatch().describe('Entity ids to classify in this batch'),
       boundaryEntityId: z.string().min(1).describe('Id of the closed boundary polyline')
     })
   ),
@@ -385,7 +688,9 @@ const specs = [
       'EnvCAD symbol entities. Closed polylines and circles are treated as regions. ' +
       'Arc-segmented polylines use chords and the result reports that degradation.',
     z.strictObject({
-      entityIds: z.array(z.string()).min(2).describe('Entity ids to check pairwise')
+      entityIds: entityIdBatch(2, 10).describe(
+        'Entity ids to check pairwise in this call; use repeated pair/group calls for larger sets'
+      )
     })
   ),
   defineTool(
@@ -410,11 +715,25 @@ const specs = [
         .array(
           z.strictObject({
             ...Point2D.shape,
-            label: z.string().min(1).optional().describe('Optional explicit point label')
+            label: z
+              .string()
+              .min(1)
+              .max(200)
+              .optional()
+              .describe('Optional explicit point label')
           })
         )
-        .min(1),
-      prefix: z.string().min(1).optional().describe('Generated-label prefix; defaults to MW')
+        .min(1)
+        .max(50)
+        .describe(
+          'One placement batch; continue automatically with explicit labels for additional points'
+        ),
+      prefix: z
+        .string()
+        .min(1)
+        .max(100)
+        .optional()
+        .describe('Generated-label prefix; defaults to MW')
     })
   ),
   defineTool(
@@ -470,8 +789,7 @@ const specs = [
           'Explicit sheet interpretation unit. Changing this never scales model geometry.'
         ),
       templateId: z.string().min(1).optional().describe('Id of the title-block template, from get_sheet_setup'),
-      fields: z
-        .record(z.string(), z.string())
+      fields: titleBlockFields()
         .optional()
         .describe('Title-block field values keyed by the template field keys from get_sheet_setup')
     })
@@ -480,21 +798,24 @@ const specs = [
     'set_title_block_fields',
     'Update one or more title-block field values (e.g. PROJECT, DRAWING_TITLE, CLIENT) without ' +
       'changing any other sheet settings. Keys must be field keys of the active template — see ' +
-      'get_sheet_setup; any key the template does not define is stored but never rendered and ' +
-      'comes back in ignoredFieldKeys. Not undoable with Ctrl+Z.',
+      'get_sheet_setup; the result reports a bounded ignored-field preview/count. ' +
+      'Not undoable with Ctrl+Z.',
     z.strictObject({
-      fields: z
-        .record(z.string(), z.string())
+      fields: titleBlockFields()
         .describe('Title-block field values, keyed by template field key')
     })
   )
 ] as const satisfies readonly CadToolSpec[]
 
 export const CAD_TOOL_SPECS: readonly CadToolSpec[] = Object.freeze([...specs])
-export type CadToolName = (typeof specs)[number]['name']
-export const CAD_TOOL_NAMES = Object.freeze(
-  specs.map((spec) => spec.name)
-) as readonly CadToolName[]
+
+const specificationNames = new Set(specs.map((spec) => spec.name))
+if (
+  specificationNames.size !== CAD_TOOL_NAMES.length ||
+  CAD_TOOL_NAMES.some((name) => !specificationNames.has(name))
+) {
+  throw new Error('CAD tool specifications do not match the canonical tool manifest.')
+}
 
 const SPEC_BY_NAME = new Map<string, (typeof specs)[number]>(
   specs.map((spec) => [spec.name, spec])

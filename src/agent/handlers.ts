@@ -1,4 +1,3 @@
-import { AcApDocManager, acapRunDatabaseEdit } from '@mlightcad/cad-simple-viewer'
 import {
   AcCmColor,
   AcDbArc,
@@ -43,6 +42,7 @@ import { agentBridge, type ToolHandler } from './bridge'
 import {
   arrowheadGeometry,
   boundingBoxCenter,
+  boundingBoxDistance,
   distance,
   hasBulgeArcs,
   linearDimensionGeometry,
@@ -77,18 +77,34 @@ import {
 import {
   awaitCadSessionRegeneration,
   cadSessionState,
+  getCadSessionRevision,
   getCadSessionSnapshot,
+  getWorkspaceRevision,
   markCadSessionDatabaseEdited,
   requireEditableCadSession
 } from '../cad/session'
+import { runCadDatabaseEdit } from '../cad/infrastructure/mlightcad/MlightCadUndoGroupAdapter'
+import {
+  cloneAndTransformEntities,
+  eraseEntities as eraseCadEntities,
+  transformEntities
+} from '../cad/tools/entities/MlightCadEntityMutations'
 import {
   fitDrawingToScreen,
   verifyCurrentCadExtentsFit
 } from '../cad/fitDrawing'
+import { DrawingReadModel } from '../cad/read-model/DrawingReadModel'
+import type { DrawingReadRecord } from '../cad/read-model/DrawingReadRecord'
+import {
+  drawingVisionService,
+  type OverlayBox
+} from '../cad/vision/DrawingVisionService'
 
 type InputRecord = Record<string, unknown>
 
 let testDatabaseOverride: AcDbDatabase | undefined
+let testReadModelRevision = 0
+const drawingReadModel = new DrawingReadModel()
 
 const DIMENSION_LAYER = 'DIMENSIONS'
 const BOUNDARY_LAYER = 'BOUNDARY'
@@ -99,6 +115,37 @@ const CHORD_DEGRADATION_NOTE =
   'Polyline bulges were approximated by straight chord geometry for this predicate; arc data were present or could not be verified through the public API.'
 const NO_REPROJECTION_NOTE =
   'Coordinates were used as-is; CRS reprojection was NOT performed.'
+const DEFAULT_ENTITY_PAGE_SIZE = 100
+const MAX_ENTITY_PAGE_SIZE = 500
+const MAX_ENTITY_PAGE_CHARACTERS = 28_000
+const MAX_ENTITY_TEXT_PREVIEW_CHARACTERS = 2_000
+const DEFAULT_TEXT_CHUNK_SIZE = 8_000
+const MAX_TEXT_CHUNK_SIZE = 16_000
+const DEFAULT_VERTEX_PAGE_SIZE = 100
+const MAX_VERTEX_PAGE_SIZE = 500
+const MAX_OVERLAP_CLUSTER_MEMBER_COUNT = 100
+const MAX_OVERLAP_CLUSTER_RECORD_CHARACTERS = 20_000
+const MAX_OVERLAP_CLUSTER_LAYER_PREVIEW = 20
+const MAX_IMPORTED_GEOMETRIES_PER_BATCH = 100
+const MAX_FIELD_KEY_PREVIEW = 25
+
+type EntityDetailLevel = 'summary' | 'geometry'
+type EntityKind =
+  | 'text'
+  | 'line'
+  | 'polyline'
+  | 'circle'
+  | 'arc'
+  | 'block'
+  | 'point'
+  | 'hatch'
+  | 'leader'
+  | 'solid'
+  | 'other'
+
+function layerKey(name: string): string {
+  return name.toUpperCase()
+}
 
 function errorResult(err: unknown): ToolResult {
   return { error: err instanceof Error ? err.message : String(err) }
@@ -124,11 +171,36 @@ function positiveNumber(value: unknown, field: string): number {
   return result
 }
 
+function boundedInteger(
+  value: unknown,
+  field: string,
+  fallback: number,
+  minimum: number,
+  maximum: number
+): number {
+  if (value === undefined) return fallback
+  if (
+    typeof value !== 'number' ||
+    !Number.isSafeInteger(value) ||
+    value < minimum ||
+    value > maximum
+  ) {
+    throw new Error(`${field} must be an integer from ${minimum} to ${maximum}`)
+  }
+  return value
+}
+
 function nonEmptyString(value: unknown, field: string): string {
   if (typeof value !== 'string' || value.trim() === '') {
     throw new Error(`${field} must be a non-empty string`)
   }
   return value.trim()
+}
+
+function optionalBoolean(value: unknown, field: string): boolean | undefined {
+  if (value === undefined) return undefined
+  if (typeof value !== 'boolean') throw new Error(`${field} must be a boolean`)
+  return value
 }
 
 function point2D(value: unknown, field: string): Point2D {
@@ -165,6 +237,8 @@ function currentDatabase(): AcDbDatabase {
  */
 export function setCadToolTestDatabase(database: AcDbDatabase | undefined): void {
   testDatabaseOverride = database
+  testReadModelRevision += 1
+  drawingReadModel.invalidate()
   if (database) acdbHostApplicationServices().workingDatabase = database
 }
 
@@ -174,11 +248,10 @@ function drawingUnits(db = currentDatabase()): string {
 
 function runEdit<T>(label: string, callback: () => T): T {
   const db = currentDatabase()
-  let result!: T
-  acapRunDatabaseEdit(db, label, () => {
-    result = callback()
-  })
+  const result = runCadDatabaseEdit(db, label, callback)
   if (!testDatabaseOverride) markCadSessionDatabaseEdited()
+  else testReadModelRevision += 1
+  drawingReadModel.invalidate()
   return result
 }
 
@@ -214,6 +287,15 @@ function ensureLayerExists(layerName: string, db = currentDatabase()): void {
   if (!db.tables.layerTable.has(layerName)) {
     throw new Error(`Layer not found: ${layerName}`)
   }
+}
+
+function canonicalLayerName(
+  layerName: string,
+  db = currentDatabase()
+): string {
+  const layer = db.tables.layerTable.getAt(layerName)
+  if (!layer) throw new Error(`Layer not found: ${layerName}`)
+  return layer.name
 }
 
 function createLayerRecord(
@@ -265,8 +347,7 @@ function layerFromInput(input: InputRecord): string | undefined {
 function appendEntity(entity: AcDbEntity, layer?: string): string {
   const db = currentDatabase()
   if (layer) {
-    ensureLayerExists(layer, db)
-    entity.layer = layer
+    entity.layer = canonicalLayerName(layer, db)
   }
   db.tables.blockTable.modelSpace.appendEntity(entity)
   return entity.objectId
@@ -278,7 +359,7 @@ function annotationLayer(input: InputRecord, db = currentDatabase()): {
 } {
   const name = layerFromInput(input) ?? DIMENSION_LAYER
   const { created } = createLayerRecord(db, name)
-  return { name, created }
+  return { name: canonicalLayerName(name, db), created }
 }
 
 function nextAnnotationBlockName(db = currentDatabase()): string {
@@ -359,6 +440,85 @@ function bboxData(entity: AcDbEntity) {
       }
 }
 
+function entityText(entity: AcDbEntity): string | undefined {
+  if (entity instanceof AcDbMText) return entity.contents
+  if (entity instanceof AcDbText) return entity.textString
+  return undefined
+}
+
+function boundedText(content: string): {
+  content: string
+  contentLength: number
+  contentTruncated: boolean
+} {
+  const contentTruncated = content.length > MAX_ENTITY_TEXT_PREVIEW_CHARACTERS
+  return {
+    content: contentTruncated
+      ? content.slice(0, MAX_ENTITY_TEXT_PREVIEW_CHARACTERS)
+      : content,
+    contentLength: content.length,
+    contentTruncated
+  }
+}
+
+function entityKind(entity: AcDbEntity): EntityKind {
+  if (entity instanceof AcDbMText || entity instanceof AcDbText) return 'text'
+  if (entity instanceof AcDbLine) return 'line'
+  if (entity instanceof AcDbPolyline) return 'polyline'
+  if (entity instanceof AcDbCircle) return 'circle'
+  if (entity instanceof AcDbArc) return 'arc'
+  if (entity instanceof AcDbBlockReference) return 'block'
+  if (entity instanceof AcDbPoint) return 'point'
+  if (entity instanceof AcDbHatch) return 'hatch'
+  if (entity instanceof AcDbLeader) return 'leader'
+  if (entity instanceof AcDbSolid) return 'solid'
+  return 'other'
+}
+
+function colorSummary(color: AcCmColor): Record<string, unknown> {
+  const mode = color.isByLayer
+    ? 'by-layer'
+    : color.isByBlock
+      ? 'by-block'
+      : color.isByACI
+        ? 'aci'
+        : color.isByColor
+          ? 'explicit-rgb'
+          : 'none'
+  return {
+    mode,
+    value: color.toString(),
+    colorIndex: color.colorIndex ?? null,
+    rgb: color.RGB ?? null,
+    cssColor: color.cssColor ?? null
+  }
+}
+
+function entityStyleSummary(entity: AcDbEntity): Record<string, unknown> {
+  const transparency = entity.transparency
+  const resolvedColor = currentDatabase().tables.layerTable.has(entity.layer)
+    ? entity.resolvedColor
+    : entity.color
+  return {
+    color: colorSummary(entity.color),
+    resolvedColor: colorSummary(resolvedColor),
+    lineType: entity.lineType,
+    lineWeight: entity.lineWeight,
+    linetypeScale: entity.linetypeScale,
+    visibility: entity.visibility,
+    transparency: {
+      mode: transparency.isByLayer
+        ? 'by-layer'
+        : transparency.isByBlock
+          ? 'by-block'
+          : transparency.isByAlpha
+            ? 'explicit'
+            : 'invalid',
+      percentage: transparency.percentage ?? null
+    }
+  }
+}
+
 function geometrySummary(entity: AcDbEntity): Record<string, unknown> {
   if (entity instanceof AcDbPolyline) {
     const vertices = polylineVertices(entity)
@@ -382,15 +542,21 @@ function geometrySummary(entity: AcDbEntity): Record<string, unknown> {
   if (entity instanceof AcDbMText) {
     return {
       kind: 'text',
-      content: entity.contents,
-      position: { x: entity.location.x, y: entity.location.y, z: entity.location.z }
+      ...boundedText(entity.contents),
+      position: { x: entity.location.x, y: entity.location.y, z: entity.location.z },
+      height: entity.height,
+      width: entity.width,
+      rotationDeg: (entity.rotation * 180) / Math.PI,
+      attachmentPoint: entity.attachmentPoint
     }
   }
   if (entity instanceof AcDbText) {
     return {
       kind: 'text',
-      content: entity.textString,
-      position: { x: entity.position.x, y: entity.position.y, z: entity.position.z }
+      ...boundedText(entity.textString),
+      position: { x: entity.position.x, y: entity.position.y, z: entity.position.z },
+      height: entity.height,
+      rotationDeg: (entity.rotation * 180) / Math.PI
     }
   }
   if (entity instanceof AcDbLine) {
@@ -409,7 +575,232 @@ function geometrySummary(entity: AcDbEntity): Record<string, unknown> {
       endAngleDeg: (entity.endAngle * 180) / Math.PI
     }
   }
+  if (entity instanceof AcDbBlockReference) {
+    return {
+      kind: 'block',
+      blockName: entity.blockName,
+      position: {
+        x: entity.position.x,
+        y: entity.position.y,
+        z: entity.position.z
+      },
+      rotationDeg: (entity.rotation * 180) / Math.PI,
+      scale: {
+        x: entity.scaleFactors.x,
+        y: entity.scaleFactors.y,
+        z: entity.scaleFactors.z
+      }
+    }
+  }
+  if (entity instanceof AcDbPoint) {
+    return {
+      kind: 'point',
+      position: {
+        x: entity.position.x,
+        y: entity.position.y,
+        z: entity.position.z
+      }
+    }
+  }
   return { kind: entity.type }
+}
+
+function entitySummary(
+  entity: AcDbEntity,
+  detail: EntityDetailLevel
+): Record<string, unknown> {
+  const summary: Record<string, unknown> = {
+    id: entity.objectId,
+    type: entity.type,
+    kind: entityKind(entity),
+    layer: entity.layer,
+    style: entityStyleSummary(entity),
+    bbox: bboxData(entity)
+  }
+  const text = entityText(entity)
+  if (detail === 'geometry') {
+    summary.geometry = geometrySummary(entity)
+  } else if (text !== undefined) {
+    summary.text = boundedText(text)
+  } else if (entity instanceof AcDbBlockReference) {
+    summary.blockName = entity.blockName
+    summary.position = {
+      x: entity.position.x,
+      y: entity.position.y,
+      z: entity.position.z
+    }
+  }
+  if (
+    entity instanceof AcDbPolyline ||
+    entity instanceof AcDbCircle ||
+    entity instanceof AcDbArc ||
+    entity instanceof AcDbLine
+  ) {
+    summary.closed = entity.closed
+  }
+  return summary
+}
+
+function readModelRevisionKey(): string {
+  return testDatabaseOverride
+    ? `test:${testReadModelRevision}`
+    : JSON.stringify(getWorkspaceRevision())
+}
+
+function currentDrawingReadModel(
+  db = currentDatabase()
+): DrawingReadModel {
+  const revisionKey = readModelRevisionKey()
+  if (drawingReadModel.revisionKey === revisionKey) return drawingReadModel
+  const visibleLayers = new Map(
+    Array.from(db.tables.layerTable.newIterator()).map((layer) => [
+      layerKey(layer.name),
+      !layer.isOff && !layer.isFrozen
+    ])
+  )
+  const records: DrawingReadRecord[] = Array.from(
+    db.tables.blockTable.modelSpace.newIterator()
+  ).map((entity) => {
+    const box = entityBox(entity)
+    const text = entityText(entity)
+    return {
+      id: entity.objectId,
+      layer: entity.layer,
+      type: entity.type,
+      kind: entityKind(entity),
+      ...(text !== undefined ? { text } : {}),
+      ...(box
+        ? {
+            bounds: {
+              minX: box.min.x,
+              minY: box.min.y,
+              maxX: box.max.x,
+              maxY: box.max.y
+            }
+          }
+        : {}),
+      visible:
+        entity.visibility &&
+        visibleLayers.get(layerKey(entity.layer)) !== false,
+      space: 'model',
+      ...(entity instanceof AcDbText || entity instanceof AcDbMText
+        ? { annotationType: 'text' }
+        : entity instanceof AcDbLeader
+          ? { annotationType: 'leader' }
+          : {})
+    }
+  })
+  drawingReadModel.replace(revisionKey, records)
+  return drawingReadModel
+}
+
+function detailLevel(value: unknown, fallback: EntityDetailLevel): EntityDetailLevel {
+  if (value === undefined) return fallback
+  if (value !== 'summary' && value !== 'geometry') {
+    throw new Error('detail must be "summary" or "geometry"')
+  }
+  return value
+}
+
+function paginateIndexedEntities(
+  ids: readonly string[],
+  db: AcDbDatabase,
+  cursor: number,
+  pageSize: number,
+  detail: EntityDetailLevel
+): {
+  entities: Record<string, unknown>[]
+  returnedCount: number
+  nextCursor: number | null
+  hasMore: boolean
+} {
+  if (cursor > ids.length) {
+    throw new Error(`cursor ${cursor} is past the ${ids.length}-entity result set`)
+  }
+  const entities: Record<string, unknown>[] = []
+  let encodedCharacters = 2
+  let index = cursor
+  while (index < ids.length && entities.length < pageSize) {
+    const entity = db.tables.blockTable.getEntityById(ids[index])
+    if (!entity) {
+      throw new Error(
+        'The drawing changed while reading an indexed entity page; restart at cursor 0.'
+      )
+    }
+    const summary = entitySummary(entity, detail)
+    const characters = JSON.stringify(summary).length
+    if (
+      entities.length > 0 &&
+      encodedCharacters + characters + 1 > MAX_ENTITY_PAGE_CHARACTERS
+    ) {
+      break
+    }
+    entities.push(summary)
+    encodedCharacters += characters + (entities.length > 1 ? 1 : 0)
+    index += 1
+  }
+  return {
+    entities,
+    returnedCount: entities.length,
+    nextCursor: index < ids.length ? index : null,
+    hasMore: index < ids.length
+  }
+}
+
+function paginateSelectedEntities(
+  ids: readonly string[],
+  db: AcDbDatabase,
+  cursor: number,
+  pageSize: number,
+  detail: EntityDetailLevel
+): {
+  entities: Record<string, unknown>[]
+  missingIds: string[]
+  scannedCount: number
+  returnedCount: number
+  nextCursor: number | null
+  hasMore: boolean
+} {
+  if (cursor > ids.length) {
+    throw new Error(`cursor ${cursor} is past the ${ids.length}-entity selection`)
+  }
+
+  const entities: Record<string, unknown>[] = []
+  const missingIds: string[] = []
+  let encodedCharacters = 2
+  let index = cursor
+  while (index < ids.length && index - cursor < pageSize) {
+    const id = ids[index]
+    const entity = db.tables.blockTable.getEntityById(id)
+    const summary = entity ? entitySummary(entity, detail) : undefined
+    const encoded = JSON.stringify(summary ?? id)
+    if (
+      index > cursor &&
+      encodedCharacters + encoded.length + 1 > MAX_ENTITY_PAGE_CHARACTERS
+    ) {
+      break
+    }
+    if (summary) entities.push(summary)
+    else missingIds.push(id)
+    encodedCharacters += encoded.length + (index > cursor ? 1 : 0)
+    index += 1
+  }
+
+  const hasMore = index < ids.length
+  return {
+    entities,
+    missingIds,
+    scannedCount: index - cursor,
+    returnedCount: entities.length,
+    nextCursor: hasMore ? index : null,
+    hasMore
+  }
+}
+
+function queryRevision() {
+  return testDatabaseOverride
+    ? { documentRevision: 0, contentRevision: 0 }
+    : getCadSessionRevision()
 }
 
 function getSelectedEntities(rawInput: unknown): ToolResult {
@@ -417,43 +808,536 @@ function getSelectedEntities(rawInput: unknown): ToolResult {
   if (!Array.isArray(input.ids) || !input.ids.every((id) => typeof id === 'string')) {
     throw new Error('ids must be an array of strings')
   }
+  const cursor = boundedInteger(input.cursor, 'cursor', 0, 0, Number.MAX_SAFE_INTEGER)
+  const pageSize = boundedInteger(
+    input.pageSize,
+    'pageSize',
+    DEFAULT_ENTITY_PAGE_SIZE,
+    1,
+    MAX_ENTITY_PAGE_SIZE
+  )
+  const detail = detailLevel(input.detail, 'geometry')
   const ids = [...new Set(input.ids as string[])]
   const db = currentDatabase()
-  const entities: Record<string, unknown>[] = []
-  const missingIds: string[] = []
-
-  for (const id of ids) {
-    const entity = db.tables.blockTable.getEntityById(id)
-    if (!entity) {
-      missingIds.push(id)
-      continue
-    }
-    const summary: Record<string, unknown> = {
-      id: entity.objectId,
-      type: entity.type,
-      layer: entity.layer,
-      geometry: geometrySummary(entity),
-      bbox: bboxData(entity)
-    }
-    if (
-      entity instanceof AcDbPolyline ||
-      entity instanceof AcDbCircle ||
-      entity instanceof AcDbArc ||
-      entity instanceof AcDbLine
-    ) {
-      summary.closed = entity.closed
-    }
-    entities.push(summary)
-  }
+  const matchedCount = ids.reduce(
+    (count, id) =>
+      count + (db.tables.blockTable.getEntityById(id) ? 1 : 0),
+    0
+  )
+  const page = paginateSelectedEntities(ids, db, cursor, pageSize, detail)
 
   return {
     data: {
       units: drawingUnits(db),
       // An empty list means the user sent their message with nothing
       // selected, not that the lookup failed.
-      selectedCount: entities.length,
-      entities,
-      missingIds
+      selectedCount: ids.length,
+      matchedCount,
+      missingCount: ids.length - matchedCount,
+      detail,
+      cursor,
+      pageSize,
+      ...page,
+      revision: queryRevision()
+    }
+  }
+}
+
+function stringArray(value: unknown, field: string): string[] | undefined {
+  if (value === undefined) return undefined
+  if (
+    !Array.isArray(value) ||
+    !value.every((entry) => typeof entry === 'string' && entry.trim() !== '')
+  ) {
+    throw new Error(`${field} must be an array of non-empty strings`)
+  }
+  return [...new Set(value.map((entry) => entry.trim()))]
+}
+
+function queryBounds(value: unknown): {
+  minX: number
+  minY: number
+  maxX: number
+  maxY: number
+} | undefined {
+  if (value === undefined) return undefined
+  const bounds = asRecord(value, 'bounds')
+  const result = {
+    minX: finiteNumber(bounds.minX, 'bounds.minX'),
+    minY: finiteNumber(bounds.minY, 'bounds.minY'),
+    maxX: finiteNumber(bounds.maxX, 'bounds.maxX'),
+    maxY: finiteNumber(bounds.maxY, 'bounds.maxY')
+  }
+  if (result.maxX < result.minX || result.maxY < result.minY) {
+    throw new Error('bounds maximums must be greater than or equal to minimums')
+  }
+  return result
+}
+
+function listEntities(rawInput: unknown): ToolResult {
+  const input = asRecord(rawInput, 'list_entities')
+  const cursor = boundedInteger(input.cursor, 'cursor', 0, 0, Number.MAX_SAFE_INTEGER)
+  const pageSize = boundedInteger(
+    input.pageSize,
+    'pageSize',
+    DEFAULT_ENTITY_PAGE_SIZE,
+    1,
+    MAX_ENTITY_PAGE_SIZE
+  )
+  const detail = detailLevel(input.detail, 'summary')
+  const entityIdsFilter = stringArray(input.entityIds, 'entityIds')
+  const layers = stringArray(input.layers, 'layers')
+  const types = stringArray(input.types, 'types')
+  const kinds = stringArray(input.kinds, 'kinds') as EntityKind[] | undefined
+  const textContains =
+    input.textContains === undefined
+      ? undefined
+      : nonEmptyString(input.textContains, 'textContains').toLocaleLowerCase()
+  const bounds = queryBounds(input.bounds)
+  const db = currentDatabase()
+  const matches = currentDrawingReadModel(db).query({
+    ...(entityIdsFilter ? { entityIds: entityIdsFilter } : {}),
+    ...(layers ? { layers } : {}),
+    ...(types ? { types } : {}),
+    ...(kinds ? { kinds } : {}),
+    ...(textContains ? { textContains } : {}),
+    ...(bounds ? { bounds } : {}),
+    space: 'model'
+  })
+  const page = paginateIndexedEntities(
+    matches,
+    db,
+    cursor,
+    pageSize,
+    detail
+  )
+
+  return {
+    data: {
+      units: drawingUnits(db),
+      matchedCount: matches.length,
+      detail,
+      cursor,
+      pageSize,
+      ...page,
+      filters: {
+        ...(entityIdsFilter ? { entityIdCount: entityIdsFilter.length } : {}),
+        ...(layers ? { layerCount: layers.length } : {}),
+        ...(types ? { typeCount: types.length } : {}),
+        ...(kinds ? { kindCount: kinds.length } : {}),
+        ...(textContains ? { textContains: input.textContains } : {}),
+        ...(bounds ? { bounded: true } : {})
+      },
+      revision: queryRevision()
+    }
+  }
+}
+
+interface TextEntityBox {
+  entity: AcDbMText | AcDbText
+  box: BoundingBox2D
+}
+
+function textBoxesOverlap(
+  left: BoundingBox2D,
+  right: BoundingBox2D,
+  minimumGap: number
+): boolean {
+  const clearance = boundingBoxDistance(left, right)
+  return clearance === 0 || clearance < minimumGap
+}
+
+function buildOverlapClusterSegments(
+  group: readonly TextEntityBox[],
+  clusterIndex: number
+): Record<string, unknown>[] {
+  const entityIds = group.map((entry) => entry.entity.objectId)
+  const layerNames = [
+    ...new Map(
+      group.map((entry) => [
+        layerKey(entry.entity.layer),
+        entry.entity.layer
+      ])
+    ).values()
+  ].sort((left, right) => left.localeCompare(right))
+  const layerPreview = layerNames.slice(0, MAX_OVERLAP_CLUSTER_LAYER_PREVIEW)
+  const base = {
+    clusterIndex,
+    entityCount: group.length,
+    layerCount: layerNames.length,
+    layers: layerPreview,
+    layersTruncated: layerPreview.length < layerNames.length,
+    bbox: unionBoundingBoxes(group.map((entry) => entry.box)),
+    textSamples: group.slice(0, 5).map((entry) => ({
+      entityId: entry.entity.objectId,
+      content: (entityText(entry.entity) ?? '').slice(0, 160)
+    }))
+  }
+  const record = (start: number, end: number) => ({
+    ...base,
+    memberCursor: start,
+    entityIds: entityIds.slice(start, end),
+    membersReturnedCount: end - start,
+    membersNextCursor: end < entityIds.length ? end : null,
+    membersHasMore: end < entityIds.length
+  })
+  const segments: Record<string, unknown>[] = []
+  let start = 0
+  while (start < entityIds.length) {
+    let end = start
+    while (
+      end < entityIds.length &&
+      end - start < MAX_OVERLAP_CLUSTER_MEMBER_COUNT
+    ) {
+      const candidate = record(start, end + 1)
+      if (
+        end > start &&
+        JSON.stringify(candidate).length >
+          MAX_OVERLAP_CLUSTER_RECORD_CHARACTERS
+      ) {
+        break
+      }
+      if (
+        end === start &&
+        JSON.stringify(candidate).length >
+          MAX_OVERLAP_CLUSTER_RECORD_CHARACTERS
+      ) {
+        throw new Error(
+          `Overlap-cluster member ${entityIds[start]} cannot fit in a bounded response`
+        )
+      }
+      end += 1
+    }
+    segments.push(record(start, end))
+    start = end
+  }
+  return segments
+}
+
+function findTextOverlaps(rawInput: unknown): ToolResult {
+  const input = asRecord(rawInput, 'find_text_overlaps')
+  const layers = stringArray(input.layers, 'layers')
+  const bounds = queryBounds(input.bounds)
+  const minimumGap =
+    input.minimumGap === undefined
+      ? 0
+      : finiteNumber(input.minimumGap, 'minimumGap')
+  if (minimumGap < 0) throw new Error('minimumGap must be zero or greater')
+  const cursor = boundedInteger(input.cursor, 'cursor', 0, 0, Number.MAX_SAFE_INTEGER)
+  const pageSize = boundedInteger(
+    input.pageSize,
+    'pageSize',
+    DEFAULT_ENTITY_PAGE_SIZE,
+    1,
+    MAX_ENTITY_PAGE_SIZE
+  )
+  const db = currentDatabase()
+  const candidateIds = currentDrawingReadModel(db).query({
+    kinds: ['text'],
+    ...(layers ? { layers } : {}),
+    ...(bounds ? { bounds } : {}),
+    space: 'model'
+  })
+  const candidates: TextEntityBox[] = candidateIds
+    .map((id) => db.tables.blockTable.getEntityById(id))
+    .filter(
+      (entity): entity is AcDbMText | AcDbText =>
+        entity instanceof AcDbMText || entity instanceof AcDbText
+    )
+    .map((entity) => ({ entity, box: entityBox(entity) }))
+    .filter(
+      (entry): entry is TextEntityBox => entry.box !== null
+    )
+    .sort(
+      (left, right) =>
+        left.box.min.x - right.box.min.x ||
+        left.box.min.y - right.box.min.y ||
+        left.entity.objectId.localeCompare(right.entity.objectId)
+    )
+
+  const parent = candidates.map((_, index) => index)
+  const find = (index: number): number => {
+    let root = index
+    while (parent[root] !== root) root = parent[root]
+    while (parent[index] !== index) {
+      const next = parent[index]
+      parent[index] = root
+      index = next
+    }
+    return root
+  }
+  const union = (left: number, right: number) => {
+    const leftRoot = find(left)
+    const rightRoot = find(right)
+    if (leftRoot !== rightRoot) parent[rightRoot] = leftRoot
+  }
+
+  for (let left = 0; left < candidates.length; left += 1) {
+    for (let right = left + 1; right < candidates.length; right += 1) {
+      if (
+        candidates[right].box.min.x >
+        candidates[left].box.max.x + minimumGap
+      ) {
+        break
+      }
+      if (
+        textBoxesOverlap(
+          candidates[left].box,
+          candidates[right].box,
+          minimumGap
+        )
+      ) {
+        union(left, right)
+      }
+    }
+  }
+
+  const grouped = new Map<number, TextEntityBox[]>()
+  candidates.forEach((candidate, index) => {
+    const root = find(index)
+    const group = grouped.get(root) ?? []
+    group.push(candidate)
+    grouped.set(root, group)
+  })
+  const clusterGroups = [...grouped.values()].filter(
+    (group) => group.length > 1
+  )
+  const clusterSegments = clusterGroups.flatMap((group, index) =>
+    buildOverlapClusterSegments(group, index)
+  )
+  const page = paginateRecords(
+    clusterSegments,
+    cursor,
+    pageSize,
+    'overlap-cluster segment'
+  )
+
+  return {
+    data: {
+      units: drawingUnits(db),
+      textEntityCount: candidates.length,
+      overlapClusterCount: clusterGroups.length,
+      clusterSegmentCount: clusterSegments.length,
+      minimumGap,
+      cursor,
+      pageSize,
+      clusters: page.records,
+      returnedCount: page.returnedCount,
+      nextCursor: page.nextCursor,
+      hasMore: page.hasMore,
+      filters: {
+        ...(layers ? { layerCount: layers.length } : {}),
+        ...(bounds ? { bounded: true } : {})
+      },
+      revision: queryRevision()
+    }
+  }
+}
+
+function getEntityText(rawInput: unknown): ToolResult {
+  const input = asRecord(rawInput, 'get_entity_text')
+  const entityId = nonEmptyString(input.entityId, 'entityId')
+  const cursor = boundedInteger(input.cursor, 'cursor', 0, 0, Number.MAX_SAFE_INTEGER)
+  const chunkSize = boundedInteger(
+    input.chunkSize,
+    'chunkSize',
+    DEFAULT_TEXT_CHUNK_SIZE,
+    1,
+    MAX_TEXT_CHUNK_SIZE
+  )
+  const entity = currentDatabase().tables.blockTable.getEntityById(entityId)
+  if (!entity) throw new Error(`Entity id not found: ${entityId}`)
+  const content = entityText(entity)
+  if (content === undefined) {
+    throw new Error(`Entity ${entityId} (${entity.type}) is not TEXT or MTEXT`)
+  }
+  if (cursor > content.length) {
+    throw new Error(`cursor ${cursor} is past the ${content.length}-character text`)
+  }
+  const requestedEnd = Math.min(content.length, cursor + chunkSize)
+  const revision = queryRevision()
+  const buildPage = (end: number) => ({
+      entityId,
+      type: entity.type,
+      layer: entity.layer,
+      cursor,
+      chunkSize,
+      content: content.slice(cursor, end),
+      totalCharacters: content.length,
+      returnedCharacters: end - cursor,
+      nextCursor: end < content.length ? end : null,
+      hasMore: end < content.length,
+      revision
+  })
+  let lower = cursor
+  let upper = requestedEnd
+  while (lower < upper) {
+    const candidate = Math.ceil((lower + upper) / 2)
+    if (
+      JSON.stringify(buildPage(candidate)).length <=
+      MAX_ENTITY_PAGE_CHARACTERS
+    ) {
+      lower = candidate
+    } else {
+      upper = candidate - 1
+    }
+  }
+  if (lower === cursor && requestedEnd > cursor) {
+    throw new Error(
+      `Entity ${entityId} text metadata cannot fit one character in a bounded response`
+    )
+  }
+  return { data: buildPage(lower) }
+}
+
+function getPolylineVertices(rawInput: unknown): ToolResult {
+  const input = asRecord(rawInput, 'get_polyline_vertices')
+  const entityId = nonEmptyString(input.entityId, 'entityId')
+  const cursor = boundedInteger(input.cursor, 'cursor', 0, 0, Number.MAX_SAFE_INTEGER)
+  const pageSize = boundedInteger(
+    input.pageSize,
+    'pageSize',
+    DEFAULT_VERTEX_PAGE_SIZE,
+    1,
+    MAX_VERTEX_PAGE_SIZE
+  )
+  const entity = currentDatabase().tables.blockTable.getEntityById(entityId)
+  if (!entity) throw new Error(`Entity id not found: ${entityId}`)
+  if (!(entity instanceof AcDbPolyline)) {
+    throw new Error(`Entity ${entityId} (${entity.type}) is not a polyline`)
+  }
+  const vertices = polylineVertices(entity)
+  if (cursor > vertices.length) {
+    throw new Error(`cursor ${cursor} is past the ${vertices.length}-vertex polyline`)
+  }
+  const page: typeof vertices = []
+  let encodedCharacters = 2
+  let end = cursor
+  while (end < vertices.length && page.length < pageSize) {
+    const vertex = vertices[end]
+    const vertexCharacters = JSON.stringify(vertex).length
+    if (
+      page.length > 0 &&
+      encodedCharacters + vertexCharacters + 1 > MAX_ENTITY_PAGE_CHARACTERS
+    ) {
+      break
+    }
+    page.push(vertex)
+    encodedCharacters += vertexCharacters + (page.length > 1 ? 1 : 0)
+    end += 1
+  }
+
+  return {
+    data: {
+      entityId,
+      layer: entity.layer,
+      units: drawingUnits(),
+      closed: entity.closed,
+      cursor,
+      pageSize,
+      vertices: page,
+      vertexCount: vertices.length,
+      returnedCount: end - cursor,
+      nextCursor: end < vertices.length ? end : null,
+      hasMore: end < vertices.length,
+      revision: queryRevision()
+    }
+  }
+}
+
+function buildLayerSummaries(
+  db: AcDbDatabase,
+  readModel: DrawingReadModel
+): Record<string, unknown>[] {
+  return Array.from(db.tables.layerTable.newIterator()).map((layer) => {
+    const stats = readModel.layerStats(layer.name)
+    return {
+      name: layer.name,
+      colorCss: layer.color.cssColor ?? '#ffffff',
+      isOff: layer.isOff,
+      isFrozen: layer.isFrozen,
+      isLocked: layer.isLocked,
+      isPlottable: layer.isPlottable,
+      entityCount: stats?.entityCount ?? 0,
+      entityKinds: stats
+        ? Object.fromEntries(
+            [...stats.entityKinds.entries()].sort(([left], [right]) =>
+              left.localeCompare(right)
+            )
+          )
+        : {}
+    }
+  })
+}
+
+function paginateRecords<T>(
+  records: readonly T[],
+  cursor: number,
+  pageSize: number,
+  label: string
+): {
+  records: T[]
+  returnedCount: number
+  nextCursor: number | null
+  hasMore: boolean
+} {
+  if (cursor > records.length) {
+    throw new Error(`cursor ${cursor} is past the ${records.length}-${label} result set`)
+  }
+  const page: T[] = []
+  let encodedCharacters = 2
+  let index = cursor
+  while (index < records.length && page.length < pageSize) {
+    const record = records[index]
+    const recordCharacters = JSON.stringify(record).length
+    if (recordCharacters > MAX_ENTITY_PAGE_CHARACTERS) {
+      throw new Error(
+        `${label} record ${index} exceeds the bounded response size`
+      )
+    }
+    if (
+      page.length > 0 &&
+      encodedCharacters + recordCharacters + 1 > MAX_ENTITY_PAGE_CHARACTERS
+    ) {
+      break
+    }
+    page.push(record)
+    encodedCharacters += recordCharacters + (page.length > 1 ? 1 : 0)
+    index += 1
+  }
+  const hasMore = index < records.length
+  return {
+    records: page,
+    returnedCount: page.length,
+    nextCursor: hasMore ? index : null,
+    hasMore
+  }
+}
+
+function listLayers(rawInput: unknown): ToolResult {
+  const input = asRecord(rawInput, 'list_layers')
+  const cursor = boundedInteger(input.cursor, 'cursor', 0, 0, Number.MAX_SAFE_INTEGER)
+  const pageSize = boundedInteger(
+    input.pageSize,
+    'pageSize',
+    DEFAULT_ENTITY_PAGE_SIZE,
+    1,
+    MAX_ENTITY_PAGE_SIZE
+  )
+  const db = currentDatabase()
+  const layers = buildLayerSummaries(db, currentDrawingReadModel(db))
+  const page = paginateRecords(layers, cursor, pageSize, 'layer')
+
+  return {
+    data: {
+      layerCount: layers.length,
+      cursor,
+      pageSize,
+      layers: page.records,
+      returnedCount: page.returnedCount,
+      nextCursor: page.nextCursor,
+      hasMore: page.hasMore,
+      revision: queryRevision()
     }
   }
 }
@@ -476,6 +1360,10 @@ function getDrawingContext(): ToolResult {
         units: 'Unknown',
         currentLayer: null,
         layers: [],
+        layerCount: 0,
+        layersReturnedCount: 0,
+        layersNextCursor: null,
+        layersHasMore: false,
         drawingExtents: null,
         extents: null,
         sheetDrawingUnit: sheetStore.current.drawingUnit,
@@ -488,31 +1376,30 @@ function getDrawingContext(): ToolResult {
   }
 
   const db = currentDatabase()
-  const layers: { name: string; colorCss: string; isOff: boolean }[] = []
-  for (const layer of db.tables.layerTable.newIterator()) {
-    layers.push({
-      name: layer.name,
-      colorCss: layer.color.cssColor ?? '#ffffff',
-      isOff: layer.isOff
-    })
-  }
+  const readModel = currentDrawingReadModel(db)
+  const allLayers = buildLayerSummaries(db, readModel)
+  const layerPage = paginateRecords(
+    allLayers,
+    0,
+    DEFAULT_ENTITY_PAGE_SIZE,
+    'layer'
+  )
+  const visibleEntityCount = readModel.visibleCount
 
   const storedExtents = db.extents
-  const fallbackExtents = Array.from(db.tables.blockTable.modelSpace.newIterator())
-    .map((entity) => entity.geometricExtents)
-    .filter((extents) => !extents.isEmpty())
+  const fallbackExtents = readModel.extents()
   const extents =
-    storedExtents.isEmpty() && fallbackExtents.length > 0
+    storedExtents.isEmpty() && fallbackExtents
       ? {
           min: {
-            x: Math.min(...fallbackExtents.map((value) => value.min.x)),
-            y: Math.min(...fallbackExtents.map((value) => value.min.y)),
-            z: Math.min(...fallbackExtents.map((value) => value.min.z))
+            x: fallbackExtents.minX,
+            y: fallbackExtents.minY,
+            z: 0
           },
           max: {
-            x: Math.max(...fallbackExtents.map((value) => value.max.x)),
-            y: Math.max(...fallbackExtents.map((value) => value.max.y)),
-            z: Math.max(...fallbackExtents.map((value) => value.max.z))
+            x: fallbackExtents.maxX,
+            y: fallbackExtents.maxY,
+            z: 0
           }
         }
       : storedExtents.isEmpty()
@@ -544,21 +1431,29 @@ function getDrawingContext(): ToolResult {
       editable: snapshot?.editable ?? true,
       viewReady: snapshot?.viewReady ?? false,
       activeLayout: snapshot?.activeLayout,
-      entityCount:
-        snapshot?.entityCount ??
-        Array.from(db.tables.blockTable.modelSpace.newIterator()).length,
-      visibleEntityCount: snapshot?.visibleEntityCount,
+      entityCount: readModel.size,
+      visibleEntityCount,
       databaseUnit: snapshot?.databaseUnit ?? drawingUnits(db),
       units: drawingUnits(db),
       currentLayer: db.clayer,
-      layers,
+      layers: layerPage.records,
+      layerCount: allLayers.length,
+      layersReturnedCount: layerPage.returnedCount,
+      layersNextCursor: layerPage.nextCursor,
+      layersHasMore: layerPage.hasMore,
       drawingExtents: normalizedExtents,
       extents,
       sheetDrawingUnit: sheetStore.current.drawingUnit,
       sheetScaleDenominator: sheetStore.current.scaleDenominator,
       unitMismatch: mismatch.mismatch,
       unitMismatchFactor: mismatch.factor,
-      lifecycleStatus: snapshot?.status ?? 'active'
+      lifecycleStatus: snapshot?.status ?? 'active',
+      entityDiscovery: {
+        tool: 'list_entities',
+        selectionRequired: false,
+        paginated: true
+      },
+      revision: queryRevision()
     }
   }
 }
@@ -570,16 +1465,14 @@ function moveEntities(rawInput: unknown): ToolResult {
   const dy = finiteNumber(input.dy, 'dy')
   const db = currentDatabase()
   const entities = resolveEntities(ids, db)
-  const documentManager = testDatabaseOverride
-    ? AcApDocManager.instance
-    : requireEditableCadSession().manager
   runEdit('Agent: move_entities', () => {
-    const count = documentManager.curDocument.entityService.translateEntities(entities, {
-      x: dx,
-      y: dy,
-      z: 0
-    })
+    const count = transformEntities(
+      db,
+      entities,
+      new AcGeMatrix3d().makeTranslation(dx, dy, 0)
+    )
     if (count !== entities.length) throw new Error('Not every entity could be opened for move')
+    resolveEntities(ids, db)
   })
   return { data: { entityIds: ids, dx, dy } }
 }
@@ -589,37 +1482,49 @@ function copyEntities(rawInput: unknown): ToolResult {
   const ids = entityIds(input.entityIds)
   const dx = finiteNumber(input.dx, 'dx')
   const dy = finiteNumber(input.dy, 'dy')
-  const entities = resolveEntities(ids)
-  const documentManager = testDatabaseOverride
-    ? AcApDocManager.instance
-    : requireEditableCadSession().manager
-  const copies = runEdit('Agent: copy_entities', () =>
-    documentManager.curDocument.entityService.cloneAndTransform(
+  const db = currentDatabase()
+  const entities = resolveEntities(ids, db)
+  const newIds = runEdit('Agent: copy_entities', () => {
+    const copies = cloneAndTransformEntities(
+      db,
       entities,
       new AcGeMatrix3d().makeTranslation(dx, dy, 0)
     )
-  )
-  const newIds = copies.map((entity) => entity.objectId)
-  if (newIds.length !== entities.length) throw new Error('Not every entity could be copied')
-  return { data: { entityIds: newIds, sourceEntityIds: ids, dx, dy } }
+    const copiedIds = copies.map((entity) => entity.objectId)
+    if (copiedIds.length !== entities.length) {
+      throw new Error('Not every entity could be copied')
+    }
+    if (copiedIds.some((id) => !db.tables.blockTable.getEntityById(id))) {
+      throw new Error('A copied entity was not present before transaction commit')
+    }
+    return copiedIds
+  })
+  return {
+    data: {
+      entityIds: newIds,
+      sourceCount: ids.length,
+      copiedCount: newIds.length,
+      dx,
+      dy
+    }
+  }
 }
 
 function rotateEntities(rawInput: unknown): ToolResult {
   const input = asRecord(rawInput, 'rotate_entities')
   const ids = entityIds(input.entityIds)
   const angleDeg = finiteNumber(input.angleDeg, 'angleDeg')
-  const entities = resolveEntities(ids)
-  const documentManager = testDatabaseOverride
-    ? AcApDocManager.instance
-    : requireEditableCadSession().manager
+  const db = currentDatabase()
+  const entities = resolveEntities(ids, db)
   const center = input.center === undefined ? commonCenter(entities) : point2D(input.center, 'center')
+  const matrix = new AcGeMatrix3d()
+    .makeTranslation(center.x, center.y, 0)
+    .multiply(new AcGeMatrix3d().makeRotationZ((angleDeg * Math.PI) / 180))
+    .multiply(new AcGeMatrix3d().makeTranslation(-center.x, -center.y, 0))
   runEdit('Agent: rotate_entities', () => {
-    const count = documentManager.curDocument.entityService.rotateEntities(
-      entities,
-      { ...center, z: 0 },
-      (angleDeg * Math.PI) / 180
-    )
+    const count = transformEntities(db, entities, matrix)
     if (count !== entities.length) throw new Error('Not every entity could be opened for rotation')
+    resolveEntities(ids, db)
   })
   return { data: { entityIds: ids, angleDeg, center } }
 }
@@ -628,18 +1533,17 @@ function scaleEntities(rawInput: unknown): ToolResult {
   const input = asRecord(rawInput, 'scale_entities')
   const ids = entityIds(input.entityIds)
   const factor = positiveNumber(input.factor, 'factor')
-  const entities = resolveEntities(ids)
-  const documentManager = testDatabaseOverride
-    ? AcApDocManager.instance
-    : requireEditableCadSession().manager
+  const db = currentDatabase()
+  const entities = resolveEntities(ids, db)
   const center = input.center === undefined ? commonCenter(entities) : point2D(input.center, 'center')
   const matrix = new AcGeMatrix3d()
     .makeTranslation(center.x, center.y, 0)
     .multiply(new AcGeMatrix3d().makeScale(factor, factor, factor))
     .multiply(new AcGeMatrix3d().makeTranslation(-center.x, -center.y, 0))
   runEdit('Agent: scale_entities', () => {
-    const count = documentManager.curDocument.entityService.transformEntities(entities, matrix)
+    const count = transformEntities(db, entities, matrix)
     if (count !== entities.length) throw new Error('Not every entity could be opened for scaling')
+    resolveEntities(ids, db)
   })
   return { data: { entityIds: ids, factor, center } }
 }
@@ -647,13 +1551,14 @@ function scaleEntities(rawInput: unknown): ToolResult {
 function deleteEntities(rawInput: unknown): ToolResult {
   const input = asRecord(rawInput, 'delete_entities')
   const ids = entityIds(input.entityIds)
-  resolveEntities(ids)
-  const documentManager = testDatabaseOverride
-    ? AcApDocManager.instance
-    : requireEditableCadSession().manager
+  const db = currentDatabase()
+  resolveEntities(ids, db)
   runEdit('Agent: delete_entities', () => {
-    const count = documentManager.curDocument.entityService.eraseEntities(ids)
+    const count = eraseCadEntities(db, ids)
     if (count !== ids.length) throw new Error('Not every entity could be deleted')
+    if (ids.some((id) => db.tables.blockTable.getEntityById(id))) {
+      throw new Error('A deleted entity remained present before transaction commit')
+    }
   })
   return { data: { entityIds: ids } }
 }
@@ -664,16 +1569,61 @@ function setEntityLayer(rawInput: unknown): ToolResult {
   const layerName = nonEmptyString(input.layerName, 'layerName')
   const db = currentDatabase()
   resolveEntities(ids, db)
+  let appliedLayerName = layerName
   const layerCreated = runEdit('Agent: set_entity_layer', () => {
     const created = createLayerRecord(db, layerName).created
+    const layer = db.tables.layerTable.getAt(layerName)
+    if (!layer) throw new Error(`Layer not found after creation: ${layerName}`)
+    appliedLayerName = layer.name
     for (const id of ids) {
       const entity = db.openEntityForWrite(id) as AcDbEntity | undefined
       if (!entity) throw new Error(`Entity could not be opened for write: ${id}`)
-      entity.layer = layerName
+      entity.layer = appliedLayerName
     }
     return created
   })
-  return { data: { entityIds: ids, layerName, layerCreated } }
+  return { data: { entityIds: ids, layerName: appliedLayerName, layerCreated } }
+}
+
+function setEntityColor(rawInput: unknown): ToolResult {
+  const input = asRecord(rawInput, 'set_entity_color')
+  const ids = entityIds(input.entityIds)
+  const mode = nonEmptyString(input.mode, 'mode')
+  if (mode !== 'by-layer' && mode !== 'by-block' && mode !== 'explicit') {
+    throw new Error('mode must be "by-layer", "by-block", or "explicit"')
+  }
+  const colorCss =
+    input.colorCss === undefined
+      ? undefined
+      : nonEmptyString(input.colorCss, 'colorCss')
+  if (mode === 'explicit' && colorCss === undefined) {
+    throw new Error('colorCss is required when mode is "explicit"')
+  }
+  if (mode !== 'explicit' && colorCss !== undefined) {
+    throw new Error('colorCss is only valid when mode is "explicit"')
+  }
+  const color =
+    mode === 'by-layer'
+      ? new AcCmColor().setByLayer()
+      : mode === 'by-block'
+        ? new AcCmColor().setByBlock()
+        : parseCssColor(colorCss as string)
+  const db = currentDatabase()
+  resolveEntities(ids, db)
+  runEdit('Agent: set_entity_color', () => {
+    for (const id of ids) {
+      const entity = db.openEntityForWrite(id)
+      if (!entity) throw new Error(`Entity could not be opened for write: ${id}`)
+      entity.color = color.clone()
+    }
+  })
+  return {
+    data: {
+      entityIds: ids,
+      mode,
+      colorCss: mode === 'explicit' ? color.cssColor ?? colorCss : null
+    }
+  }
 }
 
 function changeText(rawInput: unknown): ToolResult {
@@ -690,7 +1640,13 @@ function changeText(rawInput: unknown): ToolResult {
     else if (opened instanceof AcDbMText) opened.contents = input.newText as string
     else throw new Error(`Text entity could not be opened for write: ${id}`)
   })
-  return { data: { entityIds: [id], text: input.newText } }
+  return {
+    data: {
+      entityIds: [id],
+      textCharacterCount: (input.newText as string).length,
+      contentChanged: true
+    }
+  }
 }
 
 function calculateArea(rawInput: unknown): ToolResult {
@@ -790,7 +1746,14 @@ function drawPolyline(rawInput: unknown): ToolResult {
     polyline.closed = closed
     return appendEntity(polyline, layer)
   })
-  return { data: { entityIds: [id], points, closed, layer: layer ?? currentDatabase().clayer } }
+  return {
+    data: {
+      entityIds: [id],
+      vertexCount: points.length,
+      closed,
+      layer: layer ?? currentDatabase().clayer
+    }
+  }
 }
 
 function drawRectangle(rawInput: unknown): ToolResult {
@@ -875,7 +1838,13 @@ function drawText(rawInput: unknown): ToolResult {
     return appendEntity(text, layer)
   })
   return {
-    data: { entityIds: [id], position, text: input.text, height, layer: layer ?? currentDatabase().clayer }
+    data: {
+      entityIds: [id],
+      position,
+      textCharacterCount: (input.text as string).length,
+      height,
+      layer: layer ?? currentDatabase().clayer
+    }
   }
 }
 
@@ -1068,7 +2037,7 @@ function addLeader(rawInput: unknown): ToolResult {
     data: {
       entityIds: [result.leaderId, result.textId],
       targetPoint,
-      text,
+      textCharacterCount: text.length,
       textPosition,
       height,
       layer: result.layer.name,
@@ -1100,7 +2069,7 @@ function addMText(rawInput: unknown): ToolResult {
     data: {
       entityIds: [result.entityId],
       position,
-      text,
+      textCharacterCount: text.length,
       height,
       layer: result.layer.name,
       layerCreated: result.layer.created
@@ -1143,7 +2112,14 @@ function drawHatch(rawInput: unknown): ToolResult {
     hatch.add(createClosedBoundary(vertices))
     return appendEntity(hatch, layer)
   })
-  return { data: { entityIds: [id], boundary: vertices, pattern, layer: layer ?? currentDatabase().clayer } }
+  return {
+    data: {
+      entityIds: [id],
+      boundaryVertexCount: vertices.length,
+      pattern,
+      layer: layer ?? currentDatabase().clayer
+    }
+  }
 }
 
 function createLayer(rawInput: unknown): ToolResult {
@@ -1155,13 +2131,66 @@ function createLayer(rawInput: unknown): ToolResult {
   return { data: { entityIds: [], name, ...result } }
 }
 
+function setLayerProperties(rawInput: unknown): ToolResult {
+  const input = asRecord(rawInput, 'set_layer_properties')
+  const name = nonEmptyString(input.name, 'name')
+  const colorCss =
+    input.colorCss === undefined
+      ? undefined
+      : nonEmptyString(input.colorCss, 'colorCss')
+  const isOff = optionalBoolean(input.isOff, 'isOff')
+  const isFrozen = optionalBoolean(input.isFrozen, 'isFrozen')
+  const isLocked = optionalBoolean(input.isLocked, 'isLocked')
+  const isPlottable = optionalBoolean(input.isPlottable, 'isPlottable')
+  if (
+    colorCss === undefined &&
+    isOff === undefined &&
+    isFrozen === undefined &&
+    isLocked === undefined &&
+    isPlottable === undefined
+  ) {
+    throw new Error('At least one layer property must be provided')
+  }
+
+  const db = currentDatabase()
+  const layer = db.tables.layerTable.getAt(name)
+  if (!layer) throw new Error(`Layer not found: ${name}`)
+  const properties = (record: AcDbLayerTableRecord) => ({
+    colorCss: record.color.cssColor ?? '#ffffff',
+    isOff: record.isOff,
+    isFrozen: record.isFrozen,
+    isLocked: record.isLocked,
+    isPlottable: record.isPlottable
+  })
+  const before = properties(layer)
+  runEdit('Agent: set_layer_properties', () => {
+    const writable = db.openObjectForWrite<AcDbLayerTableRecord>(layer.objectId)
+    if (!writable) throw new Error(`Layer could not be opened for write: ${name}`)
+    if (colorCss !== undefined) writable.color = parseCssColor(colorCss)
+    if (isOff !== undefined) writable.isOff = isOff
+    if (isFrozen !== undefined) writable.isFrozen = isFrozen
+    if (isLocked !== undefined) writable.isLocked = isLocked
+    if (isPlottable !== undefined) writable.isPlottable = isPlottable
+  })
+
+  const updatedLayer = db.tables.layerTable.getAt(name)
+  if (!updatedLayer) throw new Error(`Layer disappeared after update: ${name}`)
+  return { data: { entityIds: [], name, before, after: properties(updatedLayer) } }
+}
+
 function setCurrentLayer(rawInput: unknown): ToolResult {
   const input = asRecord(rawInput, 'set_current_layer')
   const name = nonEmptyString(input.name, 'name')
   const { manager } = requireEditableCadSession()
   const changed = manager.curDocument.layerService.setCurrentLayer(name)
   if (!changed) throw new Error(`Layer not found: ${name}`)
-  return { data: { entityIds: [], name } }
+  markCadSessionDatabaseEdited()
+  return {
+    data: {
+      entityIds: [],
+      name: manager.curDocument.database.clayer
+    }
+  }
 }
 
 async function zoomExtents(): Promise<ToolResult> {
@@ -1290,12 +2319,24 @@ function setSheetDefinition(rawInput: unknown): ToolResult {
   return {
     data: {
       entityIds: [],
-      sheet: { ...sheetStore.current },
+      sheet: {
+        paper: sheetStore.current.paper,
+        orientation: sheetStore.current.orientation,
+        scaleDenominator: sheetStore.current.scaleDenominator,
+        drawingUnit: sheetStore.current.drawingUnit,
+        templateId: sheetStore.current.templateId,
+        fieldCount: Object.keys(sheetStore.current.fields ?? {}).length
+      },
+      updatedKeys: Object.keys(update),
       databaseUnit: cadSessionState.databaseUnit,
       unitMismatch: mismatch.mismatch,
       unitMismatchFactor: mismatch.factor,
       geometryScaled: false,
-      ignoredFieldKeys
+      ignoredFieldCount: ignoredFieldKeys.length,
+      ignoredFieldKeysPreview: ignoredFieldKeys.slice(
+        0,
+        MAX_FIELD_KEY_PREVIEW
+      )
     }
   }
 }
@@ -1315,7 +2356,22 @@ function setTitleBlockFields(rawInput: unknown): ToolResult {
     ...sheetStore.current,
     fields: { ...(sheetStore.current.fields ?? {}), ...(fields as Record<string, string>) }
   }
-  return { data: { entityIds: [], fields: { ...sheetStore.current.fields }, ignoredFieldKeys } }
+  return {
+    data: {
+      entityIds: [],
+      updatedFieldCount: Object.keys(fields).length,
+      updatedFieldKeysPreview: Object.keys(fields).slice(
+        0,
+        MAX_FIELD_KEY_PREVIEW
+      ),
+      storedFieldCount: Object.keys(sheetStore.current.fields ?? {}).length,
+      ignoredFieldCount: ignoredFieldKeys.length,
+      ignoredFieldKeysPreview: ignoredFieldKeys.slice(
+        0,
+        MAX_FIELD_KEY_PREVIEW
+      )
+    }
+  }
 }
 
 async function getViewStatus(): Promise<ToolResult> {
@@ -1378,7 +2434,91 @@ async function inspectSheetPreview(rawInput: unknown): Promise<ToolResult> {
         : 'CAD regeneration is incomplete.'
     )
   }
-  return sheetPreviewService.capture(view as SheetPreviewView)
+  return drawingVisionService.recordSheet(
+    await sheetPreviewService.capture(view as SheetPreviewView)
+  )
+}
+
+async function inspectModelView(rawInput: unknown): Promise<ToolResult> {
+  const input = asRecord(rawInput, 'inspect_model_view')
+  if (Object.keys(input).length > 0) {
+    throw new Error('inspect_model_view input contains unsupported fields')
+  }
+  return drawingVisionService.captureModel('model-view')
+}
+
+async function inspectRegion(rawInput: unknown): Promise<ToolResult> {
+  const input = asRecord(rawInput, 'inspect_region')
+  const bounds = queryBounds(input.bounds)
+  if (!bounds) throw new Error('inspect_region.bounds is required')
+  if (bounds.maxX <= bounds.minX || bounds.maxY <= bounds.minY) {
+    throw new Error('inspect_region bounds must have positive width and height')
+  }
+  return drawingVisionService.captureModel('region', bounds)
+}
+
+async function inspectSelection(rawInput: unknown): Promise<ToolResult> {
+  const input = asRecord(rawInput, 'inspect_selection')
+  const ids = entityIds(input.entityIds)
+  const entities = resolveEntities(ids)
+  const bounds = unionBoundingBoxes(
+    entities
+      .map(entityBox)
+      .filter((box): box is BoundingBox2D => box !== null)
+  )
+  if (!bounds) {
+    throw new Error('The selected entities have no capturable extents.')
+  }
+  return drawingVisionService.captureModel(
+    'selection',
+    {
+      minX: bounds.min.x,
+      minY: bounds.min.y,
+      maxX: bounds.max.x,
+      maxY: bounds.max.y
+    },
+    ids
+  )
+}
+
+async function compareBeforeAfter(rawInput: unknown): Promise<ToolResult> {
+  const input = asRecord(rawInput, 'compare_before_after')
+  return drawingVisionService.compare(
+    nonEmptyString(input.beforeEvidenceId, 'beforeEvidenceId'),
+    nonEmptyString(input.afterEvidenceId, 'afterEvidenceId')
+  )
+}
+
+async function renderAnalysisOverlay(rawInput: unknown): Promise<ToolResult> {
+  const input = asRecord(rawInput, 'render_analysis_overlay')
+  if (!Array.isArray(input.boxes) || input.boxes.length < 1 || input.boxes.length > 50) {
+    throw new Error('boxes must contain from 1 through 50 overlays')
+  }
+  const boxes = input.boxes.map((value, index): OverlayBox => {
+    const box = asRecord(value, `boxes[${index}]`)
+    const result = {
+      x: finiteNumber(box.x, `boxes[${index}].x`),
+      y: finiteNumber(box.y, `boxes[${index}].y`),
+      width: positiveNumber(box.width, `boxes[${index}].width`),
+      height: positiveNumber(box.height, `boxes[${index}].height`),
+      ...(box.label === undefined
+        ? {}
+        : { label: nonEmptyString(box.label, `boxes[${index}].label`) })
+    }
+    if (
+      result.x < 0 ||
+      result.y < 0 ||
+      result.x + result.width > 1 ||
+      result.y + result.height > 1
+    ) {
+      throw new Error(`boxes[${index}] must remain inside the normalized image`)
+    }
+    return result
+  })
+  return drawingVisionService.overlay(
+    nonEmptyString(input.evidenceId, 'evidenceId'),
+    boxes
+  )
 }
 
 function getCanvasDimensions(): { width: number; height: number } {
@@ -1498,17 +2638,23 @@ function importBoundaryFromCsv(rawInput: unknown): ToolResult {
   const area = shoelaceArea(points)
   const perimeter = polylineLength(points, true)
   const result = runEdit('Agent: import_boundary_from_csv', () => {
-    const layerResult = createLayerRecord(currentDatabase(), layer)
-    const entity = createPolylineEntity(points, true, layer)
-    currentDatabase().tables.blockTable.modelSpace.appendEntity(entity)
-    return { entityId: entity.objectId, layerCreated: layerResult.created }
+    const db = currentDatabase()
+    const layerResult = createLayerRecord(db, layer)
+    const appliedLayer = canonicalLayerName(layer, db)
+    const entity = createPolylineEntity(points, true, appliedLayer)
+    db.tables.blockTable.modelSpace.appendEntity(entity)
+    return {
+      entityId: entity.objectId,
+      layer: appliedLayer,
+      layerCreated: layerResult.created
+    }
   })
 
   return {
     data: {
       entityIds: [result.entityId],
       entityId: result.entityId,
-      layer,
+      layer: result.layer,
       layerCreated: result.layerCreated,
       inputRowCount: suppliedPoints.length,
       vertexCount: points.length,
@@ -1525,35 +2671,51 @@ function importBoundaryFromGeoJson(rawInput: unknown): ToolResult {
   const geojsonText = nonEmptyString(input.geojsonText, 'geojsonText')
   const geometries = parseSupportedGeoJson(geojsonText)
   if (geometries.length === 0) throw new Error('GeoJSON contains no supported geometries')
+  if (geometries.length > MAX_IMPORTED_GEOMETRIES_PER_BATCH) {
+    throw new Error(
+      `GeoJSON expands to ${geometries.length} entities; continue automatically in batches of ` +
+        `${MAX_IMPORTED_GEOMETRIES_PER_BATCH}. No CAD change was made.`
+    )
+  }
   const layer = layerFromInput(input) ?? IMPORT_LAYER
 
   const result = runEdit('Agent: import_boundary_from_geojson', () => {
     const db = currentDatabase()
     const layerResult = createLayerRecord(db, layer)
+    const appliedLayer = canonicalLayerName(layer, db)
     const entityIds: string[] = []
     for (const geometry of geometries) {
       if (geometry.kind === 'point') {
         const point = new AcDbPoint()
         point.position = point3D(geometry.point)
-        point.layer = layer
+        point.layer = appliedLayer
         db.tables.blockTable.modelSpace.appendEntity(point)
         entityIds.push(point.objectId)
       } else {
-        const entity = createPolylineEntity(geometry.points, geometry.closed, layer)
+        const entity = createPolylineEntity(
+          geometry.points,
+          geometry.closed,
+          appliedLayer
+        )
         db.tables.blockTable.modelSpace.appendEntity(entity)
         entityIds.push(entity.objectId)
       }
     }
-    return { entityIds, layerCreated: layerResult.created }
+    return { entityIds, layer: appliedLayer, layerCreated: layerResult.created }
   })
 
   return {
     data: {
       entityIds: result.entityIds,
       importedCount: result.entityIds.length,
-      layer,
+      layer: result.layer,
       layerCreated: result.layerCreated,
-      geometryKinds: geometries.map((geometry) => geometry.kind),
+      geometryKindCounts: Object.fromEntries(
+        [...new Set(geometries.map((geometry) => geometry.kind))].map((kind) => [
+          kind,
+          geometries.filter((geometry) => geometry.kind === kind).length
+        ])
+      ),
       crsNote: NO_REPROJECTION_NOTE
     }
   }
@@ -1812,7 +2974,8 @@ function placeMonitoringPoints(rawInput: unknown): ToolResult {
   return {
     data: {
       entityIds: placed.results.map((result) => result.entityId),
-      points: placed.results,
+      placedCount: placed.results.length,
+      labels: placed.results.map((result) => result.label),
       layer: MONITORING_LAYER,
       layerCreated: placed.layerCreated,
       prefix
@@ -1865,15 +3028,26 @@ function insertSymbol(rawInput: unknown): ToolResult {
 
 const REAL_HANDLERS: Record<(typeof CAD_TOOL_NAMES)[number], ToolHandler> = {
   get_selected_entities: (input) => getSelectedEntities(input),
+  list_entities: (input) => listEntities(input),
+  list_layers: (input) => listLayers(input),
+  find_text_overlaps: (input) => findTextOverlaps(input),
+  get_entity_text: (input) => getEntityText(input),
+  get_polyline_vertices: (input) => getPolylineVertices(input),
   get_drawing_context: () => getDrawingContext(),
   get_view_status: () => getViewStatus(),
   inspect_sheet_preview: (input) => inspectSheetPreview(input),
+  inspect_model_view: (input) => inspectModelView(input),
+  inspect_region: (input) => inspectRegion(input),
+  inspect_selection: (input) => inspectSelection(input),
+  compare_before_after: (input) => compareBeforeAfter(input),
+  render_analysis_overlay: (input) => renderAnalysisOverlay(input),
   move_entities: (input) => moveEntities(input),
   copy_entities: (input) => copyEntities(input),
   rotate_entities: (input) => rotateEntities(input),
   scale_entities: (input) => scaleEntities(input),
   delete_entities: (input) => deleteEntities(input),
   set_entity_layer: (input) => setEntityLayer(input),
+  set_entity_color: (input) => setEntityColor(input),
   change_text: (input) => changeText(input),
   calculate_area: (input) => calculateArea(input),
   calculate_length: (input) => calculateLength(input),
@@ -1889,6 +3063,7 @@ const REAL_HANDLERS: Record<(typeof CAD_TOOL_NAMES)[number], ToolHandler> = {
   add_mtext: (input) => addMText(input),
   draw_hatch: (input) => drawHatch(input),
   create_layer: (input) => createLayer(input),
+  set_layer_properties: (input) => setLayerProperties(input),
   set_current_layer: (input) => setCurrentLayer(input),
   zoom_extents: () => zoomExtents(),
   import_boundary_from_csv: (input) => importBoundaryFromCsv(input),

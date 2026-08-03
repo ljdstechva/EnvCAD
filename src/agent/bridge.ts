@@ -6,9 +6,15 @@ import {
   sessionTokenProtocol,
   type SidecarConnectionConfig
 } from '../../desktop/runtimeProtocol'
+import {
+  getCadSessionRevision,
+  getWorkspaceRevision,
+  type CadSessionRevision
+} from '../cad/session'
 import { pushToast } from '../toast/toastStore'
 import { verifyToolImageSha256 } from './imageIntegrity'
 import {
+  ENVCAD_TURN_REVISION_FIELD,
   MAX_WEBSOCKET_PAYLOAD_BYTES,
   parseClientMessage,
   parseServerMessage,
@@ -23,9 +29,54 @@ import {
   type ToolResult,
   type TurnMetrics
 } from './protocol'
+import {
+  type CadOperationRequest,
+  type OperationReceipt,
+  parseAgentClientEnvelope,
+  parseAgentServerEnvelope,
+  persistedTurnEventEnvelopeSchema,
+  MAX_INLINE_TURN_TEXT_UTF8_BYTES,
+  type AgentClientEnvelope,
+  type AgentServerEnvelope,
+  type InputReference,
+  type InstructionBreakdown,
+  type PersistedTurnEventEnvelope,
+  type SkillActivation,
+  type TurnFinished,
+  type TurnOutcome,
+  type TurnPhase,
+  type WorkspaceRevision
+} from '../../shared/agent-contracts'
+import { CadMutationExecutor } from '../cad/operations/CadMutationExecutor'
+import { MlightCadUndoGroupAdapter } from '../cad/infrastructure/mlightcad/MlightCadUndoGroupAdapter'
+import { OperationCoordinator } from '../cad/operations/OperationCoordinator'
+import { createDurableOperationCoordinator } from '../cad/infrastructure/storage/OperationRuntime'
+import {
+  DurableTurnSession,
+  type DurableActiveTurn
+} from './runtime/DurableTurnSession'
+import { TurnProjection } from './runtime/TurnProjection'
+import {
+  InputIngestionClient,
+  localInputDisplayText,
+  type InputIngestionProgress
+} from './runtime/InputIngestionClient'
+import {
+  DraftStore,
+  type QueuedTurnDraft
+} from './runtime/DraftStore'
 
-export type ConnectionState = 'connecting' | 'online' | 'offline'
-export type AgentStatus = 'idle' | 'thinking'
+export type ConnectionState =
+  | 'connecting'
+  | 'online'
+  | 'reconnecting'
+  | 'offline'
+export type AgentStatus =
+  | 'idle'
+  | 'waiting'
+  | 'thinking'
+  | 'recovering'
+  | 'failed'
 
 export interface AgentChatMessage {
   role: 'user' | 'assistant'
@@ -35,6 +86,8 @@ export interface AgentChatMessage {
   resolvedModel?: string
   effort?: string
   metrics?: TurnMetrics
+  turnId?: string
+  outcome?: TurnOutcome
 }
 
 export interface PendingToolCall {
@@ -62,11 +115,23 @@ export interface AgentBridgeState {
   preferencesReady: boolean
   refreshingCapabilities: boolean
   recommendedConfigurations: AiPreferences['recommendedConfigurations']
+  activeTurnId?: string
+  turnPhase?: TurnPhase
+  turnStatus: string
+  activeSkills: SkillActivation[]
+  instructionBreakdown?: InstructionBreakdown
+  operationReceipts: OperationReceipt[]
+  terminalOutcome?: TurnOutcome
+  terminal?: TurnFinished
+  inputProgress?: InputIngestionProgress
+  queuedMessages: QueuedTurnDraft[]
+  queueStatus: string
 }
 
 export type ToolHandler = (input: unknown) => Promise<ToolResult> | ToolResult
 export type AgentBridgeEvent =
   | ServerMessage
+  | { type: 'durable_event'; envelope: PersistedTurnEventEnvelope }
   | { type: 'tool_result'; callId: string; name: string; result: ToolResult }
   | { type: 'connection_reset'; message: string }
 export type AgentBridgeListener = (message: AgentBridgeEvent) => void
@@ -83,6 +148,90 @@ export const DEFAULT_BROWSER_CONNECTION: SidecarConnectionConfig = {
 }
 const RECONNECT_MIN_MS = 500
 const RECONNECT_MAX_MS = 5000
+const CONTENT_MUTATING_CAD_TOOLS = new Set([
+  'move_entities',
+  'copy_entities',
+  'rotate_entities',
+  'scale_entities',
+  'delete_entities',
+  'set_entity_layer',
+  'set_entity_color',
+  'change_text',
+  'draw_line',
+  'draw_polyline',
+  'draw_rectangle',
+  'draw_circle',
+  'draw_arc',
+  'draw_text',
+  'add_linear_dimension',
+  'add_radius_dimension',
+  'add_leader',
+  'add_mtext',
+  'draw_hatch',
+  'create_layer',
+  'set_layer_properties',
+  'set_current_layer',
+  'import_boundary_from_csv',
+  'import_boundary_from_geojson',
+  'place_monitoring_points',
+  'insert_symbol'
+])
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function parseTurnRevision(input: unknown): CadSessionRevision | undefined {
+  if (!isRecord(input)) return undefined
+  const value = input[ENVCAD_TURN_REVISION_FIELD]
+  if (!isRecord(value)) return undefined
+  if (
+    !Number.isSafeInteger(value.documentRevision) ||
+    (value.documentRevision as number) < 0 ||
+    !Number.isSafeInteger(value.contentRevision) ||
+    (value.contentRevision as number) < 0
+  ) {
+    return undefined
+  }
+  return {
+    documentRevision: value.documentRevision as number,
+    contentRevision: value.contentRevision as number
+  }
+}
+
+function withoutTurnRevision(input: unknown): unknown {
+  if (!isRecord(input)) return input
+  const publicInput = { ...input }
+  delete publicInput[ENVCAD_TURN_REVISION_FIELD]
+  return publicInput
+}
+
+function revisionsEqual(
+  left: CadSessionRevision,
+  right: CadSessionRevision
+): boolean {
+  return (
+    left.documentRevision === right.documentRevision &&
+    left.contentRevision === right.contentRevision
+  )
+}
+
+function toolMayMutateCadContent(name: string, input: unknown): boolean {
+  if (name === 'measure_clearance') {
+    return isRecord(input) && input.draw === true
+  }
+  return CONTENT_MUTATING_CAD_TOOLS.has(name)
+}
+
+function withRevision(
+  result: ToolResult,
+  revision: WorkspaceRevision
+): ToolResult {
+  const data = isRecord(result.data)
+    ? { ...result.data, revision }
+    : { value: result.data ?? null, revision }
+  return { ...result, data }
+}
 
 function defaultPreferences(): AiPreferences {
   return {
@@ -132,9 +281,24 @@ export class AgentBridge {
     configurationError: '',
     preferencesReady: false,
     refreshingCapabilities: false,
-    recommendedConfigurations: undefined
+    recommendedConfigurations: undefined,
+    activeTurnId: undefined,
+    turnPhase: undefined,
+    turnStatus: '',
+    activeSkills: [],
+    instructionBreakdown: undefined,
+    operationReceipts: [],
+    terminalOutcome: undefined,
+    terminal: undefined,
+    inputProgress: undefined,
+    queuedMessages: [],
+    queueStatus: ''
   })
 
+  private readonly turnSession: DurableTurnSession
+  private readonly draftStore: DraftStore
+  private readonly inputIngestion: InputIngestionClient
+  private turnProjection: TurnProjection | undefined
   private ws: WebSocket | undefined
   private reconnectDelayMs = RECONNECT_MIN_MS
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined
@@ -151,6 +315,84 @@ export class AgentBridge {
   private pendingResetRevision: number | undefined
   private readonly fallbackNotices = new Set<string>()
   private lastSendError: string | undefined
+  private activeSelectionSnapshot: SelectionSnapshot | undefined
+  private durabilityFailureReported = false
+  private operationCoordinator: OperationCoordinator | undefined
+  private mutationExecutor: CadMutationExecutor | undefined
+  private readonly undoGroups = new MlightCadUndoGroupAdapter()
+  private readonly mutationControllers = new Map<string, AbortController>()
+  private processingQueue = false
+
+  constructor(
+    options: {
+      turnSession?: DurableTurnSession
+      operationCoordinator?: OperationCoordinator
+      draftStore?: DraftStore
+    } = {}
+  ) {
+    this.turnSession = options.turnSession ?? new DurableTurnSession()
+    this.draftStore =
+      options.draftStore ??
+      new DraftStore({
+        onPersistenceError: (error) => this.reportBridgeError(error.message)
+      })
+    this.syncQueueState()
+    this.inputIngestion = new InputIngestionClient({
+      command: (payload) => this.turnSession.command(payload),
+      send: (envelope) => this.sendV2(envelope),
+      onProgress: (progress) => {
+        this.state.inputProgress = progress
+        if (!this.turnSession.activeTurn) {
+          this.state.turnStatus =
+            `Preserving large input: ${progress.receivedBytes.toLocaleString()} ` +
+            `of ${progress.totalBytes.toLocaleString()} bytes.`
+        }
+      }
+    })
+    this.operationCoordinator = options.operationCoordinator
+    const active = this.turnSession.activeTurn
+    this.nextConfigurationRevision = Math.max(
+      this.nextConfigurationRevision,
+      active?.configurationRevision ?? 0
+    )
+    this.restoreDurableTurn(active)
+  }
+
+  private restoreDurableTurn(active: DurableActiveTurn | undefined): void {
+    if (!active) return
+    this.turnProjection = new TurnProjection(active.turnId, {
+      lastSequence: active.lastServerSequence,
+      assistantText: active.streamingText,
+      accepted: active.accepted,
+      phase: active.projection?.phase,
+      status: active.projection?.status,
+      activeSkills: active.projection?.activeSkills,
+      instructionBreakdown: active.projection?.instructionBreakdown,
+      operationReceipts: active.projection?.operationReceipts
+    })
+    this.activeSelectionSnapshot = structuredClone(active.selectionSnapshot)
+    this.state.activeTurnId = active.turnId
+    this.state.streamingText = active.streamingText
+    this.state.turnPhase = active.projection?.phase
+    this.state.activeSkills = structuredClone(
+      active.projection?.activeSkills ?? []
+    )
+    this.state.instructionBreakdown = active.projection?.instructionBreakdown
+      ? structuredClone(active.projection.instructionBreakdown)
+      : undefined
+    this.state.operationReceipts = structuredClone(
+      active.projection?.operationReceipts ?? []
+    )
+    this.state.status = active.accepted ? 'thinking' : 'waiting'
+    this.state.turnStatus = active.accepted
+      ? 'Restoring the durable turn.'
+      : 'Waiting to submit the preserved draft.'
+    this.state.messages.push({
+      role: 'user',
+      text: active.text,
+      turnId: active.turnId
+    })
+  }
 
   registerHandler(name: string, handler: ToolHandler): void {
     this.handlers.set(name, handler)
@@ -285,36 +527,406 @@ export class AgentBridge {
   sendUserMessage(
     text: string,
     selectionSnapshot: SelectionSnapshot,
-    sheet: SheetSnapshot
-  ): void {
+    sheet: SheetSnapshot,
+    referenceInputIds: string[] = []
+  ): string | Promise<string> {
+    if (!text.trim()) throw new Error('Enter an instruction before sending.')
+    if (selectionSnapshot.count !== selectionSnapshot.ids.length) {
+      throw new Error('The frozen selection count does not match its entity IDs.')
+    }
+    const uniqueReferenceInputIds = [...new Set(referenceInputIds)]
+    if (uniqueReferenceInputIds.length > 1_000) {
+      throw new Error('A turn cannot include more than 1,000 local references.')
+    }
+    const inputByteLength = new TextEncoder().encode(text).byteLength
+    const workspaceRevision = getWorkspaceRevision()
     if (
+      workspaceRevision.documentRevision !==
+        selectionSnapshot.revision.documentRevision ||
+      workspaceRevision.contentRevision !==
+        selectionSnapshot.revision.contentRevision
+    ) {
+      throw new Error(
+        'The drawing changed while the message was being prepared. Capture the selection again.'
+      )
+    }
+    const frozenSelection: SelectionSnapshot = {
+      ids: [...selectionSnapshot.ids],
+      count: selectionSnapshot.count,
+      units: selectionSnapshot.units,
+      revision: { ...selectionSnapshot.revision }
+    }
+    if (
+      this.turnSession.activeTurn ||
+      this.state.status !== 'idle' ||
+      this.state.connectionState !== 'online' ||
       this.state.refreshingCapabilities ||
       !this.state.configurationReady ||
       !this.state.appliedRevision ||
       !this.state.appliedConfiguration
     ) {
-      throw new Error(
-        'Wait for the selected provider, model, and effort to be confirmed before sending.'
+      return this.queueUserMessage(
+        text,
+        inputByteLength,
+        frozenSelection,
+        sheet,
+        uniqueReferenceInputIds
       )
     }
-    const message: ClientMessage = {
-      type: 'user_message',
+    if (inputByteLength > MAX_INLINE_TURN_TEXT_UTF8_BYTES) {
+      return this.ingestLargeInstruction(
+        text,
+        inputByteLength,
+        frozenSelection,
+        workspaceRevision,
+        sheet,
+        uniqueReferenceInputIds
+      )
+    }
+    return this.commitUserTurn(
       text,
+      undefined,
+      frozenSelection,
+      workspaceRevision,
+      sheet,
+      uniqueReferenceInputIds
+    )
+  }
+
+  async ingestTextAttachment(file: File): Promise<InputReference> {
+    if (this.state.connectionState !== 'online') {
+      throw new Error(
+        'Reconnect the AI Assistant before attaching a file so EnvCAD can preserve it locally.'
+      )
+    }
+    const text = await file.text()
+    return this.inputIngestion.ingestText(text, file.name || 'attachment.txt')
+  }
+
+  async deleteLocalInput(inputId: string): Promise<void> {
+    if (this.turnSession.activeTurn) {
+      throw new Error(
+        'Wait for the active turn to finish before deleting a local input reference.'
+      )
+    }
+    if (this.state.connectionState !== 'online') {
+      throw new Error(
+        'Reconnect the AI Assistant before deleting the local input copy.'
+      )
+    }
+    await this.inputIngestion.delete(inputId)
+  }
+
+  getComposerDraft(): string {
+    return this.draftStore.composerText
+  }
+
+  saveComposerDraft(text: string): boolean {
+    return this.draftStore.setComposerText(text)
+  }
+
+  removeQueuedMessage(queueId: string): void {
+    if (!this.draftStore.remove(queueId)) {
+      this.reportBridgeError('The queued message could not be removed safely.')
+      return
+    }
+    this.syncQueueState()
+  }
+
+  clearQueuedMessages(): void {
+    if (!this.draftStore.clearQueue()) {
+      this.reportBridgeError('The assistant queue could not be cleared safely.')
+      return
+    }
+    this.syncQueueState()
+  }
+
+  resumeQueuedMessage(queueId: string): void {
+    const queued = this.draftStore.queuedTurns.find(
+      (item) => item.queueId === queueId
+    )
+    if (!queued) return
+    const revision = getCadSessionRevision()
+    if (
+      !this.draftStore.update(queueId, {
+        selectionSnapshot: {
+          ...queued.selectionSnapshot,
+          revision
+        },
+        status: 'queued',
+        reason: undefined
+      })
+    ) {
+      this.reportBridgeError('The queued message could not be rebound safely.')
+      return
+    }
+    this.syncQueueState()
+    void this.processQueuedTurns()
+  }
+
+  private queueUserMessage(
+    text: string,
+    inputByteLength: number,
+    selectionSnapshot: SelectionSnapshot,
+    sheet: SheetSnapshot,
+    referenceInputIds: string[]
+  ): string | Promise<string> {
+    if (
+      inputByteLength > MAX_INLINE_TURN_TEXT_UTF8_BYTES &&
+      this.state.connectionState === 'online'
+    ) {
+      return this.inputIngestion.ingestText(text).then((reference) =>
+        this.enqueueQueuedTurn(
+          localInputDisplayText(text, reference),
+          reference,
+          selectionSnapshot,
+          sheet,
+          referenceInputIds
+        )
+      )
+    }
+    if (inputByteLength > MAX_INLINE_TURN_TEXT_UTF8_BYTES) {
+      throw new Error(
+        'Reconnect before queueing this large instruction. The composer remains editable so the draft can be retried without truncation.'
+      )
+    }
+    return this.enqueueQueuedTurn(
+      text,
+      undefined,
       selectionSnapshot,
       sheet,
-      configurationRevision: this.state.appliedRevision
+      referenceInputIds
+    )
+  }
+
+  private enqueueQueuedTurn(
+    text: string,
+    instructionReference: InputReference | undefined,
+    selectionSnapshot: SelectionSnapshot,
+    sheet: SheetSnapshot,
+    referenceInputIds: string[]
+  ): string {
+    this.draftStore.enqueue({
+      text,
+      ...(instructionReference ? { instructionReference } : {}),
+      referenceInputIds,
+      selectionSnapshot,
+      sheet: structuredClone(sheet)
+    })
+    this.syncQueueState()
+    this.state.queueStatus =
+      'Follow-up preserved locally and queued for the current provider.'
+    return text
+  }
+
+  private async ingestLargeInstruction(
+    text: string,
+    inputByteLength: number,
+    frozenSelection: SelectionSnapshot,
+    workspaceRevision: WorkspaceRevision,
+    sheet: SheetSnapshot,
+    referenceInputIds: string[] = []
+  ): Promise<string> {
+    this.state.status = 'waiting'
+    this.state.turnStatus = 'Reserving local storage for the large instruction.'
+    this.state.inputProgress = {
+      inputId: '',
+      receivedBytes: 0,
+      totalBytes: inputByteLength,
+      receivedChunks: 0,
+      status: 'receiving'
     }
-    if (!this.send(message)) {
+    let instructionReference: InputReference
+    try {
+      instructionReference = await this.inputIngestion.ingestText(text)
+    } catch (error) {
+      this.state.status = 'idle'
+      this.state.turnStatus = ''
+      this.state.inputProgress = undefined
+      throw error
+    }
+    const currentRevision = getWorkspaceRevision()
+    if (
+      currentRevision.documentRevision !==
+        frozenSelection.revision.documentRevision ||
+      currentRevision.contentRevision !==
+        frozenSelection.revision.contentRevision
+    ) {
+      this.state.status = 'idle'
+      this.state.turnStatus = ''
+      this.state.inputProgress = undefined
       throw new Error(
-        this.lastSendError ??
-          'AI Assistant sidecar is offline; the message was not sent.'
+        'The drawing changed while the large instruction was being preserved. The input remains stored locally; capture the selection again.'
       )
     }
-    this.state.messages.push({ role: 'user', text })
+    return this.commitUserTurn(
+      localInputDisplayText(text, instructionReference),
+      instructionReference,
+      frozenSelection,
+      workspaceRevision,
+      sheet,
+      referenceInputIds
+    )
+  }
+
+  private commitUserTurn(
+    durableText: string,
+    instructionReference: InputReference | undefined,
+    frozenSelection: SelectionSnapshot,
+    workspaceRevision: WorkspaceRevision,
+    sheet: SheetSnapshot,
+    referenceInputIds: string[] = [],
+    durableIds?: { turnId: string; messageId: string }
+  ): string {
+    const configurationRevision = this.state.appliedRevision
+    const configuration = this.state.appliedConfiguration
+    if (!configurationRevision || !configuration) {
+      throw new Error(
+        'The selected provider configuration changed before the turn was committed.'
+      )
+    }
+    const { active, envelope } = this.turnSession.beginTurn(
+      {
+        text: durableText,
+        ...(instructionReference
+          ? {
+              instructionInputId: instructionReference.inputId,
+              originalInputByteLength: instructionReference.byteLength
+            }
+          : {}),
+        referenceInputIds,
+        selectionSnapshot: frozenSelection,
+        workspaceRevision,
+        sheet: structuredClone(sheet),
+        configurationRevision,
+        configuration: { ...configuration }
+      },
+      durableIds
+    )
+    this.durabilityFailureReported = false
+    this.activeSelectionSnapshot = frozenSelection
+    this.turnProjection = new TurnProjection(active.turnId)
+    this.state.activeTurnId = active.turnId
+    this.state.status = 'waiting'
+    this.state.turnStatus = 'Waiting for durable acknowledgment.'
+    this.state.turnPhase = undefined
+    this.state.activeSkills = []
+    this.state.instructionBreakdown = undefined
+    this.state.operationReceipts = []
+    this.state.terminalOutcome = undefined
+    this.state.terminal = undefined
+    this.state.inputProgress = undefined
+    this.state.messages.push({
+      role: 'user',
+      text: durableText,
+      turnId: active.turnId
+    })
+    if (!this.sendV2(envelope)) {
+      this.state.turnStatus =
+        this.lastSendError ??
+        'AI Assistant sidecar is offline; the preserved message will resume after reconnect.'
+    }
+    return durableText
+  }
+
+  private syncQueueState(): void {
+    this.state.queuedMessages = this.draftStore.queuedTurns
+    if (this.state.queuedMessages.length === 0) {
+      this.state.queueStatus = ''
+    }
+  }
+
+  private async processQueuedTurns(): Promise<void> {
+    if (this.processingQueue) return
+    this.processingQueue = true
+    try {
+      const queued = this.draftStore.queuedTurns[0]
+      if (
+        !queued ||
+        this.turnSession.activeTurn ||
+        this.state.status !== 'idle' ||
+        this.state.connectionState !== 'online' ||
+        !this.state.configurationReady ||
+        !this.state.appliedRevision ||
+        !this.state.appliedConfiguration
+      ) {
+        return
+      }
+      if (queued.status === 'needs-review') {
+        this.state.queueStatus =
+          queued.reason ??
+          'The next queued message needs review before it can be sent.'
+        return
+      }
+
+      const revision = getWorkspaceRevision()
+      const queuedRevision = queued.selectionSnapshot.revision
+      const documentChanged =
+        revision.documentRevision !== queuedRevision.documentRevision
+      const selectedDrawingChanged =
+        queued.selectionSnapshot.count > 0 &&
+        revision.contentRevision !== queuedRevision.contentRevision
+      if (documentChanged || selectedDrawingChanged) {
+        const reason = documentChanged
+          ? 'A different drawing is now open. Review this queued message before sending it to the new document.'
+          : 'The drawing changed after this selection was queued. Review the frozen selection before sending.'
+        this.draftStore.update(queued.queueId, {
+          status: 'needs-review',
+          reason
+        })
+        this.syncQueueState()
+        this.state.queueStatus = reason
+        return
+      }
+
+      const selectionSnapshot: SelectionSnapshot = {
+        ...queued.selectionSnapshot,
+        ids: [...queued.selectionSnapshot.ids],
+        revision: {
+          documentRevision: revision.documentRevision,
+          contentRevision: revision.contentRevision
+        }
+      }
+      this.commitUserTurn(
+        queued.text,
+        queued.instructionReference,
+        selectionSnapshot,
+        revision,
+        queued.sheet,
+        queued.referenceInputIds,
+        {
+          turnId: `queued-${queued.queueId}`,
+          messageId: queued.queueId
+        }
+      )
+      if (!this.draftStore.remove(queued.queueId)) {
+        this.reportBridgeError(
+          'The queued message started, but its queue marker could not be cleared. Its stable turn ID prevents duplicate execution.'
+        )
+      }
+      this.syncQueueState()
+    } catch (error) {
+      this.state.queueStatus =
+        error instanceof Error
+          ? error.message
+          : 'The queued message could not be started.'
+    } finally {
+      this.processingQueue = false
+    }
   }
 
   interrupt(): void {
-    if (!this.send({ type: 'interrupt' })) {
+    const active = this.turnSession.activeTurn
+    if (!active) {
+      console.error('[agent-bridge] cannot interrupt: no durable turn is active')
+      return
+    }
+    this.abortActiveMutations()
+    const message = this.turnSession.command(
+      { type: 'cancel_turn', turnId: active.turnId },
+      active.turnId
+    )
+    if (!this.sendV2(message)) {
       console.error('[agent-bridge] cannot interrupt: sidecar is offline')
     }
   }
@@ -384,6 +996,7 @@ export class AgentBridge {
 
   private stopSocket(): void {
     this.stopped = true
+    this.abortActiveMutations()
     clearTimeout(this.reconnectTimer)
     this.reconnectTimer = undefined
     const previous = this.ws
@@ -392,9 +1005,16 @@ export class AgentBridge {
     this.invalidateConfiguration()
     this.state.appliedConfiguration = undefined
     this.state.appliedRevision = undefined
-    this.state.status = 'idle'
-    this.state.streamingText = ''
-    this.state.pendingToolCalls = []
+    const active = this.turnSession.activeTurn
+    this.state.status = active ? 'waiting' : 'idle'
+    if (active) {
+      this.state.turnStatus =
+        'Assistant connection stopped; the durable turn remains preserved.'
+    } else {
+      this.state.streamingText = ''
+      this.state.pendingToolCalls = []
+      this.activeSelectionSnapshot = undefined
+    }
     this.state.refreshingCapabilities = false
   }
 
@@ -424,39 +1044,47 @@ export class AgentBridge {
       this.invalidateConfiguration()
       this.state.appliedConfiguration = undefined
       this.state.appliedRevision = undefined
+      const active = this.turnSession.activeTurn
+      if (active?.accepted || (active && active.lastServerSequence > 0)) {
+        this.resumeDurableTurn(active)
+      }
     })
     ws.addEventListener('message', (event) => {
       if (this.ws !== ws) return
       void this.handleServerMessage(String(event.data))
     })
     ws.addEventListener('close', () => {
+      this.inputIngestion.failPending(
+        'AI Assistant disconnected before local input ingestion completed. The composer draft remains available to retry.'
+      )
       if (this.ws !== ws) return
       const wasOnline = this.state.connectionState === 'online'
-      const interruptedTurn =
-        this.state.status === 'thinking' ||
-        this.state.streamingText.length > 0 ||
-        this.state.pendingToolCalls.length > 0
+      const active = this.turnSession.activeTurn
+      this.abortActiveMutations()
       this.ws = undefined
       this.invalidateConfiguration()
       this.state.appliedConfiguration = undefined
       this.state.appliedRevision = undefined
-      this.state.status = 'idle'
-      this.state.streamingText = ''
-      this.state.pendingToolCalls = []
       this.state.refreshingCapabilities = false
-      this.state.connectionState = 'offline'
+      this.state.status = active ? 'waiting' : 'idle'
+      if (active) {
+        this.state.turnStatus =
+          'Connection interrupted; reconnecting to the preserved turn.'
+      } else {
+        this.state.streamingText = ''
+        this.state.pendingToolCalls = []
+        this.activeSelectionSnapshot = undefined
+      }
+      this.state.connectionState = this.stopped ? 'offline' : 'reconnecting'
       this.state.offlineReason =
         'AI Assistant disconnected. EnvCAD is reconnecting; CAD editing remains available.'
       if (wasOnline) {
-        if (interruptedTurn) {
-          const message =
-            'AI Assistant disconnected during the active turn. The incomplete response was not carried into the replacement conversation.'
-          this.state.messages.push({ role: 'assistant', text: `[error] ${message}` })
-          this.emit({ type: 'connection_reset', message })
-          pushToast(message, 'info')
-        } else {
-          pushToast('Assistant sidecar disconnected - reconnecting...', 'info')
-        }
+        pushToast(
+          active
+            ? 'Assistant disconnected; the active turn is preserved and will resume.'
+            : 'Assistant sidecar disconnected - reconnecting...',
+          'info'
+        )
       }
       if (!this.stopped) this.scheduleReconnect()
     })
@@ -491,7 +1119,7 @@ export class AgentBridge {
     if (payloadBytes > MAX_WEBSOCKET_PAYLOAD_BYTES) {
       this.lastSendError =
         `The complete AI request is ${payloadBytes.toLocaleString()} bytes and exceeds ` +
-        "EnvCAD's 2 MiB transport capacity. Reduce the prompt, selection, or sheet context and try again."
+        "EnvCAD's 2 MiB transport capacity. Reduce the prompt or sheet context and try again."
       this.reportBridgeError(this.lastSendError)
       return false
     }
@@ -520,6 +1148,82 @@ export class AgentBridge {
     return false
   }
 
+  private sendV2(message: AgentClientEnvelope): boolean {
+    this.lastSendError = undefined
+    const parsed = parseAgentClientEnvelope(message)
+    if (!parsed.ok) {
+      this.lastSendError =
+        'EnvCAD could not validate the durable assistant command.'
+      console.error(
+        `[agent-bridge] refusing invalid protocol v2 command: ${parsed.developerMessage}`
+      )
+      return false
+    }
+    const serialized = JSON.stringify(parsed.value)
+    const payloadBytes = new TextEncoder().encode(serialized).byteLength
+    if (payloadBytes > MAX_WEBSOCKET_PAYLOAD_BYTES) {
+      this.lastSendError =
+        `The complete AI request is ${payloadBytes.toLocaleString()} bytes and exceeds ` +
+        "EnvCAD's 2 MiB transport capacity. The draft remains preserved."
+      this.reportBridgeError(this.lastSendError)
+      return false
+    }
+    if (import.meta.env.DEV) {
+      console.debug('[agent-bridge] ->', {
+        type: message.payload.type,
+        protocolVersion: message.protocolVersion,
+        payloadBytes
+      })
+    }
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      try {
+        this.ws.send(serialized)
+        return true
+      } catch (error) {
+        this.lastSendError = `Failed to send ${message.payload.type}: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+        console.error(`[agent-bridge] ${this.lastSendError}`)
+      }
+    } else {
+      this.lastSendError =
+        'AI Assistant sidecar is offline; the preserved message will resume after reconnect.'
+    }
+    return false
+  }
+
+  private resumeDurableTurn(active: DurableActiveTurn): void {
+    const envelope = this.turnSession.command(
+      {
+        type: 'resume_turn',
+        turnId: active.turnId,
+        lastSequence: active.lastServerSequence
+      },
+      active.turnId
+    )
+    if (!this.sendV2(envelope)) {
+      this.state.turnStatus =
+        'Waiting to reconnect to the preserved durable turn.'
+    }
+  }
+
+  private submitPreservedDraft(): void {
+    const active = this.turnSession.activeTurn
+    if (
+      !active ||
+      active.accepted ||
+      active.lastServerSequence > 0 ||
+      this.state.appliedRevision !== active.configurationRevision ||
+      !sameConfiguration(this.state.appliedConfiguration, active.configuration)
+    ) {
+      return
+    }
+    if (this.sendV2(this.turnSession.submitEnvelope(active))) {
+      this.state.status = 'waiting'
+      this.state.turnStatus = 'Waiting for durable acknowledgment.'
+    }
+  }
+
   private async handleServerMessage(raw: string): Promise<void> {
     let decoded: unknown
     try {
@@ -528,6 +1232,33 @@ export class AgentBridge {
       this.reportBridgeError('Sidecar sent malformed JSON')
       return
     }
+    if (isRecord(decoded) && decoded.protocolVersion !== undefined) {
+      const parsed = parseAgentServerEnvelope(decoded)
+      if (!parsed.ok) {
+        this.reportBridgeError(
+          'The sidecar returned an invalid durable assistant event.'
+        )
+        console.error(
+          `[agent-bridge] invalid protocol v2 event: ${parsed.developerMessage}`
+        )
+        return
+      }
+      if (this.inputIngestion.receive(parsed.value.payload)) return
+      if (
+        parsed.value.payload.type === 'input_progress' ||
+        parsed.value.payload.type === 'input_committed' ||
+        parsed.value.payload.type === 'input_aborted'
+      ) {
+        return
+      }
+      if (parsed.value.payload.type === 'protocol_error') {
+        this.reportBridgeError(parsed.value.payload.message)
+        return
+      }
+      this.handleDurableEvent(parsed.value)
+      return
+    }
+
     const parsed = parseServerMessage(decoded)
     if (!parsed.ok) {
       this.reportBridgeError(`Sidecar sent an invalid message: ${parsed.error}`)
@@ -556,29 +1287,41 @@ export class AgentBridge {
         break
       case 'status':
         this.state.status = message.state
+        if (message.state === 'idle') this.activeSelectionSnapshot = undefined
         break
       case 'error':
         console.error(`[agent-bridge] sidecar error: ${message.message}`)
-        this.state.messages.push({
-          role: 'assistant',
-          text: `[error] ${message.message}`,
-          ...(message.provider ? { provider: message.provider } : {})
-        })
+        if (this.turnSession.activeTurn) {
+          this.state.status = 'waiting'
+          this.state.turnStatus = message.message
+        }
         pushToast(message.message)
         break
       case 'tool_call':
-        this.emit(message)
+        this.emit({
+          ...message,
+          input: withoutTurnRevision(message.input)
+        })
         this.enqueueToolCall(
           message.callId,
           message.name,
           message.input,
-          this.ws
+          this.ws,
+          message.turnId,
+          message.operation
+        )
+        return
+      case 'get_operation_status':
+        void this.handleOperationStatusRequest(
+          message.requestId,
+          message.operationId
         )
         return
       case 'ai_capabilities':
         this.state.providers = message.providers
         this.state.refreshingCapabilities = message.refreshing
         this.reconcileSelection()
+        if (!message.refreshing) void this.processQueuedTurns()
         break
       case 'ai_provider_status':
         this.mergeProviderCapability(message.provider)
@@ -597,6 +1340,8 @@ export class AgentBridge {
         this.state.appliedConfiguration = message.configuration
         this.state.configurationReady = true
         this.state.configurationError = ''
+        this.submitPreservedDraft()
+        void this.processQueuedTurns()
         break
       case 'ai_configuration_rejected':
         if (message.revision !== this.state.pendingRevision) return
@@ -611,6 +1356,117 @@ export class AgentBridge {
         break
     }
     this.emit(message)
+  }
+
+  private handleDurableEvent(message: AgentServerEnvelope): void {
+    const parsed = persistedTurnEventEnvelopeSchema.safeParse(message)
+    if (!parsed.success) {
+      this.reportBridgeError(
+        'The sidecar returned an unsupported durable assistant event.'
+      )
+      return
+    }
+    const envelope = parsed.data
+    const active = this.turnSession.activeTurn
+    if (
+      envelope.sessionId !== this.turnSession.sessionId ||
+      !active ||
+      envelope.turnId !== active.turnId
+    ) {
+      console.error(
+        '[agent-bridge] ignored a durable event for an inactive session or turn'
+      )
+      return
+    }
+    this.turnProjection ??= new TurnProjection(active.turnId, {
+      lastSequence: active.lastServerSequence,
+      assistantText: active.streamingText,
+      accepted: active.accepted
+    })
+    try {
+      if (this.turnProjection.apply(envelope) === 'duplicate') return
+    } catch (error) {
+      this.reportBridgeError(
+        'EnvCAD rejected an out-of-order durable assistant event.'
+      )
+      console.error('[agent-bridge] durable projection failed:', error)
+      return
+    }
+
+    const projection = this.turnProjection.value
+    if (envelope.payload.type !== 'turn_finished') {
+      const persisted = this.turnSession.recordServerEvent(envelope.sequence, {
+        accepted: projection.accepted,
+        streamingText: projection.assistantText,
+        projection: {
+          phase: projection.phase,
+          status: projection.status,
+          activeSkills: projection.activeSkills,
+          instructionBreakdown: projection.instructionBreakdown,
+          operationReceipts: projection.operationReceipts
+        }
+      })
+      if (!persisted) this.reportDurabilityFailure()
+    }
+    this.state.activeTurnId = active.turnId
+    this.state.turnPhase = projection.phase
+    this.state.turnStatus = projection.status
+    this.state.activeSkills = projection.activeSkills
+    this.state.instructionBreakdown = projection.instructionBreakdown
+    this.state.operationReceipts = projection.operationReceipts
+    this.state.streamingText = projection.assistantText
+
+    const event = envelope.payload
+    if (event.type === 'turn_accepted') {
+      this.state.status = 'thinking'
+    } else if (event.type === 'turn_progress') {
+      this.state.status =
+        event.phase === 'recovering' ||
+        event.phase === 'retrying' ||
+        event.phase === 'degraded'
+          ? 'recovering'
+          : 'thinking'
+    } else if (event.type === 'turn_finished') {
+      try {
+        this.undoGroups.finishTurn(active.turnId)
+      } catch (error) {
+        this.reportBridgeError(
+          'The AI action completed, but EnvCAD could not finalize its grouped undo record.'
+        )
+        console.error('[agent-bridge] undo group finalization failed:', error)
+      }
+      const failureText = event.error?.userMessage
+      const finalText = projection.assistantText
+        ? failureText
+          ? `${projection.assistantText}\n\n${failureText}`
+          : projection.assistantText
+        : failureText ?? event.status
+      this.state.messages.push({
+        role: 'assistant',
+        text: finalText,
+        turnId: active.turnId,
+        outcome: event.outcome,
+        provider: active.configuration.provider,
+        model: active.configuration.model,
+        ...(active.configuration.effort
+          ? { effort: active.configuration.effort }
+          : {}),
+        metrics: event.metrics
+      })
+      this.state.streamingText = ''
+      this.state.status = 'idle'
+      this.state.terminalOutcome = event.outcome
+      this.state.terminal = structuredClone(event)
+      this.state.pendingToolCalls = []
+      this.activeSelectionSnapshot = undefined
+      if (!this.turnSession.finishTurn(active.turnId)) {
+        this.reportDurabilityFailure()
+      }
+      this.turnProjection = undefined
+      this.requestSelectedConfiguration()
+      queueMicrotask(() => void this.processQueuedTurns())
+    }
+    this.emit({ type: 'durable_event', envelope })
   }
 
   private mergeProviderCapability(provider: ProviderCapability): void {
@@ -685,30 +1541,36 @@ export class AgentBridge {
   }
 
   private requestSelectedConfiguration(): void {
-    if (
-      this.state.connectionState !== 'online' ||
-      this.state.status === 'thinking'
-    ) {
-      return
-    }
+    if (this.state.connectionState !== 'online') return
+    const active = this.turnSession.activeTurn
+    if (active?.accepted || (active && active.lastServerSequence > 0)) return
     const provider = this.selectedProviderCapability()
     const model = this.selectedModelCapability()
     if (!provider || provider.status !== 'ready' || !model) return
-    const configuration: AgentConfiguration = {
-      provider: provider.id,
-      model: model.invocationName,
-      ...(this.state.selectedEffort
-        ? { effort: this.state.selectedEffort }
-        : {})
-    }
+    const configuration: AgentConfiguration = active
+      ? { ...active.configuration }
+      : {
+          provider: provider.id,
+          model: model.invocationName,
+          ...(this.state.selectedEffort
+            ? { effort: this.state.selectedEffort }
+            : {})
+        }
     if (
       (this.state.configurationReady &&
         sameConfiguration(this.state.appliedConfiguration, configuration)) ||
       sameConfiguration(this.pendingConfiguration, configuration)
     ) {
+      this.submitPreservedDraft()
       return
     }
-    const revision = ++this.nextConfigurationRevision
+    const revision = active
+      ? active.configurationRevision
+      : ++this.nextConfigurationRevision
+    this.nextConfigurationRevision = Math.max(
+      this.nextConfigurationRevision,
+      revision
+    )
     this.state.pendingRevision = revision
     this.state.configurationReady = false
     this.state.configurationError = ''
@@ -744,18 +1606,31 @@ export class AgentBridge {
     callId: string,
     name: string,
     input: unknown,
-    sourceSocket: WebSocket | undefined
+    sourceSocket: WebSocket | undefined,
+    turnId?: string,
+    operation?: CadOperationRequest
   ): void {
     if (!sourceSocket) return
-    this.state.pendingToolCalls.push({ callId, name, input })
+    this.state.pendingToolCalls.push({
+      callId,
+      name,
+      input: withoutTurnRevision(input)
+    })
     this.toolQueue = this.toolQueue.then(() =>
-      this.handleToolCall(callId, name, input, sourceSocket).catch((error) => {
-        this.reportBridgeError(
-          `Tool dispatch for ${name} failed: ${
-            error instanceof Error ? error.message : String(error)
-          }`
-        )
-      })
+      this.handleToolCall(
+        callId,
+        name,
+        input,
+        sourceSocket,
+        turnId,
+        operation
+      ).catch((error) => {
+          this.reportBridgeError(
+            `Tool dispatch for ${name} failed: ${
+              error instanceof Error ? error.message : String(error)
+            }`
+          )
+        })
     )
   }
 
@@ -763,17 +1638,100 @@ export class AgentBridge {
     callId: string,
     name: string,
     input: unknown,
-    sourceSocket: WebSocket
+    sourceSocket: WebSocket,
+    turnId?: string,
+    operation?: CadOperationRequest
   ): Promise<void> {
     const handler = this.handlers.get(name)
     let result: ToolResult
-    try {
-      result = handler
-        ? await handler(input)
-        : { error: `No browser handler registered for ${name}` }
-    } catch (error) {
+    let operationReceipt: OperationReceipt | undefined
+    const expectedRevision = parseTurnRevision(input)
+    const inputRecord = isRecord(input) ? { ...input } : undefined
+    if (inputRecord) delete inputRecord[ENVCAD_TURN_REVISION_FIELD]
+    const frozenSelection = this.activeSelectionSnapshot
+    const browserInput =
+      name === 'get_selected_entities' && inputRecord && frozenSelection
+        ? { ...inputRecord, ids: [...frozenSelection.ids] }
+        : inputRecord ?? input
+    const beforeRevision = getCadSessionRevision()
+
+    if (!expectedRevision) {
       result = {
-        error: error instanceof Error ? error.message : String(error)
+        error:
+          `EnvCAD rejected ${name}: the AI tool call was not bound to the active drawing revision.`
+      }
+    } else if (!revisionsEqual(expectedRevision, beforeRevision)) {
+      result = {
+        error:
+          `EnvCAD rejected ${name} before execution because the drawing changed ` +
+          `since this AI turn began (expected ${expectedRevision.documentRevision}:` +
+          `${expectedRevision.contentRevision}, current ${beforeRevision.documentRevision}:` +
+          `${beforeRevision.contentRevision}). No CAD change was made; send a new message ` +
+          `so the assistant can inspect the current drawing.`
+      }
+    } else if (name === 'get_selected_entities' && !frozenSelection) {
+      result = {
+        error: 'EnvCAD rejected get_selected_entities because no active turn snapshot exists.'
+      }
+    } else {
+      try {
+        if (operation) {
+          const active = this.turnSession.activeTurn
+          if (!turnId || !active || turnId !== active.turnId) {
+            result = {
+              error:
+                'EnvCAD rejected the mutation because it was not bound to the active durable turn.'
+            }
+          } else {
+            const controller = new AbortController()
+            this.mutationControllers.set(callId, controller)
+            try {
+              const execution = await this.getMutationExecutor().execute(
+                operation,
+                browserInput,
+                async (payload) =>
+                  handler
+                    ? await handler(payload)
+                    : { error: `No browser handler registered for ${name}` },
+                controller.signal
+              )
+              result = execution.result
+              operationReceipt = execution.receipt
+            } finally {
+              this.mutationControllers.delete(callId)
+            }
+          }
+        } else {
+          result = handler
+            ? await handler(browserInput)
+            : { error: `No browser handler registered for ${name}` }
+        }
+      } catch (error) {
+        result = {
+          error: error instanceof Error ? error.message : String(error)
+        }
+      }
+
+      if (!result.error) {
+        const afterRevision = getCadSessionRevision()
+        if (afterRevision.documentRevision !== beforeRevision.documentRevision) {
+          result = {
+            error:
+              `EnvCAD discarded the ${name} result because a different drawing ` +
+              'became active while the tool was running. Send a new message before continuing.'
+          }
+        } else if (
+          !toolMayMutateCadContent(name, browserInput) &&
+          afterRevision.contentRevision !== beforeRevision.contentRevision
+        ) {
+          result = {
+            error:
+              `EnvCAD discarded the ${name} result because drawing content changed ` +
+              'while the read was running. Send a new message before continuing.'
+          }
+        } else {
+          result = withRevision(result, getWorkspaceRevision())
+        }
       }
     }
     const validated = validateToolResultForTool(name, result)
@@ -797,12 +1755,70 @@ export class AgentBridge {
       this.emit({ type: 'tool_result', callId, name, result })
       return
     }
-    if (!this.send({ type: 'tool_result', callId, result })) {
+    if (
+      !this.send({
+        type: 'tool_result',
+        callId,
+        result,
+        ...(operationReceipt ? { operationReceipt } : {})
+      })
+    ) {
       this.reportBridgeError(
         `Failed to return the result for ${name}; sidecar is offline`
       )
     }
     this.emit({ type: 'tool_result', callId, name, result })
+  }
+
+  private getMutationExecutor(): CadMutationExecutor {
+    this.operationCoordinator ??= createDurableOperationCoordinator(
+      getWorkspaceRevision
+    )
+    this.mutationExecutor ??= new CadMutationExecutor({
+      coordinator: this.operationCoordinator,
+      currentRevision: getWorkspaceRevision,
+      beginOperationGroup: (request) => this.undoGroups.begin(request)
+    })
+    return this.mutationExecutor
+  }
+
+  private async handleOperationStatusRequest(
+    requestId: string,
+    operationId: string
+  ): Promise<void> {
+    try {
+      this.operationCoordinator ??= createDurableOperationCoordinator(
+        getWorkspaceRevision
+      )
+      const receipt = await this.operationCoordinator.getReceipt(operationId)
+      if (
+        !this.send({
+          type: 'operation_status',
+          requestId,
+          result: {
+            operationId,
+            ...(receipt ? { receipt } : {})
+          }
+        })
+      ) {
+        console.error(
+          '[agent-bridge] could not return operation status while offline'
+        )
+      }
+    } catch (error) {
+      console.error('[agent-bridge] operation status lookup failed:', error)
+      this.send({
+        type: 'operation_status',
+        requestId,
+        result: { operationId }
+      })
+    }
+  }
+
+  private abortActiveMutations(): void {
+    for (const controller of this.mutationControllers.values()) {
+      controller.abort()
+    }
   }
 
   private emit(message: AgentBridgeEvent): void {
@@ -821,6 +1837,16 @@ export class AgentBridge {
       role: 'assistant',
       text: `[error] ${message}`
     })
+    pushToast(message)
+  }
+
+  private reportDurabilityFailure(): void {
+    if (this.durabilityFailureReported) return
+    this.durabilityFailureReported = true
+    const message =
+      'The turn remains recorded by EnvCAD, but this window could not update its local resume cache. Keep the window open until the turn reaches a terminal state.'
+    console.error(`[agent-bridge] ${message}`)
+    this.state.turnStatus = message
     pushToast(message)
   }
 }

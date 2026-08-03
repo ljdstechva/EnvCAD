@@ -7,6 +7,8 @@ import {
   type AcDbDatabase,
   type AcDbEntity
 } from '@mlightcad/data-model'
+import type { WorkspaceRevision } from '../../shared/agent-contracts/workspace-revision'
+import { WorkspaceRevisionClock } from './revision/WorkspaceRevisionClock'
 
 export type CadSessionStatus =
   | 'no-document'
@@ -117,8 +119,7 @@ let manager: AcApDocManager | null = null
 let container: HTMLElement | null = null
 let hooks: CadSessionHooks | null = null
 let pendingRegenerationCheck: Promise<void> = Promise.resolve()
-let documentRevision = 0
-let contentRevision = 0
+const workspaceRevisionClock = new WorkspaceRevisionClock()
 
 export interface CadSessionRevision {
   documentRevision: number
@@ -126,12 +127,19 @@ export interface CadSessionRevision {
 }
 
 export function getCadSessionRevision(): CadSessionRevision {
-  return { documentRevision, contentRevision }
+  const revision = workspaceRevisionClock.snapshot()
+  return {
+    documentRevision: revision.documentRevision,
+    contentRevision: revision.contentRevision
+  }
 }
 
-function advanceDocumentRevision(): void {
-  documentRevision += 1
-  contentRevision = 0
+export function getWorkspaceRevision(): WorkspaceRevision {
+  return workspaceRevisionClock.snapshot()
+}
+
+function advanceDocumentRevision(kind: 'document' | 'no-document'): void {
+  workspaceRevisionClock.advanceDocument(kind)
 }
 
 export function bindCadSession(
@@ -146,7 +154,7 @@ export function bindCadSession(
 }
 
 export function setNoCadDocument(): void {
-  advanceDocumentRevision()
+  advanceDocumentRevision('no-document')
   Object.assign(mutableState, {
     status: 'no-document' satisfies CadSessionStatus,
     documentName: undefined,
@@ -169,7 +177,7 @@ export function setNoCadDocument(): void {
 }
 
 export function beginCadDocumentReplacement(): void {
-  advanceDocumentRevision()
+  advanceDocumentRevision('document')
   Object.assign(mutableState, {
     status: 'closing' satisfies CadSessionStatus,
     editable: false,
@@ -185,7 +193,7 @@ export function beginCadDocumentReplacement(): void {
 }
 
 export function beginCadDocumentOpen(documentName: string): void {
-  advanceDocumentRevision()
+  advanceDocumentRevision('document')
   Object.assign(mutableState, {
     status: 'opening' satisfies CadSessionStatus,
     documentName,
@@ -207,7 +215,7 @@ export function beginCadDocumentOpen(documentName: string): void {
 }
 
 export function failCadDocumentOpen(documentName: string, error: string): void {
-  advanceDocumentRevision()
+  advanceDocumentRevision('document')
   Object.assign(mutableState, {
     status: 'failed' satisfies CadSessionStatus,
     documentName,
@@ -238,7 +246,7 @@ export async function activateCadDocument(
   }
 
   const database = manager.curDocument.database
-  advanceDocumentRevision()
+  advanceDocumentRevision('document')
   const modelSpaceId = database.tables.blockTable.modelSpace.objectId
   const modelLayout = prepareCadDocumentView(manager)
 
@@ -354,9 +362,21 @@ export function markCadSessionDatabaseEdited(): void {
   scheduleCadSessionRegeneration()
 }
 
+export function markCadSessionSheetEdited(): boolean {
+  if (mutableState.status !== 'active') return false
+  workspaceRevisionClock.advanceSheet()
+  return true
+}
+
+export function markCadSessionViewEdited(): boolean {
+  if (mutableState.status !== 'active') return false
+  workspaceRevisionClock.advanceView()
+  return true
+}
+
 export function scheduleCadSessionRegeneration(): void {
   const active = requireEditableCadSession()
-  contentRevision += 1
+  workspaceRevisionClock.advanceContent()
   const attemptedAt = Date.now()
   invalidateRenderedEvidence()
   mutableState.lastRegeneration = {

@@ -95,6 +95,7 @@ export class FakeProvider implements AgentProvider {
   nextEvents: AgentEvent[] = [{ type: 'text_delta', text: 'done' }]
   nextGate: Promise<void> | undefined
   nextError: Error | undefined
+  nextCreateError: Error | undefined
 
   constructor(
     readonly id: ProviderId,
@@ -122,6 +123,11 @@ export class FakeProvider implements AgentProvider {
   ): Promise<AgentConversation> {
     this.configurations.push({ ...configuration })
     this.bridges.push(bridge)
+    if (this.nextCreateError) {
+      const error = this.nextCreateError
+      this.nextCreateError = undefined
+      throw error
+    }
     const conversation = new FakeConversation(
       this.nextEvents,
       this.nextGate,

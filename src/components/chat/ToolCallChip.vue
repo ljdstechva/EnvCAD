@@ -92,7 +92,7 @@ function summarize(value: unknown): string {
   border: 1px solid var(--border-color);
   border-radius: 6px;
   background: var(--bg-panel);
-  font-size: 11px;
+  font-size: 12px;
   overflow: hidden;
   max-width: 100%;
 }
@@ -189,7 +189,7 @@ function summarize(value: unknown): string {
   border-radius: 3px;
   padding: 1px 5px;
   font-family: ui-monospace, 'SFMono-Regular', Consolas, monospace;
-  font-size: 10px;
+  font-size: 12px;
 }
 
 .tool-error {
@@ -208,7 +208,7 @@ function summarize(value: unknown): string {
 .detail-label {
   color: var(--text-muted);
   margin-bottom: 2px;
-  font-size: 10px;
+  font-size: 12px;
   text-transform: uppercase;
   letter-spacing: 0.03em;
 }
@@ -222,8 +222,18 @@ function summarize(value: unknown): string {
   padding: 6px;
   color: var(--text-secondary);
   font-family: ui-monospace, 'SFMono-Regular', Consolas, monospace;
-  font-size: 10px;
+  font-size: 12px;
   max-height: 220px;
   overflow: auto;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .status-dot.pending {
+    animation: none;
+  }
+
+  .chevron {
+    transition: none;
+  }
 }
 </style>

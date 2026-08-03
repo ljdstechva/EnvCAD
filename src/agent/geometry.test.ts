@@ -3,6 +3,7 @@ import {
   arrowheadGeometry,
   boundingBox,
   boundingBoxCenter,
+  boundingBoxDistance,
   distance,
   hasBulgeArcs,
   linearDimensionGeometry,
@@ -143,6 +144,28 @@ describe('agent geometry helpers', () => {
     const combined = unionBoundingBoxes([first!, second!])
     expect(combined).toEqual({ min: { x: 10, y: 10 }, max: { x: 70, y: 25 } })
     expect(boundingBoxCenter(combined!)).toEqual({ x: 40, y: 17.5 })
+  })
+
+  it('measures axis-aligned and diagonal bounding-box clearance', () => {
+    const first = { min: { x: 0, y: 0 }, max: { x: 1, y: 1 } }
+    expect(
+      boundingBoxDistance(first, {
+        min: { x: 0.5, y: 0.5 },
+        max: { x: 2, y: 2 }
+      })
+    ).toBe(0)
+    expect(
+      boundingBoxDistance(first, {
+        min: { x: 2, y: 0 },
+        max: { x: 3, y: 1 }
+      })
+    ).toBe(1)
+    expect(
+      boundingBoxDistance(first, {
+        min: { x: 1.8, y: 1.8 },
+        max: { x: 2.8, y: 2.8 }
+      })
+    ).toBeCloseTo(Math.hypot(0.8, 0.8))
   })
 
   it('offsets horizontal and vertical dimension extension lines exactly', () => {

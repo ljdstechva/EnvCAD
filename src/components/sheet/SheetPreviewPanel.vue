@@ -11,7 +11,7 @@ import { useSheetRender } from './useSheetRender'
 import { pushToast } from '../../toast/toastStore'
 
 const props = defineProps<{
-  inspectWithAi: () => boolean
+  inspectWithAi: () => Promise<boolean>
 }>()
 
 const PX_PER_MM = 96 / 25.4
@@ -121,6 +121,16 @@ const unsubscribeAgent = agentBridge.subscribe((message) => {
   ) {
     if (message.result.error) inspectState.value = 'failure'
     else inspectToolSucceeded.value = true
+  } else if (
+    message.type === 'durable_event' &&
+    message.envelope.payload.type === 'turn_finished'
+  ) {
+    const outcome = message.envelope.payload.outcome
+    inspectState.value =
+      inspectToolSucceeded.value &&
+      (outcome === 'completed' || outcome === 'recovered')
+        ? 'success'
+        : 'failure'
   } else if (message.type === 'assistant_done') {
     inspectState.value = inspectToolSucceeded.value ? 'success' : 'failure'
   } else if (message.type === 'error' || message.type === 'connection_reset') {
@@ -168,11 +178,11 @@ onBeforeUnmount(() => {
   unsubscribeAgent()
 })
 
-function onInspectWithAi() {
+async function onInspectWithAi() {
   if (!canInspectWithAi.value) return
   inspectState.value = 'loading'
   inspectToolSucceeded.value = false
-  if (!props.inspectWithAi()) {
+  if (!(await props.inspectWithAi())) {
     inspectState.value = 'failure'
     pushToast('The Sheet Preview inspection request could not be sent.')
   }
